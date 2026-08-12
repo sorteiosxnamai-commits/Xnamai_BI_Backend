@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -20,6 +21,25 @@ scheduler = AsyncIOScheduler()
 _sync_busy = False
 
 
+async def _resume_interrupted_sync():
+    """Continue incremental sync after deploys that killed a background job."""
+    global _sync_busy
+    await asyncio.sleep(8)
+    if _sync_busy:
+        return
+    with SessionLocal() as db:
+        states = list(db.scalars(select(SyncState)))
+        resume = any(s.status in {"interrupted", "partial"} for s in states)
+    if not resume:
+        return
+    _sync_busy = True
+    log.info("Resuming interrupted/partial Mercos sync (incremental)")
+    try:
+        await sync_all(False, raise_http=False)
+    finally:
+        _sync_busy = False
+
+
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
@@ -29,7 +49,7 @@ async def lifespan(app):
         stuck = list(db.scalars(select(SyncState).where(SyncState.status == "running")))
         for state in stuck:
             state.status = "interrupted"
-            state.error = "Serviço reiniciou durante a sync"
+            state.error = "Serviço reiniciou durante a sync — retoma automático em breve"
             db.add(state)
         if stuck:
             db.commit()
@@ -59,6 +79,7 @@ async def lifespan(app):
             cfg.sync_orders_minutes,
             cfg.sync_catalog_hours,
         )
+        asyncio.create_task(_resume_interrupted_sync())
     else:
         log.warning("Scheduler disabled: MERCOS_ADAPTOR_URL/API_KEY missing")
     yield
@@ -207,20 +228,13 @@ async def run_sync(resource: str, background_tasks: BackgroundTasks, full: bool 
     if resource not in {"all", "customers", "products", "users", "orders"}:
         raise HTTPException(404, "Recurso inválido")
 
-    targets = ("customers", "products", "users", "orders") if resource == "all" else (resource,)
     with SessionLocal() as db:
         running = any(x.status == "running" for x in db.scalars(select(SyncState)))
-        if _sync_busy or running:
-            return JSONResponse(
-                status_code=202,
-                content={"status": "running", "message": "Sync já em andamento", "resource": resource, "full": full},
-            )
-        for name in targets:
-            state = db.get(SyncState, name) or SyncState(resource=name)
-            state.status = "running"
-            state.error = None
-            db.add(state)
-        db.commit()
+    if _sync_busy or running:
+        return JSONResponse(
+            status_code=202,
+            content={"status": "running", "message": "Sync já em andamento", "resource": resource, "full": full},
+        )
 
     _sync_busy = True
 
