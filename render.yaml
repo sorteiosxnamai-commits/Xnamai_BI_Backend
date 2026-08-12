@@ -14,4 +14,8 @@ services:
         generateValue: true
       - key: CORS_ORIGINS
         sync: false
+      - key: SYNC_ORDERS_MINUTES
+        value: "10"
+      - key: SYNC_CATALOG_HOURS
+        value: "6"
 

@@ -1,6 +1,6 @@
 # Xnamai BI Backend
 
-Backend analítico independente que consome o `Mercos_Adaptor`, persiste pedidos completos e todos os itens, e disponibiliza métricas para o frontend.
+Backend analítico que consome o `Mercos_Adaptor`, persiste pedidos/itens e serve o frontend.
 
 ## Executar
 
@@ -12,13 +12,24 @@ cp .env.example .env
 uvicorn app.main:app --reload
 ```
 
-No Render selecione **Docker**, configure as variáveis do `.env.example` e use `/health` como Health Check.
+No Render use **Docker**, variáveis do `.env.example` e health check `/health`.
+
+## Produção (Render)
+
+Obrigatório:
+- `DATABASE_URL` — pooler Supabase porta 6543 (sem `?pgbouncer` / `&supa=`)
+- `MERCOS_ADAPTOR_URL=https://mercosadaptor.onrender.com`
+- `MERCOS_ADAPTOR_API_KEY` — mesma chave do Adaptor
+- `BI_API_KEY` — chave que o frontend envia em `X-API-Key`
+- `CORS_ORIGINS` — URL do front (ex.: `https://xnamai-bi-frontend.onrender.com,http://localhost:5173`)
 
 ## Primeira carga
 
-Após o deploy, execute `POST /api/v1/sync/all?full=true` com o header `X-API-Key`. Depois use `full=false` nas sincronizações incrementais. O Swagger fica em `/docs`.
+```bash
+curl -X POST "https://xnamai-bi-backend.onrender.com/api/v1/sync/all?full=true" \
+  -H "X-API-Key: SUA_BI_API_KEY"
+```
 
-## Segurança
+Depois o scheduler roda pedidos a cada `SYNC_ORDERS_MINUTES` e catálogo a cada `SYNC_CATALOG_HOURS`.
 
-O navegador não deve receber a chave do `Mercos_Adaptor`. Somente este backend a utiliza. Para produção, o ideal é substituir `BI_API_KEY` por autenticação de usuários com JWT/SSO antes de liberar o painel fora da rede da empresa.
-"# Xnamai_BI_Backend" 
+Swagger: `/docs`.
