@@ -98,7 +98,23 @@ def _upsert_rows(db, resource: str, rows: list):
                 )
 
 
+def _set_state(resource: str, **fields):
+    with SessionLocal() as db:
+        state = db.get(SyncState, resource) or SyncState(resource=resource)
+        for key, value in fields.items():
+            setattr(state, key, value)
+        db.add(state)
+        db.commit()
+        return {
+            "resource": state.resource,
+            "cursor": state.cursor,
+            "records": state.records,
+            "status": state.status,
+        }
+
+
 async def sync_resource(resource: str, full=False, *, raise_http=True):
+    # Short DB sessions only — never hold a pooler connection during Mercos HTTP waits
     with SessionLocal() as db:
         state = db.get(SyncState, resource) or SyncState(resource=resource)
         cursor = None if full else state.cursor
@@ -106,57 +122,55 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         state.error = None
         db.add(state)
         db.commit()
-        try:
-            total = 0
-            for _ in range(MAX_PAGES):
-                result = await adaptor.list(resource, cursor)
-                rows = result.get("data") or []
-                if not rows:
-                    break
+
+    total = 0
+    try:
+        for _ in range(MAX_PAGES):
+            result = await adaptor.list(resource, cursor)
+            rows = result.get("data") or []
+            if not rows:
+                break
+            next_cursor = result.get("nextCursor")
+            with SessionLocal() as db:
                 _upsert_rows(db, resource, rows)
                 total += len(rows)
-                next_cursor = result.get("nextCursor")
+                state = db.get(SyncState, resource) or SyncState(resource=resource)
                 state.cursor = next_cursor or cursor or state.cursor
                 state.records = total
+                state.status = "running"
+                state.error = None
                 db.add(state)
                 db.commit()
-                if not next_cursor or next_cursor == cursor:
-                    break
-                cursor = next_cursor
-            else:
-                # Hit MAX_PAGES with more data remaining
-                state.status = "partial"
-                state.error = f"Limite de {MAX_PAGES} páginas; rode sync incremental para continuar"
-                db.add(state)
-                db.commit()
-                log.warning("Sync %s partial after %s pages (%s records)", resource, MAX_PAGES, total)
-                return {
-                    "resource": resource,
-                    "records": total,
-                    "cursor": state.cursor,
-                    "status": "partial",
-                }
-            state.last_success_at = datetime.now(timezone.utc)
-            state.status = "success"
-            state.records = total
-            state.error = None
-            db.add(state)
-            db.commit()
-            return {"resource": resource, "records": total, "cursor": state.cursor, "status": "success"}
-        except Exception as exc:
-            db.rollback()
-            state = db.get(SyncState, resource) or SyncState(resource=resource)
-            state.status = "error"
-            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            state.error = str(detail)[:1000]
-            db.add(state)
-            db.commit()
-            log.exception("Sync failed for %s", resource)
-            if raise_http:
-                if isinstance(exc, HTTPException):
-                    raise
-                raise HTTPException(502, f"Sync {resource}: {detail}") from exc
-            return {"resource": resource, "status": "error", "error": str(detail)}
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        else:
+            snapshot = _set_state(
+                resource,
+                status="partial",
+                records=total,
+                error=f"Limite de {MAX_PAGES} páginas; rode sync incremental para continuar",
+            )
+            log.warning("Sync %s partial after %s pages (%s records)", resource, MAX_PAGES, total)
+            return {**snapshot, "records": total, "status": "partial"}
+
+        snapshot = _set_state(
+            resource,
+            status="success",
+            records=total,
+            error=None,
+            last_success_at=datetime.now(timezone.utc),
+        )
+        return {"resource": resource, "records": total, "cursor": snapshot["cursor"], "status": "success"}
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        _set_state(resource, status="error", error=str(detail)[:1000], records=total)
+        log.exception("Sync failed for %s", resource)
+        if raise_http:
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(502, f"Sync {resource}: {detail}") from exc
+        return {"resource": resource, "status": "error", "error": str(detail)}
 
 
 async def sync_all(full=False, *, raise_http=True):
