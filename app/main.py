@@ -25,6 +25,15 @@ async def lifespan(app):
     Base.metadata.create_all(engine)
     cfg = settings()
     log.info("CORS origins: %s", cfg.origins)
+    with SessionLocal() as db:
+        stuck = list(db.scalars(select(SyncState).where(SyncState.status == "running")))
+        for state in stuck:
+            state.status = "interrupted"
+            state.error = "Serviço reiniciou durante a sync"
+            db.add(state)
+        if stuck:
+            db.commit()
+            log.warning("Reset %s sync(s) stuck in running", len(stuck))
     if cfg.mercos_adaptor_url and cfg.mercos_adaptor_api_key:
         scheduler.add_job(
             sync_orders_job,
