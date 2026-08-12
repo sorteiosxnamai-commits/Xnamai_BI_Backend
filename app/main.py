@@ -102,11 +102,22 @@ def get_rankings(days: int = Query(30, ge=0, le=3650), db: Session = Depends(db_
 @app.get("/api/v1/intelligence/customers", dependencies=[Depends(auth)])
 def get_customer_intelligence(
     inactive_days: int = Query(90, ge=14, le=730),
-    risk_days: int = Query(45, ge=7, le=365),
+    risk_days: int = Query(90, ge=7, le=365),
     limit: int = Query(500, ge=1, le=5000),
+    segment: str | None = Query(None, description="todos|ativo|em_risco|recuperar|lead_novo"),
+    sort: str | None = Query(None, description="name|orders|revenue|ticketAverage|lastOrderAt|daysSinceLastOrder|..."),
+    order: str = Query("asc", pattern="^(asc|desc)$"),
     db: Session = Depends(db_session),
 ):
-    return customer_intelligence(db, inactive_days=inactive_days, risk_days=risk_days, limit=limit)
+    return customer_intelligence(
+        db,
+        inactive_days=inactive_days,
+        risk_days=risk_days,
+        limit=limit,
+        segment=segment,
+        sort=sort,
+        order=order,
+    )
 
 
 @app.get("/api/v1/intelligence/leads", dependencies=[Depends(auth)])

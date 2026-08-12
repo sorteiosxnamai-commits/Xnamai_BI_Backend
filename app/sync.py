@@ -23,10 +23,27 @@ def dt(value):
 
 
 def f(value):
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return 0.0
+    text = str(value).strip()
+    # BR: 1.234.567,89 → 1234567.89
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
     try:
-        return float(value or 0)
+        n = float(text)
     except (ValueError, TypeError):
-        return 0
+        return 0.0
+    # Descarta totais absurdos na origem
+    if n < 0 or n > 5_000_000:
+        return 0.0
+    return n
 
 
 def _upsert_rows(db, resource: str, rows: list):

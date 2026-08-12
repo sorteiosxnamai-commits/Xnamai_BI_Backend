@@ -7,8 +7,12 @@ from app.models import Customer, Order, OrderItem, Product, Seller
 
 # Mercos v2: 0=Cancelado, 1=Orçamento, 2=Pedido. Also keep legacy text/codes.
 CANCELLED = {"0", "5", "cancelled", "cancelado"}
-# Orçamentos não entram em faturamento / ticket
+# Orçamentos e cancelados fora do faturamento
 NON_REVENUE = CANCELLED | {"1", "orcamento", "orçamento", "budget", "quote"}
+# Só pedidos confirmados entram em faturamento de clientes (evita lixo de orçamento/cancelado)
+REVENUE_STATUSES = {"2", "pedido", "order"}
+# Totais absurdos (dado sujo) não entram na soma
+MAX_ORDER_TOTAL = 500_000.0
 
 
 def _now():
@@ -26,11 +30,15 @@ def _status_key(value) -> str:
 
 
 def _is_revenue_status(status) -> bool:
-    return _status_key(status) not in NON_REVENUE
+    return _status_key(status) in REVENUE_STATUSES
 
 
 def _valid_orders(days: int | None = None):
-    q = select(Order).where(~func.lower(Order.status).in_(NON_REVENUE))
+    q = select(Order).where(
+        func.lower(Order.status).in_(REVENUE_STATUSES),
+        Order.total > 0,
+        Order.total < MAX_ORDER_TOTAL,
+    )
     start = period_start(days)
     if start is not None:
         q = q.where(Order.issued_at >= start)
@@ -67,14 +75,14 @@ def dashboard(db: Session, days: int = 30):
     buyers = db.scalar(
         select(func.count(func.distinct(Order.customer_mercos_id))).where(
             Order.issued_at.is_not(None),
-            ~func.lower(Order.status).in_(NON_REVENUE),
+            func.lower(Order.status).in_(REVENUE_STATUSES),
             Order.customer_mercos_id.is_not(None),
             *date_filter,
         )
     ) or 0
     daily_q = (
         select(func.date(Order.issued_at), func.count(Order.id), func.sum(Order.total))
-        .where(Order.issued_at.is_not(None), ~func.lower(Order.status).in_(NON_REVENUE), *date_filter)
+        .where(Order.issued_at.is_not(None), func.lower(Order.status).in_(REVENUE_STATUSES), *date_filter)
         .group_by(func.date(Order.issued_at))
         .order_by(func.date(Order.issued_at))
     )
@@ -107,7 +115,7 @@ def rankings(db: Session, days: int = 30, limit: int = 10):
     product_q = (
         select(OrderItem.name, func.sum(OrderItem.quantity), func.sum(OrderItem.total))
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(~func.lower(Order.status).in_(NON_REVENUE))
+        .where(func.lower(Order.status).in_(REVENUE_STATUSES))
         .group_by(OrderItem.name)
         .order_by(func.sum(OrderItem.total).desc())
         .limit(limit)
@@ -115,7 +123,7 @@ def rankings(db: Session, days: int = 30, limit: int = 10):
     customer_q = (
         select(Customer.name, func.count(Order.id), func.sum(Order.total))
         .join(Order, Order.customer_mercos_id == Customer.mercos_id)
-        .where(~func.lower(Order.status).in_(NON_REVENUE))
+        .where(func.lower(Order.status).in_(REVENUE_STATUSES))
         .group_by(Customer.name)
         .order_by(func.sum(Order.total).desc())
         .limit(limit)
@@ -123,7 +131,7 @@ def rankings(db: Session, days: int = 30, limit: int = 10):
     seller_q = (
         select(Seller.name, func.count(Order.id), func.sum(Order.total))
         .join(Order, Order.seller_mercos_id == Seller.mercos_id)
-        .where(~func.lower(Order.status).in_(NON_REVENUE))
+        .where(func.lower(Order.status).in_(REVENUE_STATUSES))
         .group_by(Seller.name)
         .order_by(func.sum(Order.total).desc())
         .limit(limit)
@@ -154,50 +162,153 @@ def _customer_order_stats(db: Session):
                 func.min(Order.issued_at).label("first_order_at"),
             )
             .where(
-                ~func.lower(Order.status).in_(NON_REVENUE),
+                func.lower(Order.status).in_(REVENUE_STATUSES),
                 Order.customer_mercos_id.is_not(None),
+                Order.customer_mercos_id != "",
+                Order.total > 0,
+                Order.total < MAX_ORDER_TOTAL,
             )
             .group_by(Order.customer_mercos_id)
         ).all()
     }
 
 
+def _aware(dt_value):
+    if dt_value is None:
+        return None
+    if dt_value.tzinfo is None:
+        return dt_value.replace(tzinfo=timezone.utc)
+    return dt_value
+
+
 def classify_customer(stats, *, inactive_days: int, risk_days: int, now: datetime) -> str:
+    """
+    Ativo: comprou nos últimos 3 meses (`inactive_days`).
+    Em risco: sem compra há pelo menos 3 meses (91+ dias).
+    Recuperar: parado há mais de 6 meses (2× inactive_days) — foco de recuperação.
+    Lead novo: sem pedidos, ou primeiros pedidos recentes.
+    """
+    _ = risk_days
     if stats is None or not stats.orders:
         return "lead_novo"
-    last = stats.last_order_at
+    first = _aware(stats.first_order_at)
+    last = _aware(stats.last_order_at)
     if last is None:
         return "lead_novo"
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
     days_since = (now - last).days
-    if days_since <= risk_days:
-        return "ativo"
+    days_since_first = (now - first).days if first else days_since
+    if days_since_first <= inactive_days and int(stats.orders) <= 5:
+        return "lead_novo"
     if days_since <= inactive_days:
-        return "em_risco"
-    return "recuperar"
+        return "ativo"
+    # 91+ → em risco; >180 → recuperar (ainda entra em “não compra há 3+ meses”)
+    if days_since > inactive_days * 2:
+        return "recuperar"
+    return "em_risco"
 
 
-def customer_intelligence(db: Session, *, inactive_days: int = 90, risk_days: int = 45, limit: int = 500):
+def _sort_customers(rows: list, segment: str | None, sort: str | None, order: str):
+    reverse = (order or "asc").lower() == "desc"
+    key = (sort or "").strip()
+
+    def by_num(field, default=0):
+        return lambda r: (r.get(field) is None, r.get(field) if r.get(field) is not None else default)
+
+    def by_str(field):
+        return lambda r: (r.get(field) or "").lower()
+
+    sorters = {
+        "name": by_str("name"),
+        "segment": by_str("segment"),
+        "potential": by_str("potential"),
+        "orders": by_num("orders", 0),
+        "revenue": by_num("revenue", 0),
+        "ticketAverage": by_num("ticketAverage", 0),
+        "lastOrderAt": by_str("lastOrderAt"),
+        "firstOrderAt": by_str("firstOrderAt"),
+        "daysSinceLastOrder": by_num("daysSinceLastOrder", 10**9),
+        "email": lambda r: (r.get("email") or r.get("phone") or "").lower(),
+    }
+    if key in sorters:
+        rows.sort(key=sorters[key], reverse=reverse)
+        return rows
+
+    # Defaults por aba
+    if segment == "ativo":
+        rows.sort(key=lambda r: r.get("lastOrderAt") or "", reverse=True)
+    elif segment == "em_risco":
+        rows.sort(key=lambda r: r.get("daysSinceLastOrder") if r.get("daysSinceLastOrder") is not None else 10**9)
+    elif segment == "recuperar":
+        rows.sort(
+            key=lambda r: (
+                -(r.get("revenue") or 0),
+                r.get("daysSinceLastOrder") if r.get("daysSinceLastOrder") is not None else 10**9,
+            )
+        )
+    elif segment == "lead_novo":
+        with_orders = [r for r in rows if (r.get("orders") or 0) > 0]
+        without = [r for r in rows if (r.get("orders") or 0) <= 0]
+        with_orders.sort(key=lambda r: r.get("firstOrderAt") or r.get("lastOrderAt") or "", reverse=True)
+        without.sort(key=lambda r: (r.get("name") or "").lower())
+        rows[:] = with_orders + without
+    else:
+        weight = {"ativo": 0, "lead_novo": 1, "em_risco": 2, "recuperar": 3}
+        rows.sort(
+            key=lambda r: (
+                weight.get(r["segment"], 9),
+                -(r.get("revenue") or 0),
+                r.get("daysSinceLastOrder") if r.get("daysSinceLastOrder") is not None else 10**9,
+            )
+        )
+    return rows
+
+
+def customer_intelligence(
+    db: Session,
+    *,
+    inactive_days: int = 90,
+    risk_days: int = 90,
+    limit: int = 500,
+    segment: str | None = None,
+    sort: str | None = None,
+    order: str = "asc",
+):
     now = _now()
     stats_map = _customer_order_stats(db)
     customers = db.scalars(select(Customer)).all()
     rows = []
     summary = {"ativo": 0, "em_risco": 0, "recuperar": 0, "lead_novo": 0}
+    seg_filter = (segment or "").strip().lower() or None
+    if seg_filter in {"", "todos", "all"}:
+        seg_filter = None
 
     for c in customers:
         st = stats_map.get(c.mercos_id)
-        segment = classify_customer(st, inactive_days=inactive_days, risk_days=risk_days, now=now)
-        summary[segment] = summary.get(segment, 0) + 1
-        last = st.last_order_at if st else None
-        if last is not None and last.tzinfo is None:
-            last = last.replace(tzinfo=timezone.utc)
+        seg = classify_customer(st, inactive_days=inactive_days, risk_days=risk_days, now=now)
+        summary[seg] = summary.get(seg, 0) + 1
+        # Aba "Em risco" = todos sem compra há 3+ meses (inclui Recuperar)
+        if seg_filter == "em_risco":
+            if seg not in {"em_risco", "recuperar"}:
+                continue
+        elif seg_filter and seg != seg_filter:
+            continue
+        last = _aware(st.last_order_at) if st else None
+        first = _aware(st.first_order_at) if st else None
         days_since = (now - last).days if last else None
         orders = int(st.orders) if st else 0
         revenue = float(st.revenue) if st else 0.0
-        potential = "alto" if segment == "recuperar" and revenue >= 5000 else (
-            "medio" if segment in {"em_risco", "recuperar"} and revenue >= 1000 else (
-                "descobrir" if segment == "lead_novo" else "manter"
+        # Soma inválida (outliers) → zera faturamento exibido
+        if orders and revenue / orders > MAX_ORDER_TOTAL:
+            revenue = 0.0
+        if revenue < 0:
+            revenue = 0.0
+        potential = (
+            "alto"
+            if seg == "recuperar" and revenue >= 5000
+            else (
+                "medio"
+                if seg in {"em_risco", "recuperar"} and revenue >= 1000
+                else ("descobrir" if seg == "lead_novo" else "manter")
             )
         )
         rows.append(
@@ -208,33 +319,43 @@ def customer_intelligence(db: Session, *, inactive_days: int = 90, risk_days: in
                 "state": c.state,
                 "email": c.email,
                 "phone": c.phone,
-                "segment": segment,
+                "segment": seg,
                 "potential": potential,
                 "orders": orders,
                 "revenue": round(revenue, 2),
                 "ticketAverage": round(revenue / orders, 2) if orders else 0,
-                "firstOrderAt": st.first_order_at.isoformat() if st and st.first_order_at else None,
+                "firstOrderAt": first.isoformat() if first else None,
                 "lastOrderAt": last.isoformat() if last else None,
                 "daysSinceLastOrder": days_since,
             }
         )
 
-    # Prioritize recover / risk / revenue for the matrix view
-    weight = {"recuperar": 0, "em_risco": 1, "lead_novo": 2, "ativo": 3}
-    rows.sort(key=lambda r: (weight.get(r["segment"], 9), -(r["revenue"] or 0), r["name"] or ""))
+    # Em risco: ordenar 91, 92, … mesmo quando inclui “recuperar”
+    sort_segment = "em_risco" if seg_filter == "em_risco" else seg_filter
+    _sort_customers(rows, sort_segment, sort, order)
     return {
         "inactiveDays": inactive_days,
         "riskDays": risk_days,
+        "segment": seg_filter or "todos",
+        "sort": sort,
+        "order": order,
         "summary": summary,
-        "total": len(rows),
+        "total": sum(summary.values()),
+        "matched": len(rows),
         "customers": rows[:limit],
     }
 
 
-def leads_to_recover(db: Session, *, inactive_days: int = 90, risk_days: int = 45, limit: int = 200):
-    data = customer_intelligence(db, inactive_days=inactive_days, risk_days=risk_days, limit=10_000)
+def leads_to_recover(db: Session, *, inactive_days: int = 90, risk_days: int = 90, limit: int = 200):
+    data = customer_intelligence(
+        db,
+        inactive_days=inactive_days,
+        risk_days=risk_days,
+        limit=10_000,
+        segment=None,
+    )
     leads = [c for c in data["customers"] if c["segment"] in {"recuperar", "em_risco"}]
-    leads.sort(key=lambda r: (-(r["revenue"] or 0), -(r["daysSinceLastOrder"] or 0)))
+    leads.sort(key=lambda r: (r.get("daysSinceLastOrder") if r.get("daysSinceLastOrder") is not None else 10**9, -(r["revenue"] or 0)))
     return {
         "inactiveDays": inactive_days,
         "riskDays": risk_days,
@@ -249,7 +370,7 @@ def dead_stock(db: Session, *, no_sale_days: int = 90, limit: int = 200):
         select(func.distinct(OrderItem.product_mercos_id))
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
         .where(
-            ~func.lower(Order.status).in_(NON_REVENUE),
+            func.lower(Order.status).in_(REVENUE_STATUSES),
             OrderItem.product_mercos_id.is_not(None),
         )
     )
@@ -266,7 +387,7 @@ def dead_stock(db: Session, *, no_sale_days: int = 90, limit: int = 200):
             )
             .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
             .where(
-                ~func.lower(Order.status).in_(NON_REVENUE),
+                func.lower(Order.status).in_(REVENUE_STATUSES),
                 OrderItem.product_mercos_id.is_not(None),
             )
             .group_by(OrderItem.product_mercos_id)
@@ -316,7 +437,7 @@ def product_movers(db: Session, *, days: int = 365, limit: int = 20):
             func.sum(OrderItem.total).label("revenue"),
         )
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(~func.lower(Order.status).in_(NON_REVENUE))
+        .where(func.lower(Order.status).in_(REVENUE_STATUSES))
         .group_by(OrderItem.product_mercos_id, OrderItem.name, OrderItem.code)
     )
     if start is not None:
