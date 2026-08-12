@@ -22,6 +22,7 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app):
     Base.metadata.create_all(engine)
     cfg = settings()
+    log.info("CORS origins: %s", cfg.origins)
     if cfg.mercos_adaptor_url and cfg.mercos_adaptor_api_key:
         scheduler.add_job(
             sync_orders_job,
@@ -59,7 +60,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings().origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 

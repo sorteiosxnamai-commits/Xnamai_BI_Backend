@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     mercos_adaptor_url: str = ""
     mercos_adaptor_api_key: str = ""
     bi_api_key: str = "change-me"
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://localhost:5173,https://xnamai-bi-frontend.vercel.app"
     sync_orders_minutes: int = 10
     sync_catalog_hours: int = 6
     log_level: str = "INFO"
@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_database_url_field(cls, value: str) -> str:
         return normalize_database_url(value)
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def normalize_cors_origins(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return "http://localhost:5173,https://xnamai-bi-frontend.vercel.app"
+        return value.strip().strip('"').strip("'")
 
     @property
     def origins(self):

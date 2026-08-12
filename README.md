@@ -21,7 +21,7 @@ Obrigatório:
 - `MERCOS_ADAPTOR_URL=https://mercosadaptor.onrender.com`
 - `MERCOS_ADAPTOR_API_KEY` — mesma chave do Adaptor
 - `BI_API_KEY` — chave que o frontend envia em `X-API-Key`
-- `CORS_ORIGINS` — URL do front (ex.: `https://xnamai-bi-frontend.onrender.com,http://localhost:5173`)
+- `CORS_ORIGINS` — URLs do front (ex.: `https://xnamai-bi-frontend.vercel.app,http://localhost:5173`)
 
 ## Primeira carga
 
