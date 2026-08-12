@@ -22,7 +22,7 @@ class Adaptor:
 
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
                     r = await client.get(
                         url,
                         params=params,

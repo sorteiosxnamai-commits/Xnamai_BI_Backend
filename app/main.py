@@ -24,7 +24,7 @@ _sync_busy = False
 async def _resume_interrupted_sync():
     """Continue incremental sync after deploys that killed a background job."""
     global _sync_busy
-    await asyncio.sleep(8)
+    await asyncio.sleep(20)
     if _sync_busy:
         return
     with SessionLocal() as db:
