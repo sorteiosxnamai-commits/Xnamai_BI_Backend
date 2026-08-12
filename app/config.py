@@ -1,6 +1,50 @@
 from functools import lru_cache
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine.url import make_url
+
+# libpq/psycopg accept these; ORM helpers like pgbouncer=true must be stripped
+_ALLOWED_QUERY_KEYS = {
+    "sslmode",
+    "sslrootcert",
+    "sslcert",
+    "sslkey",
+    "sslcrl",
+    "gssencmode",
+    "channel_binding",
+    "connect_timeout",
+    "application_name",
+    "options",
+    "target_session_attrs",
+}
+
+
+def normalize_database_url(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        return value
+
+    url = value.strip().strip('"').strip("'")
+    if url.startswith("postgres://"):
+        url = "postgresql+psycopg://" + url[len("postgres://"):]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://"):]
+    elif not url.startswith("postgresql+psycopg://") and "://" not in url:
+        # already a driver URL or sqlite — leave non-postgres alone below
+        pass
+
+    if not url.startswith("postgresql+psycopg://"):
+        return url
+
+    parsed = make_url(url)
+    query = {k: v for k, v in parsed.query.items() if k in _ALLOWED_QUERY_KEYS}
+
+    host = (parsed.host or "").lower()
+    if "supabase.com" in host or "supabase.co" in host:
+        query.setdefault("sslmode", "require")
+        query.setdefault("gssencmode", "disable")
+
+    return parsed.set(query=query).render_as_string(hide_password=False)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -15,18 +59,14 @@ class Settings(BaseSettings):
 
     @field_validator("database_url", mode="before")
     @classmethod
-    def normalize_database_url(cls, value: str) -> str:
-        # Render/Heroku use postgres://; SQLAlchemy + psycopg3 need postgresql+psycopg://
-        if isinstance(value, str):
-            if value.startswith("postgres://"):
-                return "postgresql+psycopg://" + value[len("postgres://"):]
-            if value.startswith("postgresql://"):
-                return "postgresql+psycopg://" + value[len("postgresql://"):]
-        return value
+    def normalize_database_url_field(cls, value: str) -> str:
+        return normalize_database_url(value)
 
     @property
-    def origins(self): return [x.strip() for x in self.cors_origins.split(",") if x.strip()]
+    def origins(self):
+        return [x.strip() for x in self.cors_origins.split(",") if x.strip()]
+
 
 @lru_cache
-def settings(): return Settings()
-
+def settings():
+    return Settings()
