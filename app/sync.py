@@ -1,8 +1,14 @@
+import logging
 from datetime import datetime, timezone
+
+from fastapi import HTTPException
 from sqlalchemy import delete, select
+
 from app.adaptor import adaptor
 from app.database import SessionLocal
 from app.models import Customer, Order, OrderItem, Product, Seller, SyncState
+
+log = logging.getLogger("uvicorn.error")
 
 MAX_PAGES = 200
 
@@ -122,19 +128,33 @@ async def sync_resource(resource: str, full=False):
             state.records = total
             db.add(state)
             db.commit()
-            return {"resource": resource, "records": total, "cursor": state.cursor}
+            return {"resource": resource, "records": total, "cursor": state.cursor, "status": "success"}
         except Exception as exc:
             db.rollback()
             state = db.get(SyncState, resource) or SyncState(resource=resource)
             state.status = "error"
-            state.error = str(exc)[:1000]
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            state.error = str(detail)[:1000]
             db.add(state)
             db.commit()
-            raise
+            log.exception("Sync failed for %s", resource)
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(502, f"Sync {resource}: {detail}") from exc
 
 
 async def sync_all(full=False):
-    return [await sync_resource(r, full) for r in ("customers", "products", "users", "orders")]
+    results = []
+    errors = []
+    for resource in ("customers", "products", "users", "orders"):
+        try:
+            results.append(await sync_resource(resource, full))
+        except HTTPException as exc:
+            errors.append({"resource": resource, "status": "error", "error": str(exc.detail)})
+            results.append({"resource": resource, "status": "error", "error": str(exc.detail)})
+    if errors and not any(r.get("status") == "success" for r in results):
+        raise HTTPException(502, {"message": "Sync falhou", "results": results})
+    return results
 
 
 async def sync_orders_job():
