@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -11,6 +12,18 @@ class Settings(BaseSettings):
     sync_orders_minutes: int = 10
     sync_catalog_hours: int = 6
     log_level: str = "INFO"
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: str) -> str:
+        # Render/Heroku use postgres://; SQLAlchemy + psycopg3 need postgresql+psycopg://
+        if isinstance(value, str):
+            if value.startswith("postgres://"):
+                return "postgresql+psycopg://" + value[len("postgres://"):]
+            if value.startswith("postgresql://"):
+                return "postgresql+psycopg://" + value[len("postgresql://"):]
+        return value
+
     @property
     def origins(self): return [x.strip() for x in self.cors_origins.split(",") if x.strip()]
 
