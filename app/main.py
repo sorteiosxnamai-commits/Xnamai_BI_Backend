@@ -21,39 +21,22 @@ scheduler = AsyncIOScheduler()
 _sync_busy = False
 
 
-async def _resume_interrupted_sync():
-    """Continue incremental sync after deploys that killed a background job."""
-    global _sync_busy
-    await asyncio.sleep(20)
-    if _sync_busy:
-        return
-    with SessionLocal() as db:
-        states = list(db.scalars(select(SyncState)))
-        resume = any(s.status in {"interrupted", "partial"} for s in states)
-    if not resume:
-        return
-    _sync_busy = True
-    log.info("Resuming interrupted/partial Mercos sync (incremental)")
-    try:
-        await sync_all(False, raise_http=False)
-    finally:
-        _sync_busy = False
-
-
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
     cfg = settings()
     log.info("CORS origins: %s", cfg.origins)
+    # Never auto-resume Mercos sync on boot — it starves dashboard reads on free Render.
+    # User clicks Sincronizar / Primeira carga when they want to sync.
     with SessionLocal() as db:
         stuck = list(db.scalars(select(SyncState).where(SyncState.status == "running")))
         for state in stuck:
             state.status = "interrupted"
-            state.error = "Serviço reiniciou durante a sync — retoma automático em breve"
+            state.error = "Serviço reiniciou durante a sync — use Sincronizar para continuar"
             db.add(state)
         if stuck:
             db.commit()
-            log.warning("Reset %s sync(s) stuck in running", len(stuck))
+            log.warning("Marked %s sync(s) interrupted (no auto-resume)", len(stuck))
     if cfg.mercos_adaptor_url and cfg.mercos_adaptor_api_key:
         scheduler.add_job(
             sync_orders_job,
@@ -79,7 +62,6 @@ async def lifespan(app):
             cfg.sync_orders_minutes,
             cfg.sync_catalog_hours,
         )
-        asyncio.create_task(_resume_interrupted_sync())
     else:
         log.warning("Scheduler disabled: MERCOS_ADAPTOR_URL/API_KEY missing")
     yield
