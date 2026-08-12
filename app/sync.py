@@ -98,7 +98,7 @@ def _upsert_rows(db, resource: str, rows: list):
                 )
 
 
-async def sync_resource(resource: str, full=False):
+async def sync_resource(resource: str, full=False, *, raise_http=True):
     with SessionLocal() as db:
         state = db.get(SyncState, resource) or SyncState(resource=resource)
         cursor = None if full else state.cursor
@@ -138,29 +138,26 @@ async def sync_resource(resource: str, full=False):
             db.add(state)
             db.commit()
             log.exception("Sync failed for %s", resource)
-            if isinstance(exc, HTTPException):
-                raise
-            raise HTTPException(502, f"Sync {resource}: {detail}") from exc
+            if raise_http:
+                if isinstance(exc, HTTPException):
+                    raise
+                raise HTTPException(502, f"Sync {resource}: {detail}") from exc
+            return {"resource": resource, "status": "error", "error": str(detail)}
 
 
-async def sync_all(full=False):
+async def sync_all(full=False, *, raise_http=True):
     results = []
-    errors = []
     for resource in ("customers", "products", "users", "orders"):
-        try:
-            results.append(await sync_resource(resource, full))
-        except HTTPException as exc:
-            errors.append({"resource": resource, "status": "error", "error": str(exc.detail)})
-            results.append({"resource": resource, "status": "error", "error": str(exc.detail)})
-    if errors and not any(r.get("status") == "success" for r in results):
+        results.append(await sync_resource(resource, full, raise_http=False))
+    if raise_http and results and all(r.get("status") == "error" for r in results):
         raise HTTPException(502, {"message": "Sync falhou", "results": results})
     return results
 
 
 async def sync_orders_job():
-    await sync_resource("orders", full=False)
+    await sync_resource("orders", full=False, raise_http=False)
 
 
 async def sync_catalog_job():
     for resource in ("customers", "products", "users"):
-        await sync_resource(resource, full=False)
+        await sync_resource(resource, full=False, raise_http=False)

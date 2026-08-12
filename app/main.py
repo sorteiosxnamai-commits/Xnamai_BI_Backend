@@ -3,19 +3,21 @@ import secrets
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.analytics import dashboard, rankings
 from app.config import settings
-from app.database import Base, db_session, engine
+from app.database import Base, SessionLocal, db_session, engine
 from app.models import Customer, Order, Product, Seller, SyncState
 from app.sync import sync_all, sync_catalog_job, sync_orders_job, sync_resource
 
 log = logging.getLogger("uvicorn.error")
 scheduler = AsyncIOScheduler()
+_sync_busy = False
 
 
 @asynccontextmanager
@@ -157,9 +159,45 @@ def sync_status(db: Session = Depends(db_session)):
 
 
 @app.post("/api/v1/sync/{resource}", dependencies=[Depends(auth)])
-async def run_sync(resource: str, full: bool = False):
-    if resource == "all":
-        return await sync_all(full)
-    if resource not in {"customers", "products", "users", "orders"}:
+async def run_sync(resource: str, background_tasks: BackgroundTasks, full: bool = False):
+    global _sync_busy
+    if resource not in {"all", "customers", "products", "users", "orders"}:
         raise HTTPException(404, "Recurso inválido")
-    return await sync_resource(resource, full)
+
+    targets = ("customers", "products", "users", "orders") if resource == "all" else (resource,)
+    with SessionLocal() as db:
+        running = any(x.status == "running" for x in db.scalars(select(SyncState)))
+        if _sync_busy or running:
+            return JSONResponse(
+                status_code=202,
+                content={"status": "running", "message": "Sync já em andamento", "resource": resource, "full": full},
+            )
+        for name in targets:
+            state = db.get(SyncState, name) or SyncState(resource=name)
+            state.status = "running"
+            state.error = None
+            db.add(state)
+        db.commit()
+
+    _sync_busy = True
+
+    async def _job():
+        global _sync_busy
+        try:
+            if resource == "all":
+                await sync_all(full, raise_http=False)
+            else:
+                await sync_resource(resource, full, raise_http=False)
+        finally:
+            _sync_busy = False
+
+    background_tasks.add_task(_job)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "started",
+            "message": "Sync iniciada em background. Acompanhe em /api/v1/sync/status",
+            "resource": resource,
+            "full": full,
+        },
+    )
