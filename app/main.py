@@ -9,7 +9,16 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.analytics import customer_intelligence, dashboard, dead_stock, leads_to_recover, product_movers, rankings
+from app.analytics import (
+    customer_intelligence,
+    dashboard,
+    dead_stock,
+    leads_to_recover,
+    orders_insight,
+    period_start,
+    product_movers,
+    rankings,
+)
 from app.config import settings
 from app.database import Base, SessionLocal, db_session, engine
 from app.models import Customer, Order, Product, Seller, SyncState
@@ -145,9 +154,27 @@ def get_product_movers(days: int = Query(365, ge=0, le=3650), db: Session = Depe
 
 
 @app.get("/api/v1/orders", dependencies=[Depends(auth)])
-def orders(limit: int = Query(100, le=500), db: Session = Depends(db_session)):
+def orders(
+    limit: int = Query(200, le=2000),
+    days: int = Query(0, ge=0, le=3650),
+    sort: str | None = Query(None),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    db: Session = Depends(db_session),
+):
     customers = {x.mercos_id: x.name for x in db.scalars(select(Customer))}
     sellers = {x.mercos_id: x.name for x in db.scalars(select(Seller))}
+    start = period_start(days)
+    q = select(Order).where(Order.issued_at.is_not(None))
+    if start is not None:
+        q = q.where(Order.issued_at >= start)
+    sort_map = {
+        "number": Order.number,
+        "status": Order.status,
+        "date": Order.issued_at,
+        "total": Order.total,
+    }
+    col = sort_map.get(sort or "date", Order.issued_at)
+    q = q.order_by(col.asc() if order == "asc" else col.desc())
     return [
         {
             "id": x.mercos_id,
@@ -160,8 +187,17 @@ def orders(limit: int = Query(100, le=500), db: Session = Depends(db_session)):
             "date": x.issued_at,
             "total": x.total,
         }
-        for x in db.scalars(select(Order).order_by(desc(Order.issued_at)).limit(limit))
+        for x in db.scalars(q.limit(limit))
     ]
+
+
+@app.get("/api/v1/orders/insight", dependencies=[Depends(auth)])
+def get_orders_insight(
+    days: int = Query(30, ge=0, le=3650),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(db_session),
+):
+    return orders_insight(db, days=days, limit=limit)
 
 
 @app.get("/api/v1/products", dependencies=[Depends(auth)])

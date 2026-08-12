@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.models import Customer, Order, OrderItem, Product, Seller
@@ -452,3 +452,114 @@ def product_movers(db: Session, *, days: int = 365, limit: int = 20):
         for pid, name, code, qty, rev in list(reversed(sold[-limit:])) if sold
     ]
     return {"periodDays": days, "top": top, "slow": bottom}
+
+
+def orders_insight(db: Session, *, days: int = 30, limit: int = 10):
+    """Macros e rankings de pedidos no período."""
+    start = period_start(days)
+    q = select(Order).where(
+        Order.issued_at.is_not(None),
+        func.lower(Order.status).in_(REVENUE_STATUSES),
+        Order.total > 0,
+        Order.total < MAX_ORDER_TOTAL,
+    )
+    if start is not None:
+        q = q.where(Order.issued_at >= start)
+    rows = list(db.scalars(q.order_by(desc(Order.total))).all())
+    customers = {c.mercos_id: c.name for c in db.scalars(select(Customer)).all()}
+    sellers = {s.mercos_id: s.name for s in db.scalars(select(Seller)).all()}
+
+    def pack(o: Order):
+        return {
+            "id": o.mercos_id,
+            "number": o.number,
+            "customerId": o.customer_mercos_id,
+            "customerName": customers.get(o.customer_mercos_id) or o.customer_mercos_id or "—",
+            "sellerId": o.seller_mercos_id,
+            "sellerName": sellers.get(o.seller_mercos_id) or o.seller_mercos_id or "—",
+            "status": o.status,
+            "date": o.issued_at.isoformat() if o.issued_at else None,
+            "total": float(o.total or 0),
+        }
+
+    count = len(rows)
+    revenue = sum(float(o.total or 0) for o in rows)
+    totals = [float(o.total or 0) for o in rows]
+    biggest = [pack(o) for o in rows[:limit]]
+    smallest = [pack(o) for o in sorted(rows, key=lambda x: float(x.total or 0))[:limit]]
+
+    by_customer: dict[str, dict] = {}
+    for o in rows:
+        cid = o.customer_mercos_id or ""
+        if not cid:
+            continue
+        slot = by_customer.setdefault(cid, {"orders": 0, "revenue": 0.0, "last": o.issued_at})
+        slot["orders"] += 1
+        slot["revenue"] += float(o.total or 0)
+        if o.issued_at and (slot["last"] is None or o.issued_at > slot["last"]):
+            slot["last"] = o.issued_at
+
+    top_by_orders = sorted(by_customer.items(), key=lambda kv: (-kv[1]["orders"], -kv[1]["revenue"]))[:limit]
+    top_by_revenue = sorted(by_customer.items(), key=lambda kv: (-kv[1]["revenue"], -kv[1]["orders"]))[:limit]
+
+    # Clientes da base que há mais tempo não pedem (com pelo menos 1 pedido histórico)
+    now = _now()
+    last_map = {
+        row.customer_mercos_id: row.last_at
+        for row in db.execute(
+            select(Order.customer_mercos_id, func.max(Order.issued_at).label("last_at"))
+            .where(
+                func.lower(Order.status).in_(REVENUE_STATUSES),
+                Order.customer_mercos_id.is_not(None),
+                Order.customer_mercos_id != "",
+                Order.issued_at.is_not(None),
+            )
+            .group_by(Order.customer_mercos_id)
+        ).all()
+    }
+    idle = []
+    for cid, last in last_map.items():
+        last_a = _aware(last)
+        if not last_a:
+            continue
+        idle.append(
+            {
+                "id": cid,
+                "name": customers.get(cid) or cid,
+                "lastOrderAt": last_a.isoformat(),
+                "daysSinceLastOrder": (now - last_a).days,
+            }
+        )
+    idle.sort(key=lambda r: -(r["daysSinceLastOrder"] or 0))
+
+    return {
+        "periodDays": days,
+        "kpis": {
+            "orders": count,
+            "revenue": round(revenue, 2),
+            "ticketAverage": round(revenue / count, 2) if count else 0,
+            "maxOrder": round(max(totals), 2) if totals else 0,
+            "minOrder": round(min(totals), 2) if totals else 0,
+        },
+        "biggestOrders": biggest,
+        "smallestOrders": smallest,
+        "topCustomersByOrders": [
+            {
+                "id": cid,
+                "name": customers.get(cid) or cid,
+                "orders": data["orders"],
+                "revenue": round(data["revenue"], 2),
+            }
+            for cid, data in top_by_orders
+        ],
+        "topCustomersByRevenue": [
+            {
+                "id": cid,
+                "name": customers.get(cid) or cid,
+                "orders": data["orders"],
+                "revenue": round(data["revenue"], 2),
+            }
+            for cid, data in top_by_revenue
+        ],
+        "idleCustomers": idle[:limit],
+    }
