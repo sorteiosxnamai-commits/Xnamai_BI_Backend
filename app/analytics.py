@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.models import Customer, Order, OrderItem, Product, Seller
+
+BR_TZ = ZoneInfo("America/Sao_Paulo")
 
 # Mercos v2: 0=Cancelado, 1=Orçamento, 2=Pedido. Also keep legacy text/codes.
 CANCELLED = {"0", "5", "cancelled", "cancelado"}
@@ -93,6 +96,19 @@ def dashboard(db: Session, days: int = 30):
         .group_by(Order.status)
     )
     statuses = db.execute(status_q).all()
+
+    # Vendas do dia (calendário Brasil)
+    now_br = datetime.now(BR_TZ)
+    today_start = now_br.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    today_orders, today_revenue, _ = totals(today_start, None)
+    today_buyers = db.scalar(
+        select(func.count(func.distinct(Order.customer_mercos_id))).where(
+            Order.issued_at >= today_start,
+            func.lower(Order.status).in_(REVENUE_STATUSES),
+            Order.customer_mercos_id.is_not(None),
+        )
+    ) or 0
+
     return {
         "periodDays": days,
         "kpis": {
@@ -104,6 +120,13 @@ def dashboard(db: Session, days: int = 30):
             "customers": buyers,
             "customersTotal": db.scalar(select(func.count(Customer.id))) or 0,
             "cancellations": cancelled,
+        },
+        "today": {
+            "date": now_br.date().isoformat(),
+            "orders": today_orders,
+            "revenue": round(today_revenue, 2),
+            "ticketAverage": round(today_revenue / today_orders, 2) if today_orders else 0,
+            "customers": today_buyers,
         },
         "salesEvolution": [{"date": str(d), "orders": c, "revenue": round(v or 0, 2)} for d, c, v in daily],
         "status": [{"status": s, "orders": c, "value": round(v or 0, 2)} for s, c, v in statuses],
