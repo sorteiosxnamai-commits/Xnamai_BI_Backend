@@ -164,13 +164,18 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         return {"resource": resource, "records": total, "cursor": snapshot["cursor"], "status": "success"}
     except Exception as exc:
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        _set_state(resource, status="error", error=str(detail)[:1000], records=total)
+        # Network blips / Render cold starts — keep cursor and allow auto-resume
+        transient = isinstance(exc, HTTPException) and (
+            "inacessível" in str(exc.detail).lower() or exc.status_code in {502, 503}
+        )
+        status = "interrupted" if transient else "error"
+        _set_state(resource, status=status, error=str(detail)[:1000], records=total)
         log.exception("Sync failed for %s", resource)
         if raise_http:
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(502, f"Sync {resource}: {detail}") from exc
-        return {"resource": resource, "status": "error", "error": str(detail)}
+        return {"resource": resource, "status": status, "error": str(detail)}
 
 
 async def sync_all(full=False, *, raise_http=True):
