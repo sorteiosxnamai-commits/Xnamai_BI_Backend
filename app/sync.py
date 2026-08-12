@@ -68,9 +68,11 @@ def _upsert_rows(db, resource: str, rows: list):
             )
             obj.number = str(row.get("numero") or mid)
             obj.customer_mercos_id = str(row.get("cliente_id") or "") or None
-            obj.seller_mercos_id = str(row.get("usuario_id") or row.get("vendedor_id") or "") or None
-            obj.status = str(row.get("status") or row.get("situacao") or "unknown")
-            obj.issued_at = dt(row.get("data_emissao") or row.get("data_criacao"))
+            obj.seller_mercos_id = (
+                str(row.get("criador_id") or row.get("usuario_id") or row.get("vendedor_id") or "") or None
+            )
+            obj.status = str(row.get("status") if row.get("status") is not None else row.get("situacao") or "unknown")
+            obj.issued_at = dt(row.get("data_emissao") or row.get("data_criacao") or row.get("ultima_alteracao"))
             obj.total = f(row.get("total"))
             obj.discount = f(row.get("desconto"))
             obj.source_updated_at = dt(row.get("ultima_alteracao"))
@@ -80,18 +82,23 @@ def _upsert_rows(db, resource: str, rows: list):
             db.execute(delete(OrderItem).where(OrderItem.order_mercos_id == mid))
             for pos, item in enumerate(row.get("itens") or row.get("items") or []):
                 q = f(item.get("quantidade"))
-                unit = f(item.get("preco_unitario") or item.get("preco"))
-                total = f(item.get("total") or q * unit)
+                unit = f(
+                    item.get("preco_liquido")
+                    or item.get("preco_unitario")
+                    or item.get("preco")
+                    or item.get("preco_tabela")
+                )
+                total = f(item.get("subtotal") or item.get("total") or (q * unit))
                 db.add(
                     OrderItem(
                         order_mercos_id=mid,
                         position=pos,
                         product_mercos_id=str(item.get("produto_id") or "") or None,
-                        code=str(item.get("codigo") or ""),
-                        name=item.get("nome") or item.get("descricao") or "Produto",
+                        code=str(item.get("produto_codigo") or item.get("codigo") or ""),
+                        name=item.get("produto_nome") or item.get("nome") or item.get("descricao") or "Produto",
                         quantity=q,
                         unit_price=unit,
-                        discount=f(item.get("desconto")),
+                        discount=f(item.get("desconto") or item.get("desconto_de_cupom")),
                         total=total,
                         raw=item,
                     )

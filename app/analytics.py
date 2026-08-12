@@ -5,7 +5,10 @@ from sqlalchemy.orm import Session
 
 from app.models import Customer, Order, OrderItem, Product, Seller
 
-CANCELLED = {"5", "cancelled", "cancelado"}
+# Mercos v2: 0=Cancelado, 1=Orçamento, 2=Pedido. Also keep legacy text/codes.
+CANCELLED = {"0", "5", "cancelled", "cancelado"}
+# Orçamentos não entram em faturamento / ticket
+NON_REVENUE = CANCELLED | {"1", "orcamento", "orçamento", "budget", "quote"}
 
 
 def _now():
@@ -18,8 +21,16 @@ def period_start(days: int | None):
     return _now() - timedelta(days=days)
 
 
+def _status_key(value) -> str:
+    return (str(value) if value is not None else "").lower()
+
+
+def _is_revenue_status(status) -> bool:
+    return _status_key(status) not in NON_REVENUE
+
+
 def _valid_orders(days: int | None = None):
-    q = select(Order).where(~func.lower(Order.status).in_(CANCELLED))
+    q = select(Order).where(~func.lower(Order.status).in_(NON_REVENUE))
     start = period_start(days)
     if start is not None:
         q = q.where(Order.issued_at >= start)
@@ -27,35 +38,53 @@ def _valid_orders(days: int | None = None):
 
 
 def dashboard(db: Session, days: int = 30):
-    start = period_start(days) or (_now() - timedelta(days=30))
-    prev = start - ( _now() - start )
+    """days<=0 = all-time (no date filter)."""
+    start = period_start(days)
+    end = _now()
 
     def totals(a, b):
-        rows = db.scalars(select(Order).where(Order.issued_at >= a, Order.issued_at < b)).all()
-        valid = [x for x in rows if (x.status or "").lower() not in CANCELLED]
-        return len(valid), sum(x.total for x in valid), len([x for x in rows if (x.status or "").lower() in CANCELLED])
+        q = select(Order).where(Order.issued_at.is_not(None))
+        if a is not None:
+            q = q.where(Order.issued_at >= a)
+        if b is not None:
+            q = q.where(Order.issued_at < b)
+        rows = db.scalars(q).all()
+        valid = [x for x in rows if _is_revenue_status(x.status)]
+        cancelled = [x for x in rows if _status_key(x.status) in CANCELLED]
+        return len(valid), sum(x.total or 0 for x in valid), len(cancelled)
 
-    count, revenue, cancelled = totals(start, _now())
-    pc, pr, _ = totals(prev, start)
+    if start is None:
+        count, revenue, cancelled = totals(None, None)
+        pc, pr = 0, 0
+        date_filter = []
+    else:
+        prev = start - (end - start)
+        count, revenue, cancelled = totals(start, end)
+        pc, pr, _ = totals(prev, start)
+        date_filter = [Order.issued_at >= start]
+
     pct = lambda a, b: round((a - b) / b * 100, 1) if b else (100.0 if a else 0.0)
     buyers = db.scalar(
         select(func.count(func.distinct(Order.customer_mercos_id))).where(
-            Order.issued_at >= start,
-            ~func.lower(Order.status).in_(CANCELLED),
+            Order.issued_at.is_not(None),
+            ~func.lower(Order.status).in_(NON_REVENUE),
             Order.customer_mercos_id.is_not(None),
+            *date_filter,
         )
     ) or 0
-    daily = db.execute(
+    daily_q = (
         select(func.date(Order.issued_at), func.count(Order.id), func.sum(Order.total))
-        .where(Order.issued_at >= start, ~func.lower(Order.status).in_(CANCELLED))
+        .where(Order.issued_at.is_not(None), ~func.lower(Order.status).in_(NON_REVENUE), *date_filter)
         .group_by(func.date(Order.issued_at))
         .order_by(func.date(Order.issued_at))
-    ).all()
-    statuses = db.execute(
+    )
+    daily = db.execute(daily_q).all()
+    status_q = (
         select(Order.status, func.count(Order.id), func.sum(Order.total))
-        .where(Order.issued_at >= start)
+        .where(Order.issued_at.is_not(None), *date_filter)
         .group_by(Order.status)
-    ).all()
+    )
+    statuses = db.execute(status_q).all()
     return {
         "periodDays": days,
         "kpis": {
@@ -78,7 +107,7 @@ def rankings(db: Session, days: int = 30, limit: int = 10):
     product_q = (
         select(OrderItem.name, func.sum(OrderItem.quantity), func.sum(OrderItem.total))
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(~func.lower(Order.status).in_(CANCELLED))
+        .where(~func.lower(Order.status).in_(NON_REVENUE))
         .group_by(OrderItem.name)
         .order_by(func.sum(OrderItem.total).desc())
         .limit(limit)
@@ -86,7 +115,7 @@ def rankings(db: Session, days: int = 30, limit: int = 10):
     customer_q = (
         select(Customer.name, func.count(Order.id), func.sum(Order.total))
         .join(Order, Order.customer_mercos_id == Customer.mercos_id)
-        .where(~func.lower(Order.status).in_(CANCELLED))
+        .where(~func.lower(Order.status).in_(NON_REVENUE))
         .group_by(Customer.name)
         .order_by(func.sum(Order.total).desc())
         .limit(limit)
@@ -94,7 +123,7 @@ def rankings(db: Session, days: int = 30, limit: int = 10):
     seller_q = (
         select(Seller.name, func.count(Order.id), func.sum(Order.total))
         .join(Order, Order.seller_mercos_id == Seller.mercos_id)
-        .where(~func.lower(Order.status).in_(CANCELLED))
+        .where(~func.lower(Order.status).in_(NON_REVENUE))
         .group_by(Seller.name)
         .order_by(func.sum(Order.total).desc())
         .limit(limit)
@@ -125,7 +154,7 @@ def _customer_order_stats(db: Session):
                 func.min(Order.issued_at).label("first_order_at"),
             )
             .where(
-                ~func.lower(Order.status).in_(CANCELLED),
+                ~func.lower(Order.status).in_(NON_REVENUE),
                 Order.customer_mercos_id.is_not(None),
             )
             .group_by(Order.customer_mercos_id)
@@ -220,7 +249,7 @@ def dead_stock(db: Session, *, no_sale_days: int = 90, limit: int = 200):
         select(func.distinct(OrderItem.product_mercos_id))
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
         .where(
-            ~func.lower(Order.status).in_(CANCELLED),
+            ~func.lower(Order.status).in_(NON_REVENUE),
             OrderItem.product_mercos_id.is_not(None),
         )
     )
@@ -237,7 +266,7 @@ def dead_stock(db: Session, *, no_sale_days: int = 90, limit: int = 200):
             )
             .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
             .where(
-                ~func.lower(Order.status).in_(CANCELLED),
+                ~func.lower(Order.status).in_(NON_REVENUE),
                 OrderItem.product_mercos_id.is_not(None),
             )
             .group_by(OrderItem.product_mercos_id)
@@ -287,7 +316,7 @@ def product_movers(db: Session, *, days: int = 365, limit: int = 20):
             func.sum(OrderItem.total).label("revenue"),
         )
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(~func.lower(Order.status).in_(CANCELLED))
+        .where(~func.lower(Order.status).in_(NON_REVENUE))
         .group_by(OrderItem.product_mercos_id, OrderItem.name, OrderItem.code)
     )
     if start is not None:
