@@ -10,7 +10,7 @@ from app.models import Customer, Order, OrderItem, Product, Seller, SyncState
 
 log = logging.getLogger("uvicorn.error")
 
-MAX_PAGES = 200
+MAX_PAGES = 5000
 
 
 def dt(value):
@@ -123,9 +123,23 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
                 if not next_cursor or next_cursor == cursor:
                     break
                 cursor = next_cursor
+            else:
+                # Hit MAX_PAGES with more data remaining
+                state.status = "partial"
+                state.error = f"Limite de {MAX_PAGES} páginas; rode sync incremental para continuar"
+                db.add(state)
+                db.commit()
+                log.warning("Sync %s partial after %s pages (%s records)", resource, MAX_PAGES, total)
+                return {
+                    "resource": resource,
+                    "records": total,
+                    "cursor": state.cursor,
+                    "status": "partial",
+                }
             state.last_success_at = datetime.now(timezone.utc)
             state.status = "success"
             state.records = total
+            state.error = None
             db.add(state)
             db.commit()
             return {"resource": resource, "records": total, "cursor": state.cursor, "status": "success"}

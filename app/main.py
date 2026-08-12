@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.analytics import dashboard, rankings
+from app.analytics import customer_intelligence, dashboard, dead_stock, leads_to_recover, product_movers, rankings
 from app.config import settings
 from app.database import Base, SessionLocal, db_session, engine
 from app.models import Customer, Order, Product, Seller, SyncState
@@ -88,13 +88,47 @@ def health():
 
 
 @app.get("/api/v1/dashboard", dependencies=[Depends(auth)])
-def get_dashboard(days: int = Query(30, ge=1, le=730), db: Session = Depends(db_session)):
+def get_dashboard(days: int = Query(30, ge=0, le=3650), db: Session = Depends(db_session)):
     return dashboard(db, days)
 
 
 @app.get("/api/v1/rankings", dependencies=[Depends(auth)])
-def get_rankings(days: int = Query(30, ge=1, le=730), db: Session = Depends(db_session)):
+def get_rankings(days: int = Query(30, ge=0, le=3650), db: Session = Depends(db_session)):
     return rankings(db, days)
+
+
+@app.get("/api/v1/intelligence/customers", dependencies=[Depends(auth)])
+def get_customer_intelligence(
+    inactive_days: int = Query(90, ge=14, le=730),
+    risk_days: int = Query(45, ge=7, le=365),
+    limit: int = Query(500, ge=1, le=5000),
+    db: Session = Depends(db_session),
+):
+    return customer_intelligence(db, inactive_days=inactive_days, risk_days=risk_days, limit=limit)
+
+
+@app.get("/api/v1/intelligence/leads", dependencies=[Depends(auth)])
+def get_leads(
+    inactive_days: int = Query(90, ge=14, le=730),
+    risk_days: int = Query(45, ge=7, le=365),
+    limit: int = Query(200, ge=1, le=2000),
+    db: Session = Depends(db_session),
+):
+    return leads_to_recover(db, inactive_days=inactive_days, risk_days=risk_days, limit=limit)
+
+
+@app.get("/api/v1/intelligence/dead-stock", dependencies=[Depends(auth)])
+def get_dead_stock(
+    no_sale_days: int = Query(90, ge=14, le=730),
+    limit: int = Query(200, ge=1, le=2000),
+    db: Session = Depends(db_session),
+):
+    return dead_stock(db, no_sale_days=no_sale_days, limit=limit)
+
+
+@app.get("/api/v1/intelligence/product-movers", dependencies=[Depends(auth)])
+def get_product_movers(days: int = Query(365, ge=0, le=3650), db: Session = Depends(db_session)):
+    return product_movers(db, days=days)
 
 
 @app.get("/api/v1/orders", dependencies=[Depends(auth)])
