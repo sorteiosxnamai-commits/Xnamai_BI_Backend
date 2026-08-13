@@ -25,59 +25,10 @@ def upgrade() -> None:
                 sa.Column("list_unit_price", sa.Numeric(18, 2), nullable=True)
             )
 
-    if op.get_bind().dialect.name != "postgresql":
-        return
-
-    op.execute(
-        """
-        UPDATE order_items
-           SET list_unit_price =
-               REPLACE(raw ->> 'preco_tabela', ',', '.')::numeric(18, 2)
-         WHERE list_unit_price IS NULL
-           AND raw ->> 'preco_tabela'
-               ~ '^[[:space:]]*-?[0-9]+([.,][0-9]+)?[[:space:]]*$'
-        """
-    )
-    op.execute(
-        """
-        WITH item_discounts AS (
-            SELECT
-                order_mercos_id,
-                SUM(
-                    GREATEST(
-                        (list_unit_price - unit_price) * quantity,
-                        0
-                    )
-                ) AS discount_value,
-                COUNT(*) AS item_count,
-                COUNT(list_unit_price) AS priced_item_count
-            FROM order_items
-            WHERE COALESCE(raw ->> 'excluido', 'false') <> 'true'
-            GROUP BY order_mercos_id
-        ),
-        derived AS (
-            SELECT
-                orders.id,
-                item_discounts.discount_value,
-                COALESCE(orders.net_total, orders.total)
-                    + item_discounts.discount_value AS gross_total
-            FROM orders
-            JOIN item_discounts
-              ON item_discounts.order_mercos_id = orders.mercos_id
-            WHERE item_discounts.item_count = item_discounts.priced_item_count
-        )
-        UPDATE orders
-           SET gross_total = derived.gross_total,
-               discount_value = derived.discount_value,
-               discount_percent = CASE
-                   WHEN derived.gross_total > 0
-                   THEN derived.discount_value / derived.gross_total * 100
-                   ELSE 0
-               END
-          FROM derived
-         WHERE orders.id = derived.id
-        """
-    )
+    # Historical JSON backfill was removed: it timed out on production
+    # (statement_timeout while rewriting every order_items.raw). Analytics
+    # now uses current Product.list_price, and sync fills list_unit_price
+    # for newly persisted items.
 
 
 def downgrade() -> None:

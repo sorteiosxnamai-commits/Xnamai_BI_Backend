@@ -1,13 +1,17 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.models import Customer, Order, OrderItem, Product, Seller, SyncState
 from app.schemas.data_quality import DataQualityResponse
-from app.services.data_quality import build_data_quality_report
+from app.services.data_quality import (
+    _order_total_divergences,
+    build_data_quality_report,
+)
 
 
 def make_session() -> Session:
@@ -138,6 +142,17 @@ def test_data_quality_counts_coverage_and_warnings() -> None:
         assert parsed.metadata.isPartial is True
         assert any("95%" in warning for warning in parsed.warnings)
         assert any("Sincronização incompleta" in warning for warning in parsed.warnings)
+
+
+def test_data_quality_marks_divergences_unavailable_after_timeout() -> None:
+    with make_session() as db:
+        seed_dirty_data(db)
+
+        def fail_scalar(statement):
+            raise OperationalError("SELECT 1", {}, Exception("statement timeout"))
+
+        db.scalar = fail_scalar  # type: ignore[method-assign]
+        assert _order_total_divergences(db) is None
 
 
 def test_raw_inventory_only_returns_shape_not_values() -> None:

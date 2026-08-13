@@ -17,7 +17,7 @@ class IntegrityMetrics(BaseModel):
     ordersWithoutCustomer: int
     ordersWithoutSeller: int
     itemsWithoutProduct: int
-    orderTotalDivergences: int
+    orderTotalDivergences: int | None
 
 
 class DateRange(BaseModel):

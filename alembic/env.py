@@ -50,6 +50,8 @@ def run_migrations_online() -> None:
                     "hashtext('xnamai_bi_alembic_migrations'))"
                 )
             )
+            connection.execute(text("SET statement_timeout TO 0"))
+            connection.execute(text("SET lock_timeout TO '30s'"))
             connection.commit()
         try:
             context.configure(

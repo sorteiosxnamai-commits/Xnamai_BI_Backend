@@ -4,7 +4,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import String, cast, exists, func, or_, select
+from sqlalchemy import String, cast, exists, func, or_, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.domain.order_status import RECOGNIZED_ORDER_STATUSES, status_sql_in
@@ -95,6 +96,35 @@ def raw_field_inventory(db: Session, sample_limit: int = 100) -> dict[str, dict[
     return inventory
 
 
+def _order_total_divergences(db: Session) -> int | None:
+    diverged = (
+        select(OrderItem.order_mercos_id)
+        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .where(OrderItem.excluded.is_(False))
+        .group_by(OrderItem.order_mercos_id, Order.total)
+        .having(
+            func.abs(
+                func.coalesce(Order.total, 0)
+                - func.coalesce(func.sum(OrderItem.total), 0)
+            )
+            > 0.01
+        )
+        .subquery()
+    )
+    statement = select(func.count()).select_from(diverged)
+    bind = db.get_bind()
+    try:
+        if bind is not None and bind.dialect.name == "postgresql":
+            db.execute(text("SET LOCAL statement_timeout = '2500ms'"))
+        value = _scalar_int(db, statement)
+        if bind is not None and bind.dialect.name == "postgresql":
+            db.execute(text("RESET statement_timeout"))
+        return value
+    except OperationalError:
+        db.rollback()
+        return None
+
+
 def build_data_quality_report(
     db: Session, *, include_raw_inventory: bool = False, raw_sample_limit: int = 100
 ) -> dict[str, Any]:
@@ -156,22 +186,7 @@ def build_data_quality_report(
         ),
     )
 
-    item_totals = (
-        select(
-            OrderItem.order_mercos_id.label("order_id"),
-            func.coalesce(func.sum(OrderItem.total), 0).label("items_total"),
-        )
-        .where(OrderItem.excluded.is_(False))
-        .group_by(OrderItem.order_mercos_id)
-        .subquery()
-    )
-    order_total_divergences = _scalar_int(
-        db,
-        select(func.count(Order.id))
-        .select_from(Order)
-        .join(item_totals, item_totals.c.order_id == Order.mercos_id)
-        .where(func.abs(func.coalesce(Order.total, 0) - item_totals.c.items_total) > 0.01),
-    )
+    order_total_divergences = _order_total_divergences(db)
 
     min_date, max_date = db.execute(
         select(func.min(Order.issued_at), func.max(Order.issued_at))
@@ -254,6 +269,10 @@ def build_data_quality_report(
     if order_total_divergences:
         warnings.append(
             f"{order_total_divergences} pedido(s) divergem da soma de seus itens."
+        )
+    elif order_total_divergences is None:
+        warnings.append(
+            "Divergência pedido × itens não foi calculada: a consulta excedeu o tempo."
         )
     incomplete_statuses = {"running", "partial", "interrupted", "error"}
     incomplete_sync = [row.resource for row in sync_rows if row.status in incomplete_statuses]
