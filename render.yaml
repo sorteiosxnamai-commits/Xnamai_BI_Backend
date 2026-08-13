@@ -12,6 +12,18 @@ services:
         sync: false
       - key: BI_API_KEY
         generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+      - key: AUTH_ADMIN_USERNAME
+        value: "admin"
+      - key: AUTH_ADMIN_PASSWORD
+        sync: false
+      - key: AUTH_VIEWER_USERNAME
+        value: "viewer"
+      - key: AUTH_VIEWER_PASSWORD
+        sync: false
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
       - key: CORS_ORIGINS
         sync: false
       - key: SYNC_ORDERS_MINUTES

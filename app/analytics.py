@@ -4,16 +4,18 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
+from app.domain.order_status import (
+    CANCELLED_ORDER_STATUSES,
+    QUOTE_ORDER_STATUSES,
+    VALID_SALE_STATUSES,
+)
 from app.models import Customer, Order, OrderItem, Product, Seller
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 
-# Mercos v2: 0=Cancelado, 1=Orçamento, 2=Pedido. Also keep legacy text/codes.
-CANCELLED = {"0", "5", "cancelled", "cancelado"}
-# Orçamentos e cancelados fora do faturamento
-NON_REVENUE = CANCELLED | {"1", "orcamento", "orçamento", "budget", "quote"}
-# Só pedidos confirmados entram em faturamento de clientes (evita lixo de orçamento/cancelado)
-REVENUE_STATUSES = {"2", "pedido", "order"}
+CANCELLED = CANCELLED_ORDER_STATUSES
+NON_REVENUE = CANCELLED_ORDER_STATUSES | QUOTE_ORDER_STATUSES
+REVENUE_STATUSES = VALID_SALE_STATUSES
 # Totais absurdos (dado sujo) não entram na soma
 MAX_ORDER_TOTAL = 500_000.0
 
@@ -49,87 +51,255 @@ def _valid_orders(days: int | None = None):
 
 
 def dashboard(db: Session, days: int = 30):
-    """days<=0 = all-time (no date filter)."""
+    """Raio-x consolidado. Todas as métricas são agregadas no banco."""
     start = period_start(days)
     end = _now()
 
-    def totals(a, b):
-        q = select(Order).where(Order.issued_at.is_not(None))
-        if a is not None:
-            q = q.where(Order.issued_at >= a)
-        if b is not None:
-            q = q.where(Order.issued_at < b)
-        rows = db.scalars(q).all()
-        valid = [x for x in rows if _is_revenue_status(x.status)]
-        cancelled = [x for x in rows if _status_key(x.status) in CANCELLED]
-        return len(valid), sum(x.total or 0 for x in valid), len(cancelled)
-
-    if start is None:
-        count, revenue, cancelled = totals(None, None)
-        pc, pr = 0, 0
-        date_filter = []
-    else:
-        prev = start - (end - start)
-        count, revenue, cancelled = totals(start, end)
-        pc, pr, _ = totals(prev, start)
-        date_filter = [Order.issued_at >= start]
-
-    pct = lambda a, b: round((a - b) / b * 100, 1) if b else (100.0 if a else 0.0)
-    buyers = db.scalar(
-        select(func.count(func.distinct(Order.customer_mercos_id))).where(
+    def valid_conditions(a=None, b=None):
+        conditions = [
             Order.issued_at.is_not(None),
             func.lower(Order.status).in_(REVENUE_STATUSES),
-            Order.customer_mercos_id.is_not(None),
-            *date_filter,
+            Order.total > 0,
+            Order.total < MAX_ORDER_TOTAL,
+        ]
+        if a is not None:
+            conditions.append(Order.issued_at >= a)
+        if b is not None:
+            conditions.append(Order.issued_at < b)
+        return conditions
+
+    def period_stats(a=None, b=None):
+        row = db.execute(
+            select(
+                func.count(Order.id),
+                func.coalesce(func.sum(Order.total), 0),
+                func.coalesce(func.avg(Order.total), 0),
+                func.count(func.distinct(Order.customer_mercos_id)),
+                func.coalesce(func.sum(Order.discount), 0),
+            ).where(*valid_conditions(a, b))
+        ).one()
+        return {
+            "orders": int(row[0] or 0),
+            "revenue": float(row[1] or 0),
+            "ticket": float(row[2] or 0),
+            "customers": int(row[3] or 0),
+            "discount": float(row[4] or 0),
+        }
+
+    current = period_stats(start, end if start is not None else None)
+    if start is not None:
+        previous_start = start - (end - start)
+        previous = period_stats(previous_start, start)
+    else:
+        previous = {"orders": 0, "revenue": 0, "ticket": 0, "customers": 0, "discount": 0}
+
+    def change(value, prior):
+        return round((value - prior) / prior * 100, 1) if prior else (100.0 if value else 0.0)
+
+    date_conditions = []
+    if start is not None:
+        date_conditions.append(Order.issued_at >= start)
+        date_conditions.append(Order.issued_at < end)
+
+    cancelled = db.scalar(
+        select(func.count(Order.id)).where(
+            Order.issued_at.is_not(None),
+            func.lower(Order.status).in_(CANCELLED),
+            *date_conditions,
         )
     ) or 0
-    daily_q = (
-        select(func.date(Order.issued_at), func.count(Order.id), func.sum(Order.total))
-        .where(Order.issued_at.is_not(None), func.lower(Order.status).in_(REVENUE_STATUSES), *date_filter)
-        .group_by(func.date(Order.issued_at))
-        .order_by(func.date(Order.issued_at))
-    )
-    daily = db.execute(daily_q).all()
-    status_q = (
-        select(Order.status, func.count(Order.id), func.sum(Order.total))
-        .where(Order.issued_at.is_not(None), *date_filter)
-        .group_by(Order.status)
-    )
-    statuses = db.execute(status_q).all()
 
-    # Vendas do dia (calendário Brasil)
+    item_stats = db.execute(
+        select(
+            func.coalesce(func.sum(OrderItem.quantity), 0),
+            func.count(func.distinct(OrderItem.product_mercos_id)),
+        )
+        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .where(*valid_conditions(start, end if start is not None else None))
+    ).one()
+    items_sold = float(item_stats[0] or 0)
+    products_sold = int(item_stats[1] or 0)
+
+    granularity = "month" if not days or days > 365 else "day"
+    bucket = func.date_trunc(granularity, Order.issued_at)
+    evolution = db.execute(
+        select(
+            bucket.label("bucket"),
+            func.count(Order.id),
+            func.coalesce(func.sum(Order.total), 0),
+        )
+        .where(*valid_conditions(start, end if start is not None else None))
+        .group_by(bucket)
+        .order_by(bucket)
+    ).all()
+
+    statuses = db.execute(
+        select(
+            Order.status,
+            func.count(Order.id),
+            func.coalesce(func.sum(Order.total), 0),
+        )
+        .where(Order.issued_at.is_not(None), *date_conditions)
+        .group_by(Order.status)
+        .order_by(func.count(Order.id).desc())
+    ).all()
+
+    weekday_rows = db.execute(
+        select(
+            func.extract("isodow", Order.issued_at).label("weekday"),
+            func.count(Order.id),
+            func.coalesce(func.sum(Order.total), 0),
+        )
+        .where(*valid_conditions(start, end if start is not None else None))
+        .group_by("weekday")
+        .order_by("weekday")
+    ).all()
+
+    top_products = db.execute(
+        select(
+            OrderItem.product_mercos_id,
+            OrderItem.name,
+            func.coalesce(func.sum(OrderItem.quantity), 0),
+            func.coalesce(func.sum(OrderItem.total), 0),
+        )
+        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .where(*valid_conditions(start, end if start is not None else None))
+        .group_by(OrderItem.product_mercos_id, OrderItem.name)
+        .order_by(func.sum(OrderItem.total).desc())
+        .limit(10)
+    ).all()
+
+    top_customers = db.execute(
+        select(
+            Customer.mercos_id,
+            Customer.name,
+            func.count(Order.id),
+            func.coalesce(func.sum(Order.total), 0),
+        )
+        .join(Order, Order.customer_mercos_id == Customer.mercos_id)
+        .where(*valid_conditions(start, end if start is not None else None))
+        .group_by(Customer.mercos_id, Customer.name)
+        .order_by(func.sum(Order.total).desc())
+        .limit(10)
+    ).all()
+
+    top_sellers = db.execute(
+        select(
+            Seller.mercos_id,
+            Seller.name,
+            func.count(Order.id),
+            func.coalesce(func.sum(Order.total), 0),
+        )
+        .join(Order, Order.seller_mercos_id == Seller.mercos_id)
+        .where(*valid_conditions(start, end if start is not None else None))
+        .group_by(Seller.mercos_id, Seller.name)
+        .order_by(func.sum(Order.total).desc())
+        .limit(10)
+    ).all()
+
+    regions = db.execute(
+        select(
+            func.coalesce(Customer.state, "Sem UF"),
+            func.count(Order.id),
+            func.coalesce(func.sum(Order.total), 0),
+        )
+        .join(Order, Order.customer_mercos_id == Customer.mercos_id)
+        .where(*valid_conditions(start, end if start is not None else None))
+        .group_by(Customer.state)
+        .order_by(func.sum(Order.total).desc())
+        .limit(12)
+    ).all()
+
+    recent = db.execute(
+        select(Order, Customer.name, Seller.name)
+        .outerjoin(Customer, Order.customer_mercos_id == Customer.mercos_id)
+        .outerjoin(Seller, Order.seller_mercos_id == Seller.mercos_id)
+        .where(Order.issued_at.is_not(None), *date_conditions)
+        .order_by(Order.issued_at.desc())
+        .limit(15)
+    ).all()
+
     now_br = datetime.now(BR_TZ)
     today_start = now_br.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-    today_orders, today_revenue, _ = totals(today_start, None)
-    today_buyers = db.scalar(
-        select(func.count(func.distinct(Order.customer_mercos_id))).where(
-            Order.issued_at >= today_start,
-            func.lower(Order.status).in_(REVENUE_STATUSES),
-            Order.customer_mercos_id.is_not(None),
-        )
-    ) or 0
+    today = period_stats(today_start, None)
 
     return {
         "periodDays": days,
+        "granularity": granularity,
         "kpis": {
-            "revenue": round(revenue, 2),
-            "revenueChange": pct(revenue, pr),
-            "orders": count,
-            "ordersChange": pct(count, pc),
-            "ticketAverage": round(revenue / count, 2) if count else 0,
-            "customers": buyers,
+            "revenue": round(current["revenue"], 2),
+            "revenueChange": change(current["revenue"], previous["revenue"]),
+            "orders": current["orders"],
+            "ordersChange": change(current["orders"], previous["orders"]),
+            "ticketAverage": round(current["ticket"], 2),
+            "ticketChange": change(current["ticket"], previous["ticket"]),
+            "customers": current["customers"],
+            "customersChange": change(current["customers"], previous["customers"]),
             "customersTotal": db.scalar(select(func.count(Customer.id))) or 0,
-            "cancellations": cancelled,
+            "cancellations": int(cancelled),
+            "discount": round(current["discount"], 2),
+            "itemsSold": round(items_sold, 2),
+            "productsSold": products_sold,
+            "itemsPerOrder": round(items_sold / current["orders"], 2) if current["orders"] else 0,
         },
         "today": {
             "date": now_br.date().isoformat(),
-            "orders": today_orders,
-            "revenue": round(today_revenue, 2),
-            "ticketAverage": round(today_revenue / today_orders, 2) if today_orders else 0,
-            "customers": today_buyers,
+            "orders": today["orders"],
+            "revenue": round(today["revenue"], 2),
+            "ticketAverage": round(today["ticket"], 2),
+            "customers": today["customers"],
         },
-        "salesEvolution": [{"date": str(d), "orders": c, "revenue": round(v or 0, 2)} for d, c, v in daily],
-        "status": [{"status": s, "orders": c, "value": round(v or 0, 2)} for s, c, v in statuses],
+        "salesEvolution": [
+            {
+                "date": b.date().isoformat() if hasattr(b, "date") else str(b),
+                "orders": int(c or 0),
+                "revenue": round(float(v or 0), 2),
+            }
+            for b, c, v in evolution
+        ],
+        "status": [
+            {"status": str(s), "orders": int(c or 0), "value": round(float(v or 0), 2)}
+            for s, c, v in statuses
+        ],
+        "weekdaySales": [
+            {"weekday": int(w), "orders": int(c or 0), "revenue": round(float(v or 0), 2)}
+            for w, c, v in weekday_rows
+        ],
+        "regions": [
+            {"state": state, "orders": int(c or 0), "revenue": round(float(v or 0), 2)}
+            for state, c, v in regions
+        ],
+        "rankings": {
+            "products": [
+                {
+                    "id": pid,
+                    "name": name,
+                    "quantity": float(qty or 0),
+                    "revenue": round(float(value or 0), 2),
+                }
+                for pid, name, qty, value in top_products
+            ],
+            "customers": [
+                {"id": cid, "name": name, "orders": int(c or 0), "revenue": round(float(v or 0), 2)}
+                for cid, name, c, v in top_customers
+            ],
+            "sellers": [
+                {"id": sid, "name": name, "orders": int(c or 0), "revenue": round(float(v or 0), 2)}
+                for sid, name, c, v in top_sellers
+            ],
+        },
+        "recentOrders": [
+            {
+                "id": order.mercos_id,
+                "number": order.number,
+                "customerName": customer_name or order.customer_mercos_id or "—",
+                "sellerName": seller_name or order.seller_mercos_id or "—",
+                "status": order.status,
+                "date": order.issued_at.isoformat() if order.issued_at else None,
+                "total": float(order.total or 0),
+            }
+            for order, customer_name, seller_name in recent
+        ],
     }
 
 

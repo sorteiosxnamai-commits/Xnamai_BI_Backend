@@ -1,12 +1,12 @@
 import logging
-import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.analytics import (
@@ -19,10 +19,23 @@ from app.analytics import (
     product_movers,
     rankings,
 )
+from app.auth import current_user, require_admin
 from app.config import settings
 from app.database import Base, SessionLocal, db_session, engine
-from app.models import Customer, Order, Product, Seller, SyncState
-from app.sync import sync_all, sync_catalog_job, sync_orders_job, sync_resource
+from app.middleware.rate_limit import ApiRateLimitMiddleware
+from app.models import Customer, Order, Product, Seller, SyncRun, SyncState
+from app.routers.analytics import router as analytics_router
+from app.routers.auth import router as auth_router
+from app.routers.exports import router as exports_router
+from app.schemas.data_quality import DataQualityResponse
+from app.services.data_quality import build_data_quality_report
+from app.sync import (
+    SYNC_RESOURCES,
+    sync_all,
+    sync_catalog_job,
+    sync_orders_job,
+    sync_resource,
+)
 
 log = logging.getLogger("uvicorn.error")
 scheduler = AsyncIOScheduler()
@@ -34,6 +47,10 @@ async def lifespan(app):
     Base.metadata.create_all(engine)
     cfg = settings()
     log.info("CORS origins: %s", cfg.origins)
+    if not cfg.auth_admin_password:
+        log.warning("AUTH_ADMIN_PASSWORD missing: interactive login is disabled")
+    if cfg.jwt_secret == "change-me-in-production":
+        log.warning("JWT_SECRET is using the development default")
     # Never auto-resume Mercos sync on boot — it starves dashboard reads on free Render.
     # User clicks Sincronizar / Primeira carga when they want to sync.
     with SessionLocal() as db:
@@ -42,9 +59,20 @@ async def lifespan(app):
             state.status = "interrupted"
             state.error = "Serviço reiniciou durante a sync — use Sincronizar para continuar"
             db.add(state)
-        if stuck:
+        stuck_runs = list(db.scalars(select(SyncRun).where(SyncRun.status == "running")))
+        interrupted_at = datetime.now(timezone.utc)
+        for run in stuck_runs:
+            run.status = "interrupted"
+            run.finished_at = interrupted_at
+            run.error = "Serviço reiniciou durante a sincronização"
+            db.add(run)
+        if stuck or stuck_runs:
             db.commit()
-            log.warning("Marked %s sync(s) interrupted (no auto-resume)", len(stuck))
+            log.warning(
+                "Marked %s sync state(s) and %s run(s) interrupted (no auto-resume)",
+                len(stuck),
+                len(stuck_runs),
+            )
     if cfg.mercos_adaptor_url and cfg.mercos_adaptor_api_key:
         scheduler.add_job(
             sync_orders_job,
@@ -78,24 +106,36 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Xnamai BI API", version="1.0.0", lifespan=lifespan)
+app.add_middleware(ApiRateLimitMiddleware, requests_per_minute=300)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings().origins,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 
-def auth(x_api_key: str | None = Header(None)):
-    expected = settings().bi_api_key
-    if not x_api_key or len(x_api_key) != len(expected) or not secrets.compare_digest(x_api_key, expected):
-        raise HTTPException(401, "Chave inválida")
+auth = current_user
+app.include_router(auth_router)
+app.include_router(analytics_router, dependencies=[Depends(current_user)])
+app.include_router(exports_router)
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "Xnamai BI API"}
+
+
+@app.get(
+    "/api/v1/data-quality",
+    dependencies=[Depends(require_admin)],
+    response_model=DataQualityResponse,
+    tags=["admin"],
+)
+def data_quality(db: Session = Depends(db_session)):
+    """Read-only coverage and integrity audit; never returns raw PII values."""
+    return build_data_quality_report(db)
 
 
 @app.get("/api/v1/dashboard", dependencies=[Depends(auth)])
@@ -250,10 +290,58 @@ def sync_status(db: Session = Depends(db_session)):
     ]
 
 
-@app.post("/api/v1/sync/{resource}", dependencies=[Depends(auth)])
+@app.get("/api/v1/sync/runs", dependencies=[Depends(require_admin)])
+def sync_runs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    resource: str | None = Query(None),
+    db: Session = Depends(db_session),
+):
+    filters = [SyncRun.resource == resource] if resource else []
+    total = int(
+        db.scalar(select(func.count(SyncRun.id)).where(*filters)) or 0
+    )
+    rows = db.scalars(
+        select(SyncRun)
+        .where(*filters)
+        .order_by(desc(SyncRun.started_at), desc(SyncRun.id))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "resource": row.resource,
+                "mode": row.mode,
+                "status": row.status,
+                "startedAt": row.started_at,
+                "finishedAt": row.finished_at,
+                "cursorBefore": row.cursor_before,
+                "cursorAfter": row.cursor_after,
+                "pages": row.pages,
+                "received": row.received,
+                "persisted": row.persisted,
+                "failed": row.failed,
+                "details": row.details,
+                "error": row.error,
+            }
+            for row in rows
+        ],
+        "page": page,
+        "pageSize": page_size,
+        "totalItems": total,
+        "totalPages": (total + page_size - 1) // page_size,
+        "sort": "startedAt",
+        "order": "desc",
+        "appliedFilters": {"resource": resource} if resource else {},
+    }
+
+
+@app.post("/api/v1/sync/{resource}", dependencies=[Depends(require_admin)])
 async def run_sync(resource: str, background_tasks: BackgroundTasks, full: bool = False):
     global _sync_busy
-    if resource not in {"all", "customers", "products", "users", "orders"}:
+    if resource != "all" and resource not in SYNC_RESOURCES:
         raise HTTPException(404, "Recurso inválido")
 
     with SessionLocal() as db:
