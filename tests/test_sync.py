@@ -162,17 +162,26 @@ class FailingDetailAdaptor:
         raise HTTPException(502, "Adaptor inacessível")
 
 
-class ForbiddenOptionalResourceAdaptor:
+class UnavailableOptionalResourceAdaptor:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
     async def list(self, resource: str, cursor: str | None):
-        raise HTTPException(403, "Sem permissão Mercos para o recurso")
+        raise HTTPException(self.status_code, "Recurso indisponível na Mercos")
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 404])
 async def test_optional_resource_without_permission_is_unavailable(
     sync_db,
     monkeypatch,
+    status_code,
 ):
-    monkeypatch.setattr(sync, "adaptor", ForbiddenOptionalResourceAdaptor())
+    monkeypatch.setattr(
+        sync,
+        "adaptor",
+        UnavailableOptionalResourceAdaptor(status_code),
+    )
 
     result = await sync.sync_resource("carriers", full=False)
 

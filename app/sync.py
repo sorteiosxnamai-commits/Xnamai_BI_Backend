@@ -520,7 +520,7 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         unavailable = (
             resource in OPTIONAL_CATALOG_RESOURCES
             and isinstance(source_exc, HTTPException)
-            and source_exc.status_code == 403
+            and source_exc.status_code in {403, 404}
         )
         if unavailable:
             snapshot = _finish_sync_run(
@@ -538,7 +538,7 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
                 error=str(detail)[:1000],
             )
             log.warning(
-                "Sync %s unavailable: Mercos token has no permission",
+                "Sync %s unavailable in the connected Mercos account",
                 resource,
             )
             return {
