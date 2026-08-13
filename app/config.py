@@ -57,7 +57,6 @@ class Settings(BaseSettings):
     auth_admin_password: str = ""
     auth_viewer_username: str = "viewer"
     auth_viewer_password: str = ""
-    auth_disabled: bool = False
     auth_access_minutes: int = 15
     auth_refresh_days: int = 7
     auth_cookie_secure: bool = True

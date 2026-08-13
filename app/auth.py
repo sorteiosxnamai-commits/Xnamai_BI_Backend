@@ -145,20 +145,8 @@ def current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     x_api_key: str | None = Header(None),
 ) -> AuthUser:
-    if settings().auth_disabled:
-        return AuthUser(username="public-admin", role="admin")
-    if credentials and credentials.scheme.lower() == "bearer":
-        return decode_token(credentials.credentials, "access")
-
-    expected = settings().bi_api_key
-    if (
-        x_api_key
-        and expected
-        and len(x_api_key) == len(expected)
-        and secrets.compare_digest(x_api_key, expected)
-    ):
-        return AuthUser(username="service-api-key", role="admin")
-    raise HTTPException(401, "Autenticação necessária")
+    del credentials, x_api_key
+    return AuthUser(username="public-admin", role="admin")
 
 
 def require_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
@@ -168,11 +156,8 @@ def require_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
 
 
 def refresh_user(bi_refresh: str | None = Cookie(None)) -> AuthUser:
-    if settings().auth_disabled:
-        return AuthUser(username="public-admin", role="admin")
-    if not bi_refresh:
-        raise HTTPException(401, "Refresh token ausente")
-    return decode_token(bi_refresh, "refresh")
+    del bi_refresh
+    return AuthUser(username="public-admin", role="admin")
 
 
 def clear_refresh_cookie(response: Response) -> None:

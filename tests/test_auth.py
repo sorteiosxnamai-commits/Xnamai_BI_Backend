@@ -43,11 +43,12 @@ def test_viewer_cannot_use_admin_dependency(auth_settings):
     assert error.value.status_code == 403
 
 
-def test_service_api_key_remains_available_for_non_browser_integrations(auth_settings):
+def test_direct_access_ignores_credentials_and_tokens(auth_settings):
     user = auth.current_user(
         credentials=None,
         x_api_key="service-key",
     )
+    assert user.username == "public-admin"
     assert user.role == "admin"
 
     token = auth._token(
@@ -55,22 +56,17 @@ def test_service_api_key_remains_available_for_non_browser_integrations(auth_set
         "access",
         auth.timedelta(minutes=5),
     )
-    viewer = auth.current_user(
+    direct_user = auth.current_user(
         credentials=HTTPAuthorizationCredentials(
             scheme="Bearer",
             credentials=token,
         ),
         x_api_key=None,
     )
-    assert viewer.role == "viewer"
+    assert direct_user == user
 
 
-def test_public_mode_grants_direct_admin_access(auth_settings, monkeypatch):
-    public_config = auth_settings.model_copy(update={"auth_disabled": True})
-    monkeypatch.setattr(auth, "settings", lambda: public_config)
-
-    user = auth.current_user(credentials=None, x_api_key=None)
+def test_refresh_without_cookie_grants_direct_admin_access(auth_settings):
     refreshed = auth.refresh_user(bi_refresh=None)
 
-    assert user == auth.AuthUser(username="public-admin", role="admin")
-    assert refreshed == user
+    assert refreshed == auth.AuthUser(username="public-admin", role="admin")

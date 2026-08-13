@@ -22,8 +22,8 @@ Variáveis obrigatórias:
 - `JWT_SECRET`
 - `AUTH_ADMIN_USERNAME`, `AUTH_ADMIN_PASSWORD`
 - `AUTH_VIEWER_USERNAME`, `AUTH_VIEWER_PASSWORD`
-- `AUTH_DISABLED=true` habilita acesso direto como administrador. Nesse modo,
-  qualquer pessoa com a URL pode consultar dados, sincronizar e exportar.
+- A versão atual opera com autenticação desabilitada: qualquer pessoa com a
+  URL pode consultar dados, sincronizar e exportar como administrador.
 - `CORS_ORIGINS`
 - `AUTH_COOKIE_SECURE=true`
 - `AUTH_COOKIE_SAMESITE=none` quando frontend e API estiverem em domínios
