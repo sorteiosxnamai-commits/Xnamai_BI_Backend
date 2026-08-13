@@ -30,6 +30,7 @@ from app.routers.exports import router as exports_router
 from app.schemas.data_quality import DataQualityResponse
 from app.services.data_quality import build_data_quality_report
 from app.sync import (
+    SYNC_LEASE_TTL,
     SYNC_RESOURCES,
     sync_all,
     sync_catalog_job,
@@ -54,13 +55,35 @@ async def lifespan(app):
     # Never auto-resume Mercos sync on boot — it starves dashboard reads on free Render.
     # User clicks Sincronizar / Primeira carga when they want to sync.
     with SessionLocal() as db:
-        stuck = list(db.scalars(select(SyncState).where(SyncState.status == "running")))
+        interrupted_at = datetime.now(timezone.utc)
+        stale_before = interrupted_at - SYNC_LEASE_TTL
+        stuck = list(
+            db.scalars(
+                select(SyncState).where(
+                    SyncState.status == "running",
+                    (SyncState.heartbeat_at.is_(None))
+                    | (SyncState.heartbeat_at < stale_before),
+                )
+            )
+        )
+        stale_resources = {state.resource for state in stuck}
         for state in stuck:
             state.status = "interrupted"
             state.error = "Serviço reiniciou durante a sync — use Sincronizar para continuar"
+            state.lease_token = None
             db.add(state)
-        stuck_runs = list(db.scalars(select(SyncRun).where(SyncRun.status == "running")))
-        interrupted_at = datetime.now(timezone.utc)
+        stuck_runs = (
+            list(
+                db.scalars(
+                    select(SyncRun).where(
+                        SyncRun.status == "running",
+                        SyncRun.resource.in_(stale_resources),
+                    )
+                )
+            )
+            if stale_resources
+            else []
+        )
         for run in stuck_runs:
             run.status = "interrupted"
             run.finished_at = interrupted_at

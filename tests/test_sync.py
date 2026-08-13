@@ -1,3 +1,6 @@
+import asyncio
+import time
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import HTTPException
@@ -148,6 +151,48 @@ async def test_order_sync_uses_items_from_v2_list_without_detail(
         run = db.scalar(select(SyncRun))
         assert run.details["detailsConsulted"] == 0
         assert run.details["itemsPersisted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_active_lease_prevents_duplicate_resource_sync(sync_db, monkeypatch):
+    with sync_db() as db:
+        db.add(
+            SyncState(
+                resource="orders",
+                status="running",
+                lease_token="active-token",
+                heartbeat_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+    class UnexpectedAdaptor:
+        async def list(self, resource: str, cursor: str | None):
+            raise AssertionError("duplicate sync must not call the adaptor")
+
+    monkeypatch.setattr(sync, "adaptor", UnexpectedAdaptor())
+    result = await sync.sync_resource("orders")
+    assert result["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_page_persistence_does_not_block_event_loop(sync_db, monkeypatch):
+    monkeypatch.setattr(sync, "adaptor", ListWithItemsAdaptor())
+    original = sync._persist_sync_page
+
+    def slow_persist(*args, **kwargs):
+        time.sleep(0.1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sync, "_persist_sync_page", slow_persist)
+    task = asyncio.create_task(sync.sync_resource("orders"))
+    started = time.perf_counter()
+    await asyncio.sleep(0.02)
+    elapsed = time.perf_counter() - started
+    result = await task
+
+    assert elapsed < 0.08
+    assert result["status"] == "success"
 
 
 class FailingDetailAdaptor:

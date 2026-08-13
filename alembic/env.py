@@ -1,5 +1,4 @@
 from logging.config import fileConfig
-import os
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool, text
@@ -12,9 +11,9 @@ from app import models  # noqa: F401
 config = context.config
 configured_url = config.get_main_option("sqlalchemy.url")
 database_url = (
-    settings().database_url
-    if os.getenv("DATABASE_URL") or not configured_url
-    else configured_url
+    configured_url
+    if configured_url
+    else settings().database_url
 )
 config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 if config.config_file_name is not None:

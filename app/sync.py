@@ -1,10 +1,11 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.adaptor import adaptor
 from app.database import SessionLocal
@@ -30,6 +31,7 @@ log = logging.getLogger("uvicorn.error")
 
 MAX_PAGES = 5000
 ORDER_DETAIL_CONCURRENCY = 5
+SYNC_LEASE_TTL = timedelta(minutes=15)
 DIMENSION_MODELS = {
     "categories": Category,
     "segments": CustomerSegment,
@@ -335,8 +337,121 @@ def _upsert_rows(db, resource: str, rows: list):
     return {"persisted": persisted, "itemsPersisted": items_persisted}
 
 
+def _claim_sync(resource: str, full: bool, started_at: datetime):
+    """Atomically claim a resource across workers and service instances."""
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:resource))"),
+                {"resource": f"xnamai_sync_{resource}"},
+            )
+        state = db.scalar(
+            select(SyncState)
+            .where(SyncState.resource == resource)
+            .with_for_update()
+        )
+        if state is None:
+            state = SyncState(resource=resource)
+            db.add(state)
+            db.flush()
+        heartbeat = state.heartbeat_at
+        if heartbeat is not None and heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+        if (
+            state.status == "running"
+            and heartbeat is not None
+            and heartbeat >= now - SYNC_LEASE_TTL
+        ):
+            return None
+
+        if state.status == "running":
+            stale_runs = db.scalars(
+                select(SyncRun).where(
+                    SyncRun.resource == resource,
+                    SyncRun.status == "running",
+                )
+            ).all()
+            for stale_run in stale_runs:
+                stale_run.status = "interrupted"
+                stale_run.finished_at = now
+                stale_run.error = "Lease de sincronização expirou"
+                db.add(stale_run)
+
+        token = str(uuid4())
+        cursor_before = state.cursor
+        state.status = "running"
+        state.error = None
+        state.lease_token = token
+        state.heartbeat_at = now
+        db.add(state)
+        run = SyncRun(
+            resource=resource,
+            mode="full" if full else "incremental",
+            status="running",
+            started_at=started_at,
+            cursor_before=cursor_before,
+            cursor_after=cursor_before,
+            details={},
+        )
+        db.add(run)
+        db.flush()
+        run_id = run.id
+        db.commit()
+        return run_id, token, cursor_before
+
+
+def _persist_sync_page(
+    run_id: int,
+    lease_token: str,
+    resource: str,
+    rows: list,
+    *,
+    page_cursor: str | None,
+    next_pages: int,
+    received: int,
+    persisted: int,
+    failed: int,
+    details_consulted: int,
+    items_persisted: int,
+):
+    with SessionLocal() as db:
+        state = db.scalar(
+            select(SyncState)
+            .where(SyncState.resource == resource)
+            .with_for_update()
+        )
+        if state is None or state.lease_token != lease_token:
+            raise RuntimeError(f"Lease de sincronização perdida para {resource}")
+        stats = _upsert_rows(db, resource, rows)
+        next_persisted = persisted + stats["persisted"]
+        next_items_persisted = items_persisted + stats["itemsPersisted"]
+        state.cursor = page_cursor or state.cursor
+        state.records = next_persisted
+        state.status = "running"
+        state.error = None
+        state.heartbeat_at = datetime.now(timezone.utc)
+        db.add(state)
+        run = db.get(SyncRun, run_id)
+        if run is None:
+            raise RuntimeError(f"Execução de sync {run_id} não encontrada")
+        run.cursor_after = page_cursor
+        run.pages = next_pages
+        run.received = received
+        run.persisted = next_persisted
+        run.failed = failed
+        run.details = {
+            "detailsConsulted": details_consulted,
+            "itemsPersisted": next_items_persisted,
+        }
+        db.add(run)
+        db.commit()
+        return next_persisted, next_items_persisted
+
+
 def _finish_sync_run(
     run_id: int,
+    lease_token: str,
     resource: str,
     *,
     status: str,
@@ -353,12 +468,16 @@ def _finish_sync_run(
     finished_at = datetime.now(timezone.utc)
     with SessionLocal() as db:
         state = db.get(SyncState, resource) or SyncState(resource=resource)
-        state.status = status
-        state.records = persisted
-        state.error = error
-        if status == "success":
-            state.last_success_at = finished_at
-        db.add(state)
+        owns_lease = state.lease_token == lease_token
+        if owns_lease:
+            state.status = status
+            state.records = persisted
+            state.error = error
+            state.lease_token = None
+            state.heartbeat_at = finished_at
+            if status == "success":
+                state.last_success_at = finished_at
+            db.add(state)
         run = db.get(SyncRun, run_id)
         if run is not None:
             run.status = status
@@ -383,7 +502,7 @@ def _finish_sync_run(
             "resource": state.resource,
             "cursor": state.cursor,
             "records": state.records,
-            "status": state.status,
+            "status": status if owns_lease else "interrupted",
             "runId": run_id,
         }
 
@@ -391,26 +510,15 @@ def _finish_sync_run(
 async def sync_resource(resource: str, full=False, *, raise_http=True):
     # Short DB sessions only — never hold a pooler connection during Mercos HTTP waits
     started_at = datetime.now(timezone.utc)
-    with SessionLocal() as db:
-        state = db.get(SyncState, resource) or SyncState(resource=resource)
-        cursor_before = state.cursor
-        cursor = None if full else cursor_before
-        state.status = "running"
-        state.error = None
-        db.add(state)
-        run = SyncRun(
-            resource=resource,
-            mode="full" if full else "incremental",
-            status="running",
-            started_at=started_at,
-            cursor_before=cursor_before,
-            cursor_after=cursor_before,
-            details={},
-        )
-        db.add(run)
-        db.flush()
-        run_id = run.id
-        db.commit()
+    claim = await asyncio.to_thread(_claim_sync, resource, full, started_at)
+    if claim is None:
+        return {
+            "resource": resource,
+            "status": "running",
+            "message": "Sincronização deste recurso já está em andamento",
+        }
+    run_id, lease_token, cursor_before = claim
+    cursor = None if full else cursor_before
 
     pages = 0
     received = 0
@@ -442,30 +550,20 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             next_cursor = result.get("nextCursor")
             page_cursor = result.get("pageCursor") or next_cursor or cursor
             next_pages = pages + 1
-            with SessionLocal() as db:
-                stats = _upsert_rows(db, resource, rows)
-                next_persisted = persisted + stats["persisted"]
-                next_items_persisted = items_persisted + stats["itemsPersisted"]
-                state = db.get(SyncState, resource) or SyncState(resource=resource)
-                state.cursor = page_cursor or state.cursor
-                state.records = next_persisted
-                state.status = "running"
-                state.error = None
-                db.add(state)
-                run = db.get(SyncRun, run_id)
-                if run is None:
-                    raise RuntimeError(f"Execução de sync {run_id} não encontrada")
-                run.cursor_after = page_cursor or committed_cursor
-                run.pages = next_pages
-                run.received = received
-                run.persisted = next_persisted
-                run.failed = failed
-                run.details = {
-                    "detailsConsulted": details_consulted,
-                    "itemsPersisted": next_items_persisted,
-                }
-                db.add(run)
-                db.commit()
+            next_persisted, next_items_persisted = await asyncio.to_thread(
+                _persist_sync_page,
+                run_id,
+                lease_token,
+                resource,
+                rows,
+                page_cursor=page_cursor or committed_cursor,
+                next_pages=next_pages,
+                received=received,
+                persisted=persisted,
+                failed=failed,
+                details_consulted=details_consulted,
+                items_persisted=items_persisted,
+            )
             pages = next_pages
             persisted = next_persisted
             items_persisted = next_items_persisted
@@ -475,8 +573,10 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             cursor = next_cursor
         else:
             error = f"Limite de {MAX_PAGES} páginas; rode sync incremental para continuar"
-            snapshot = _finish_sync_run(
+            snapshot = await asyncio.to_thread(
+                _finish_sync_run,
                 run_id,
+                lease_token,
                 resource,
                 status="partial",
                 pages=pages,
@@ -492,8 +592,10 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             log.warning("Sync %s partial after %s pages (%s records)", resource, MAX_PAGES, persisted)
             return {**snapshot, "records": persisted, "status": "partial"}
 
-        snapshot = _finish_sync_run(
+        snapshot = await asyncio.to_thread(
+            _finish_sync_run,
             run_id,
+            lease_token,
             resource,
             status="success",
             pages=pages,
@@ -523,8 +625,10 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             and source_exc.status_code in {403, 404}
         )
         if unavailable:
-            snapshot = _finish_sync_run(
+            snapshot = await asyncio.to_thread(
+                _finish_sync_run,
                 run_id,
+                lease_token,
                 resource,
                 status="unavailable",
                 pages=pages,
@@ -553,8 +657,10 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         )
         status = "interrupted" if transient else "error"
         failed = max(failed, received - persisted)
-        _finish_sync_run(
+        await asyncio.to_thread(
+            _finish_sync_run,
             run_id,
+            lease_token,
             resource,
             status=status,
             pages=pages,

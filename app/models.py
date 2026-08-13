@@ -218,6 +218,8 @@ class SyncState(Base):
     status: Mapped[str] = mapped_column(String(30), default="never")
     records: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text)
+    lease_token: Mapped[str | None] = mapped_column(String(36))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SyncRun(Base):
