@@ -5,7 +5,18 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Integer, String, and_, asc, case, cast, desc, func, or_, select
+from sqlalchemy import (
+    Integer,
+    String,
+    and_,
+    asc,
+    case,
+    cast,
+    desc,
+    func,
+    or_,
+    select,
+)
 from sqlalchemy.orm import Session, aliased
 
 from app.domain.order_status import (
@@ -88,9 +99,7 @@ def analytics_metadata(db: Session) -> dict[str, Any]:
     total_orders = int(db.scalar(select(func.count(Order.id))) or 0)
     orders_with_items = int(
         db.scalar(
-            select(func.count(func.distinct(Order.id)))
-            .select_from(Order)
-            .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
+            select(func.count(Order.id)).where(Order.item_count > 0)
         )
         or 0
     )

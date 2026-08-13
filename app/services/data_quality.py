@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, cast, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.domain.order_status import RECOGNIZED_ORDER_STATUSES, status_sql_in
@@ -106,27 +106,43 @@ def build_data_quality_report(
 
     orders_with_items = _scalar_int(
         db,
-        select(func.count(func.distinct(Order.id)))
-        .select_from(Order)
-        .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id),
+        select(func.count(Order.id)).where(
+            exists(
+                select(OrderItem.id).where(
+                    OrderItem.order_mercos_id == Order.mercos_id
+                )
+            )
+        ),
     )
     orders_with_customer = _scalar_int(
         db,
-        select(func.count(func.distinct(Order.id)))
-        .select_from(Order)
-        .join(Customer, Customer.mercos_id == Order.customer_mercos_id),
+        select(func.count(Order.id)).where(
+            exists(
+                select(Customer.id).where(
+                    Customer.mercos_id == Order.customer_mercos_id
+                )
+            )
+        ),
     )
     orders_with_seller = _scalar_int(
         db,
-        select(func.count(func.distinct(Order.id)))
-        .select_from(Order)
-        .join(Seller, Seller.mercos_id == Order.seller_mercos_id),
+        select(func.count(Order.id)).where(
+            exists(
+                select(Seller.id).where(
+                    Seller.mercos_id == Order.seller_mercos_id
+                )
+            )
+        ),
     )
     items_with_product = _scalar_int(
         db,
-        select(func.count(func.distinct(OrderItem.id)))
-        .select_from(OrderItem)
-        .join(Product, Product.mercos_id == OrderItem.product_mercos_id),
+        select(func.count(OrderItem.id)).where(
+            exists(
+                select(Product.id).where(
+                    Product.mercos_id == OrderItem.product_mercos_id
+                )
+            )
+        ),
     )
     recognized_statuses = _scalar_int(
         db,
