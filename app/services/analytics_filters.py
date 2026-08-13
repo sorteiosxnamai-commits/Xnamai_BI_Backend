@@ -148,6 +148,7 @@ def order_conditions(
         product_predicates = [
             OrderItem.order_mercos_id == Order.mercos_id,
             Product.mercos_id == OrderItem.product_mercos_id,
+            OrderItem.excluded.is_(False),
         ]
         if filters.productIds:
             product_predicates.append(Product.mercos_id.in_(filters.productIds))

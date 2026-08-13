@@ -252,6 +252,20 @@ def test_revenue_reconciles_with_equivalent_sql() -> None:
 def test_overview_separates_sales_and_cancellations_with_comparison() -> None:
     with make_session() as db:
         seed_orders(db)
+        db.add(
+            OrderItem(
+                order_mercos_id="current-sale",
+                position=99,
+                mercos_item_id="excluded-item",
+                product_mercos_id="p1",
+                name="Produto excluído",
+                quantity=Decimal("100"),
+                unit_price=Decimal("1000"),
+                total=Decimal("100000"),
+                excluded=True,
+            )
+        )
+        db.commit()
         filters = AnalyticsFilters(
             dateFrom=date(2026, 8, 1),
             dateTo=date(2026, 8, 12),
@@ -357,6 +371,11 @@ def test_orders_pagination_sort_and_status_filter_are_server_side() -> None:
         detail = order_detail(db, "current-sale", filters)
         assert detail["order"]["number"] == "100"
         assert len(detail["items"]) == 2
+        assert detail["items"][0]["unitPrice"] == Decimal("60")
+        assert detail["items"][0]["total"] == Decimal("120")
+        assert detail["items"][0]["sourceUnitPrice"] == Decimal("0")
+        assert detail["items"][0]["sourceTotal"] == Decimal("100")
+        assert detail["items"][0]["priceSource"] == "catalog"
         product_filtered = overview(
             db,
             filters.model_copy(update={"productIds": ["p2"]}),
@@ -418,6 +437,8 @@ def test_paginated_entities_and_advanced_analytics_execute() -> None:
 
         assert products["totalItems"] == 2
         assert products["items"][0]["id"] == "p1"
+        assert products["items"][0]["quantitySold"] == Decimal("2")
+        assert products["items"][0]["revenue"] == Decimal("100")
         assert [item["id"] for item in products_by_price["items"]] == ["p2", "p1"]
         assert customers["items"][0]["id"] == "c1"
         assert sellers["items"][0]["id"] == "s1"

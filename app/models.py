@@ -123,6 +123,7 @@ class OrderItem(Base):
     unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
     discount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
     total: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
+    excluded: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 

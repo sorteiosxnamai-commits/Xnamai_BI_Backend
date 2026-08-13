@@ -102,14 +102,18 @@ def build_data_quality_report(
     total_products = _scalar_int(db, select(func.count(Product.id)))
     total_sellers = _scalar_int(db, select(func.count(Seller.id)))
     total_orders = _scalar_int(db, select(func.count(Order.id)))
-    total_items = _scalar_int(db, select(func.count(OrderItem.id)))
+    total_items = _scalar_int(
+        db,
+        select(func.count(OrderItem.id)).where(OrderItem.excluded.is_(False)),
+    )
 
     orders_with_items = _scalar_int(
         db,
         select(func.count(Order.id)).where(
             exists(
                 select(OrderItem.id).where(
-                    OrderItem.order_mercos_id == Order.mercos_id
+                    OrderItem.order_mercos_id == Order.mercos_id,
+                    OrderItem.excluded.is_(False),
                 )
             )
         ),
@@ -137,6 +141,7 @@ def build_data_quality_report(
     items_with_product = _scalar_int(
         db,
         select(func.count(OrderItem.id)).where(
+            OrderItem.excluded.is_(False),
             exists(
                 select(Product.id).where(
                     Product.mercos_id == OrderItem.product_mercos_id
@@ -156,6 +161,7 @@ def build_data_quality_report(
             OrderItem.order_mercos_id.label("order_id"),
             func.coalesce(func.sum(OrderItem.total), 0).label("items_total"),
         )
+        .where(OrderItem.excluded.is_(False))
         .group_by(OrderItem.order_mercos_id)
         .subquery()
     )
@@ -205,12 +211,14 @@ def build_data_quality_report(
         "itemsWithZeroQuantity": _scalar_int(
             db,
             select(func.count(OrderItem.id)).where(
+                OrderItem.excluded.is_(False),
                 func.coalesce(OrderItem.quantity, 0) == 0
             ),
         ),
         "itemsWithZeroTotal": _scalar_int(
             db,
             select(func.count(OrderItem.id)).where(
+                OrderItem.excluded.is_(False),
                 func.coalesce(OrderItem.total, 0) == 0
             ),
         ),

@@ -203,9 +203,10 @@ def _upsert_rows(db, resource: str, rows: list):
             obj.issued_at = dt(row.get("data_emissao") or row.get("data_criacao") or row.get("ultima_alteracao"))
             obj.total = f(row.get("total"))
             obj.discount = f(row.get("desconto"))
+            source_items = row.get("itens") or row.get("items") or []
             items = [
                 item
-                for item in (row.get("itens") or row.get("items") or [])
+                for item in source_items
                 if str(item.get("excluido", False)).lower() not in {"true", "1"}
             ]
             derived_discount = Decimal("0")
@@ -293,7 +294,7 @@ def _upsert_rows(db, resource: str, rows: list):
             db.add(obj)
             db.flush()
             db.execute(delete(OrderItem).where(OrderItem.order_mercos_id == mid))
-            for pos, item in enumerate(items):
+            for pos, item in enumerate(source_items):
                 q = f(item.get("quantidade"))
                 list_unit = optional_decimal(item, "preco_tabela")
                 unit = optional_decimal(
@@ -325,6 +326,10 @@ def _upsert_rows(db, resource: str, rows: list):
                         unit_price=unit,
                         discount=f(item.get("desconto") or item.get("desconto_de_cupom")),
                         total=total,
+                        excluded=(
+                            str(item.get("excluido", False)).lower()
+                            in {"true", "1"}
+                        ),
                         raw=item,
                     )
                 )

@@ -739,12 +739,45 @@ def order_detail(
     if row is None:
         return None
     item_rows = db.execute(
-        select(OrderItem, Product.name.label("catalog_name"))
+        select(
+            OrderItem,
+            Product.name.label("catalog_name"),
+            Product.list_price.label("catalog_price"),
+        )
         .outerjoin(Product, Product.mercos_id == OrderItem.product_mercos_id)
-        .where(OrderItem.order_mercos_id == mercos_id)
+        .where(
+            OrderItem.order_mercos_id == mercos_id,
+            OrderItem.excluded.is_(False),
+        )
         .order_by(OrderItem.position)
     ).all()
     order = row.Order
+
+    def detail_item(item) -> dict[str, Any]:
+        source_unit_price = _decimal(item.OrderItem.unit_price)
+        current_unit_price = (
+            _decimal(item.catalog_price)
+            if item.catalog_price is not None
+            else source_unit_price
+        )
+        quantity = _decimal(item.OrderItem.quantity)
+        return {
+            "id": item.OrderItem.mercos_item_id,
+            "position": item.OrderItem.position,
+            "productId": item.OrderItem.product_mercos_id,
+            "code": item.OrderItem.code,
+            "name": item.OrderItem.name or item.catalog_name,
+            "quantity": quantity,
+            "unitPrice": current_unit_price,
+            "total": quantity * current_unit_price,
+            "sourceUnitPrice": source_unit_price,
+            "sourceTotal": item.OrderItem.total,
+            "priceSource": (
+                "catalog" if item.catalog_price is not None else "order"
+            ),
+            "discount": item.OrderItem.discount,
+        }
+
     return {
         "order": {
             "id": order.mercos_id,
@@ -770,20 +803,7 @@ def order_detail(
             "carrierId": order.carrier_mercos_id,
             "commercialPolicyId": order.commercial_policy_mercos_id,
         },
-        "items": [
-            {
-                "id": item.OrderItem.mercos_item_id,
-                "position": item.OrderItem.position,
-                "productId": item.OrderItem.product_mercos_id,
-                "code": item.OrderItem.code,
-                "name": item.OrderItem.name or item.catalog_name,
-                "quantity": item.OrderItem.quantity,
-                "unitPrice": item.OrderItem.unit_price,
-                "discount": item.OrderItem.discount,
-                "total": item.OrderItem.total,
-            }
-            for item in item_rows
-        ],
+        "items": [detail_item(item) for item in item_rows],
         "appliedFilters": applied_filters(filters),
         "metadata": analytics_metadata(db),
     }
@@ -825,7 +845,11 @@ def _product_aggregate(db: Session, filters: AnalyticsFilters):
         .select_from(OrderItem)
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
         .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
-        .where(*conditions, *product_conditions)
+        .where(
+            *conditions,
+            *product_conditions,
+            OrderItem.excluded.is_(False),
+        )
         .group_by(OrderItem.product_mercos_id)
         .subquery()
     )
@@ -1988,6 +2012,8 @@ def associations(
             *_sale_conditions(filters),
             left.product_mercos_id.is_not(None),
             right.product_mercos_id.is_not(None),
+            left.excluded.is_(False),
+            right.excluded.is_(False),
         )
         .group_by(left.product_mercos_id, right.product_mercos_id)
         .order_by(desc("orders"))

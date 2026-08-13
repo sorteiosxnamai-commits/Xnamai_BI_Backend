@@ -115,7 +115,10 @@ def dashboard(db: Session, days: int = 30):
             func.count(func.distinct(OrderItem.product_mercos_id)),
         )
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(*valid_conditions(start, end if start is not None else None))
+        .where(
+            *valid_conditions(start, end if start is not None else None),
+            OrderItem.excluded.is_(False),
+        )
     ).one()
     items_sold = float(item_stats[0] or 0)
     products_sold = int(item_stats[1] or 0)
@@ -163,7 +166,10 @@ def dashboard(db: Session, days: int = 30):
             func.coalesce(func.sum(OrderItem.total), 0),
         )
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(*valid_conditions(start, end if start is not None else None))
+        .where(
+            *valid_conditions(start, end if start is not None else None),
+            OrderItem.excluded.is_(False),
+        )
         .group_by(OrderItem.product_mercos_id, OrderItem.name)
         .order_by(func.sum(OrderItem.total).desc())
         .limit(10)
@@ -308,7 +314,10 @@ def rankings(db: Session, days: int = 30, limit: int = 10):
     product_q = (
         select(OrderItem.name, func.sum(OrderItem.quantity), func.sum(OrderItem.total))
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(func.lower(Order.status).in_(REVENUE_STATUSES))
+        .where(
+            func.lower(Order.status).in_(REVENUE_STATUSES),
+            OrderItem.excluded.is_(False),
+        )
         .group_by(OrderItem.name)
         .order_by(func.sum(OrderItem.total).desc())
         .limit(limit)
@@ -565,6 +574,7 @@ def dead_stock(db: Session, *, no_sale_days: int = 90, limit: int = 200):
         .where(
             func.lower(Order.status).in_(REVENUE_STATUSES),
             OrderItem.product_mercos_id.is_not(None),
+            OrderItem.excluded.is_(False),
         )
     )
     if start is not None:
@@ -582,6 +592,7 @@ def dead_stock(db: Session, *, no_sale_days: int = 90, limit: int = 200):
             .where(
                 func.lower(Order.status).in_(REVENUE_STATUSES),
                 OrderItem.product_mercos_id.is_not(None),
+                OrderItem.excluded.is_(False),
             )
             .group_by(OrderItem.product_mercos_id)
         ).all()
@@ -630,7 +641,10 @@ def product_movers(db: Session, *, days: int = 365, limit: int = 20):
             func.sum(OrderItem.total).label("revenue"),
         )
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-        .where(func.lower(Order.status).in_(REVENUE_STATUSES))
+        .where(
+            func.lower(Order.status).in_(REVENUE_STATUSES),
+            OrderItem.excluded.is_(False),
+        )
         .group_by(OrderItem.product_mercos_id, OrderItem.name, OrderItem.code)
     )
     if start is not None:
