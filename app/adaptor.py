@@ -10,10 +10,25 @@ from app.config import settings
 log = logging.getLogger("uvicorn.error")
 
 TRANSIENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError)
+DEFAULT_RETRIES = 8
+
+
+def _response_detail(response: httpx.Response) -> str:
+    text = response.text[:500].strip()
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/html" in content_type or text.lower().startswith(("<!doctype", "<html")):
+        return "resposta HTML temporária do provedor"
+    return text or response.reason_phrase
 
 
 class Adaptor:
-    async def list(self, resource: str, cursor: str | None = None, *, retries: int = 5):
+    async def list(
+        self,
+        resource: str,
+        cursor: str | None = None,
+        *,
+        retries: int = DEFAULT_RETRIES,
+    ):
         cfg = settings()
         if not cfg.mercos_adaptor_url or not cfg.mercos_adaptor_api_key:
             raise HTTPException(503, "MERCOS_ADAPTOR_URL/API_KEY não configurados")
@@ -31,6 +46,8 @@ class Adaptor:
                     )
             except TRANSIENT as exc:
                 last_exc = exc
+                if attempt + 1 >= retries:
+                    break
                 wait = min(2 ** attempt, 30)
                 log.warning(
                     "Adaptor %s attempt %s/%s failed (%s); retry in %ss",
@@ -59,7 +76,7 @@ class Adaptor:
                 continue
 
             if r.is_error:
-                detail = r.text[:500] or r.reason_phrase
+                detail = _response_detail(r)
                 raise HTTPException(
                     status_code=502 if r.status_code >= 500 else r.status_code,
                     detail=f"Adaptor {r.status_code} em /v1/{resource}: {detail}",
@@ -71,7 +88,13 @@ class Adaptor:
             f"Adaptor inacessível após {retries} tentativas: {type(last_exc).__name__ if last_exc else 'erro'}",
         )
 
-    async def detail(self, resource: str, mercos_id: str, *, retries: int = 5):
+    async def detail(
+        self,
+        resource: str,
+        mercos_id: str,
+        *,
+        retries: int = DEFAULT_RETRIES,
+    ):
         cfg = settings()
         if not cfg.mercos_adaptor_url or not cfg.mercos_adaptor_api_key:
             raise HTTPException(503, "MERCOS_ADAPTOR_URL/API_KEY não configurados")
@@ -103,7 +126,7 @@ class Adaptor:
                 await asyncio.sleep(max(0, wait))
                 continue
             if response.is_error:
-                detail = response.text[:500] or response.reason_phrase
+                detail = _response_detail(response)
                 raise HTTPException(
                     status_code=502 if response.status_code >= 500 else response.status_code,
                     detail=f"Adaptor {response.status_code} em detalhe de {resource}: {detail}",
