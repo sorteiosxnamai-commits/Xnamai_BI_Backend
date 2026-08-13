@@ -102,6 +102,54 @@ async def test_order_sync_fetches_detail_and_is_idempotent(sync_db, monkeypatch)
     assert fake.detail_calls == ["10", "10"]
 
 
+class ListWithItemsAdaptor:
+    async def list(self, resource: str, cursor: str | None):
+        assert resource == "orders"
+        return {
+            "data": [
+                {
+                    "id": 20,
+                    "numero": 200,
+                    "status": 2,
+                    "total": "30,00",
+                    "ultima_alteracao": "2026-08-13T13:00:00+00:00",
+                    "itens": [
+                        {
+                            "id": 601,
+                            "produto_id": 3,
+                            "quantidade": 2,
+                            "preco_liquido": "15,00",
+                            "subtotal": "30,00",
+                        }
+                    ],
+                }
+            ],
+            "pageCursor": "2026-08-13T13:00:00+00:00",
+            "nextCursor": None,
+        }
+
+    async def detail(self, resource: str, mercos_id: str):
+        raise AssertionError("Detalhe não deve ser consultado quando a lista contém itens")
+
+
+@pytest.mark.asyncio
+async def test_order_sync_uses_items_from_v2_list_without_detail(
+    sync_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(sync, "adaptor", ListWithItemsAdaptor())
+
+    result = await sync.sync_resource("orders", full=False)
+
+    assert result["status"] == "success"
+    with sync_db() as db:
+        assert db.scalar(select(func.count(Order.id))) == 1
+        assert db.scalar(select(func.count(OrderItem.id))) == 1
+        run = db.scalar(select(SyncRun))
+        assert run.details["detailsConsulted"] == 0
+        assert run.details["itemsPersisted"] == 1
+
+
 class FailingDetailAdaptor:
     async def list(self, resource: str, cursor: str | None):
         return {

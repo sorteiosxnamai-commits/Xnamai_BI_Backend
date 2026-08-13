@@ -112,10 +112,12 @@ def optional_decimal(row: dict, *keys: str) -> Decimal | None:
 
 
 async def _hydrate_order_details(rows: list[dict]) -> list[dict]:
-    """Fetch every changed order detail before opening the write transaction."""
+    """Fetch details only when the v2 list payload omits the items field."""
     semaphore = asyncio.Semaphore(ORDER_DETAIL_CONCURRENCY)
 
     async def fetch(row: dict):
+        if "itens" in row or "items" in row:
+            return row
         mercos_id = str(row.get("id") or "")
         if not mercos_id:
             raise ValueError("Pedido sem id no payload de listagem")
@@ -425,11 +427,16 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
                 break
             received += len(rows)
             if resource == "orders":
+                details_needed = sum(
+                    1
+                    for row in rows
+                    if "itens" not in row and "items" not in row
+                )
                 try:
                     rows = await _hydrate_order_details(rows)
-                    details_consulted += len(rows)
+                    details_consulted += details_needed
                 except OrderDetailBatchError as exc:
-                    details_consulted += len(rows)
+                    details_consulted += details_needed
                     failed += exc.failed
                     raise
             next_cursor = result.get("nextCursor")
