@@ -5,17 +5,17 @@
 - **Venda válida**: pedido cujo status normalizado pertence a `2` ou `pedido`.
 - **Cancelamento**: pedido cujo status pertence a `0`, `5`, `cancelled` ou
   `cancelado`. A regra canônica está em `app/domain/order_status.py`.
-- **Faturamento bruto**: total líquido acrescido dos descontos calculados pela
-  diferença entre `preco_tabela` e `preco_liquido` históricos de cada item.
-  Pedidos sem preços completos continuam usando `orders.total` e são
-  identificados pela cobertura parcial.
-- **Faturamento líquido**: soma de `net_total`; usa `orders.total` quando o
-  líquido não existe na fonte.
+- **Faturamento bruto**: soma de `quantidade × preço de tabela atual` dos itens
+  válidos. Itens excluídos, pedidos sem itens e preços sentinela de R$ 1.000,00
+  não entram no cálculo.
+- **Faturamento líquido**: segue a mesma base de preço de tabela atual por regra
+  comercial. O valor histórico original permanece no banco para auditoria, mas
+  não compõe o faturamento analítico.
 - **Ticket médio**: faturamento líquido dividido pela quantidade de vendas
   válidas.
-- **Desconto total**: soma das diferenças positivas entre preço de tabela e
-  preço líquido, multiplicadas pela quantidade; usa o campo legado `discount`
-  somente quando essa derivação não está disponível.
+- **Desconto total**: no faturamento analítico fica zerado, porque a regra
+  comercial vigente usa o preço de tabela atual. O desconto histórico do
+  pedido permanece no banco para auditoria.
 - **Taxa de cancelamento**: cancelamentos divididos por todos os pedidos nos
   mesmos filtros.
 - **Compradores únicos**: clientes distintos com venda válida.
@@ -39,27 +39,21 @@ serializá-los como números JSON, mas nunca calcula totais globais no navegador
 
 ## Reconciliação SQL
 
-O faturamento líquido sem filtros adicionais deve fechar com:
+O faturamento analítico sem filtros adicionais deve fechar com:
 
 ```sql
-SELECT COALESCE(SUM(COALESCE(net_total, total)), 0) AS net_revenue
-FROM orders
-WHERE LOWER(TRIM(status)) IN ('2', 'pedido', 'order')
-  AND issued_at >= :date_from_utc
-  AND issued_at < :date_to_exclusive_utc;
-```
-
-As datas recebidas pelo BI são convertidas de `America/Sao_Paulo` para UTC. O
-limite final é exclusivo. Para reconciliar itens:
-
-```sql
-SELECT COALESCE(SUM(oi.total), 0) AS item_revenue
+SELECT COALESCE(SUM(oi.quantity * p.list_price), 0) AS net_revenue
 FROM order_items oi
 JOIN orders o ON o.mercos_id = oi.order_mercos_id
+JOIN products p ON p.mercos_id = oi.product_mercos_id
 WHERE LOWER(TRIM(o.status)) IN ('2', 'pedido', 'order')
+  AND COALESCE(oi.excluded, false) = false
+  AND p.list_price <> 1000
   AND o.issued_at >= :date_from_utc
   AND o.issued_at < :date_to_exclusive_utc;
 ```
 
-A diferença entre cabeçalhos e itens permanece explícita no relatório
-`GET /api/v1/data-quality`; ela não é ocultada nem ajustada no navegador.
+As datas recebidas pelo BI são convertidas de `America/Sao_Paulo` para UTC. O
+limite final é exclusivo. O valor histórico do cabeçalho (`orders.total`)
+permanece no relatório `GET /api/v1/data-quality` para auditoria; ele não
+compõe mais o faturamento das telas.
