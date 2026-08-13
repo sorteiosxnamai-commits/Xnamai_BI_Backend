@@ -31,7 +31,35 @@ SENSITIVE_RAW_KEYS = {
 
 
 def _scalar_int(db: Session, statement) -> int:
-    return int(db.scalar(statement) or 0)
+    try:
+        return int(db.scalar(statement) or 0)
+    except OperationalError:
+        db.rollback()
+        return 0
+
+
+def _estimated_count(db: Session, table_name: str, statement) -> int:
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        try:
+            estimate = db.scalar(
+                text(
+                    """
+                    SELECT COALESCE(c.reltuples, 0)::bigint
+                      FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = 'public'
+                       AND c.relname = :table_name
+                       AND c.relkind = 'r'
+                    """
+                ),
+                {"table_name": table_name},
+            )
+            if estimate is not None:
+                return max(int(estimate), 0)
+        except OperationalError:
+            db.rollback()
+    return _scalar_int(db, statement)
 
 
 def _pct(numerator: int, denominator: int) -> float:
@@ -116,7 +144,7 @@ def _order_total_divergences(db: Session) -> int | None:
     try:
         if bind is not None and bind.dialect.name == "postgresql":
             db.execute(text("SET LOCAL statement_timeout = '2500ms'"))
-        value = _scalar_int(db, statement)
+        value = int(db.scalar(statement) or 0)
         if bind is not None and bind.dialect.name == "postgresql":
             db.execute(text("RESET statement_timeout"))
         return value
@@ -128,25 +156,21 @@ def _order_total_divergences(db: Session) -> int | None:
 def build_data_quality_report(
     db: Session, *, include_raw_inventory: bool = False, raw_sample_limit: int = 100
 ) -> dict[str, Any]:
-    total_customers = _scalar_int(db, select(func.count(Customer.id)))
-    total_products = _scalar_int(db, select(func.count(Product.id)))
-    total_sellers = _scalar_int(db, select(func.count(Seller.id)))
-    total_orders = _scalar_int(db, select(func.count(Order.id)))
-    total_items = _scalar_int(
-        db,
-        select(func.count(OrderItem.id)).where(OrderItem.excluded.is_(False)),
+    total_customers = _estimated_count(
+        db, "customers", select(func.count(Customer.id))
+    )
+    total_products = _estimated_count(
+        db, "products", select(func.count(Product.id))
+    )
+    total_sellers = _estimated_count(db, "sellers", select(func.count(Seller.id)))
+    total_orders = _estimated_count(db, "orders", select(func.count(Order.id)))
+    total_items = _estimated_count(
+        db, "order_items", select(func.count(OrderItem.id))
     )
 
     orders_with_items = _scalar_int(
         db,
-        select(func.count(Order.id)).where(
-            exists(
-                select(OrderItem.id).where(
-                    OrderItem.order_mercos_id == Order.mercos_id,
-                    OrderItem.excluded.is_(False),
-                )
-            )
-        ),
+        select(func.count(Order.id)).where(func.coalesce(Order.item_count, 0) > 0),
     )
     orders_with_customer = _scalar_int(
         db,

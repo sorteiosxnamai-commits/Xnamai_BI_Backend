@@ -63,6 +63,7 @@ def seed_dirty_data(db: Session) -> None:
                 status="2",
                 issued_at=now,
                 total=100,
+                item_count=1,
                 raw={"id": 1, "status": "2"},
             ),
             Order(
@@ -73,6 +74,7 @@ def seed_dirty_data(db: Session) -> None:
                 status="2",
                 issued_at=now,
                 total=0,
+                item_count=0,
                 raw={},
             ),
             Order(
@@ -83,6 +85,7 @@ def seed_dirty_data(db: Session) -> None:
                 status="0",
                 issued_at=now,
                 total=50,
+                item_count=1,
                 raw={},
             ),
             OrderItem(

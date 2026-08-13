@@ -6,7 +6,6 @@ Revises: 20260813_05
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy import text
 
 
 revision = "20260813_06"
@@ -41,26 +40,9 @@ def upgrade() -> None:
             )
 
     if op.get_bind().dialect.name == "postgresql":
-        op.execute("SET LOCAL statement_timeout TO 0")
-        bind = op.get_bind()
-        while True:
-            result = bind.execute(
-                text(
-                    """
-                    UPDATE order_items
-                       SET excluded = true
-                     WHERE id IN (
-                        SELECT id
-                          FROM order_items
-                         WHERE excluded = false
-                           AND raw->>'excluido' IN ('true', '1', 'True', 'TRUE')
-                         LIMIT 5000
-                     )
-                    """
-                )
-            )
-            if result.rowcount == 0:
-                break
+        # JSON backfill of excluded items timed out in production and locked
+        # order_items. Sync marks new/updated items; do not scan raw here.
+        return
 
 
 def downgrade() -> None:

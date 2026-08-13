@@ -7,6 +7,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.analytics import (
@@ -137,6 +138,17 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(OperationalError)
+async def database_timeout_handler(request, exc: OperationalError):
+    log.warning("Database statement canceled: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Consulta excedeu o tempo no banco. Tente um período menor."
+        },
+    )
 
 
 auth = current_user

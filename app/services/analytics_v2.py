@@ -19,6 +19,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.orm import Session, aliased
+from sqlalchemy.exc import OperationalError
 
 from app.domain.order_status import (
     CANCELLED_ORDER_STATUSES,
@@ -104,8 +105,8 @@ def _current_order_values(
                 "sku_count"
             ),
         )
-        .select_from(OrderItem)
-        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .select_from(Order)
+        .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
         .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
         .where(*conditions)
         .group_by(
@@ -834,34 +835,49 @@ def order_detail(
     if row is None:
         return None
     item_rows = db.execute(
-        select(
-            OrderItem,
-            Product.name.label("catalog_name"),
-            _valid_list_price_expression().label("catalog_price"),
-        )
-        .outerjoin(Product, Product.mercos_id == OrderItem.product_mercos_id)
+        select(OrderItem)
         .where(
             OrderItem.order_mercos_id == mercos_id,
             OrderItem.excluded.is_(False),
         )
         .order_by(OrderItem.position)
-    ).all()
+    ).scalars().all()
+    product_ids = [
+        item.product_mercos_id
+        for item in item_rows
+        if item.product_mercos_id
+    ]
+    catalog = {
+        product.mercos_id: product
+        for product in (
+            db.scalars(
+                select(Product).where(Product.mercos_id.in_(product_ids))
+            ).all()
+            if product_ids
+            else []
+        )
+    }
     order = row.Order
 
-    def detail_item(item) -> dict[str, Any]:
-        source_unit_price = _decimal(item.OrderItem.unit_price)
-        current_unit_price = (
-            _decimal(item.catalog_price)
-            if item.catalog_price is not None
-            else None
+    def detail_item(item: OrderItem) -> dict[str, Any]:
+        product = catalog.get(item.product_mercos_id or "")
+        catalog_price = (
+            None
+            if product is None
+            or _decimal(product.list_price) in PLACEHOLDER_LIST_PRICES
+            else product.list_price
         )
-        quantity = _decimal(item.OrderItem.quantity)
+        source_unit_price = _decimal(item.unit_price)
+        current_unit_price = (
+            _decimal(catalog_price) if catalog_price is not None else None
+        )
+        quantity = _decimal(item.quantity)
         return {
-            "id": item.OrderItem.mercos_item_id,
-            "position": item.OrderItem.position,
-            "productId": item.OrderItem.product_mercos_id,
-            "code": item.OrderItem.code,
-            "name": item.OrderItem.name or item.catalog_name,
+            "id": item.mercos_item_id,
+            "position": item.position,
+            "productId": item.product_mercos_id,
+            "code": item.code,
+            "name": item.name or (product.name if product is not None else ""),
             "quantity": quantity,
             "unitPrice": current_unit_price,
             "total": (
@@ -870,11 +886,11 @@ def order_detail(
                 else None
             ),
             "sourceUnitPrice": source_unit_price,
-            "sourceTotal": item.OrderItem.total,
+            "sourceTotal": item.total,
             "priceSource": (
-                "catalog" if item.catalog_price is not None else "unavailable"
+                "catalog" if catalog_price is not None else "unavailable"
             ),
-            "discount": item.OrderItem.discount,
+            "discount": item.discount,
         }
 
     detail_items = [detail_item(item) for item in item_rows]
@@ -1947,37 +1963,338 @@ def breakdowns(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
     }
 
 
-def rankings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
+def _header_revenue_expression():
+    return func.coalesce(Order.net_total, Order.total)
+
+
+def _empty_ranking_page(
+    filters: AnalyticsFilters,
+    *,
+    sort: str,
+    page_size: int,
+    metadata: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
-        "products": products_page(
-            db,
-            filters,
-            page=1,
-            page_size=20,
-            search=None,
-            sort="revenue",
-            order="desc",
+        "items": [],
+        "page": 1,
+        "pageSize": page_size,
+        "totalItems": 0,
+        "totalPages": 0,
+        "sort": sort,
+        "order": "desc",
+        "appliedFilters": applied_filters(filters),
+        "metadata": metadata,
+        "summary": summary or {},
+    }
+
+
+def _ranking_customers(
+    db: Session,
+    filters: AnalyticsFilters,
+    metadata: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    conditions = _sale_conditions(filters)
+    total_revenue = _decimal(
+        db.scalar(
+            select(
+                func.coalesce(func.sum(_header_revenue_expression()), 0)
+            ).where(*conditions)
+        )
+    )
+    revenue_expr = func.coalesce(
+        func.sum(_header_revenue_expression()),
+        0,
+    ).label("revenue")
+    rows = db.execute(
+        select(
+            Customer.mercos_id,
+            Customer.name,
+            Customer.city,
+            Customer.state,
+            Customer.segment_mercos_id,
+            Customer.active,
+            func.count(Order.id).label("order_count"),
+            revenue_expr,
+        )
+        .join(Order, Order.customer_mercos_id == Customer.mercos_id)
+        .where(*conditions)
+        .group_by(
+            Customer.mercos_id,
+            Customer.name,
+            Customer.city,
+            Customer.state,
+            Customer.segment_mercos_id,
+            Customer.active,
+        )
+        .order_by(desc(revenue_expr), Customer.name)
+        .limit(limit)
+    ).all()
+    cumulative = ZERO
+    items = []
+    for row in rows:
+        revenue = _decimal(row.revenue)
+        orders = int(row.order_count or 0)
+        cumulative += revenue
+        share = float((revenue / total_revenue) * 100) if total_revenue else 0.0
+        cumulative_share = (
+            float((cumulative / total_revenue) * 100) if total_revenue else 0.0
+        )
+        items.append(
+            {
+                "id": row.mercos_id,
+                "name": row.name,
+                "city": row.city,
+                "state": row.state,
+                "segmentId": row.segment_mercos_id,
+                "active": row.active,
+                "orderCount": orders,
+                "revenue": revenue,
+                "revenueShare": share,
+                "cumulativeRevenueShare": cumulative_share,
+                "abcClass": (
+                    "A"
+                    if cumulative_share <= 80
+                    else "B"
+                    if cumulative_share <= 95
+                    else "C"
+                ),
+                "averageTicket": revenue / orders if orders else ZERO,
+                "firstOrderAt": None,
+                "lastOrderAt": None,
+                "daysSinceLastOrder": None,
+                "averageOrderIntervalDays": None,
+                "recency": None,
+                "frequency": orders,
+                "monetary": revenue,
+                "rfm": {
+                    "recency": 0,
+                    "frequency": 0,
+                    "monetary": 0,
+                    "score": 0,
+                    "segment": "regulares",
+                },
+            }
+        )
+    return {
+        "items": items,
+        "page": 1,
+        "pageSize": limit,
+        "totalItems": len(items),
+        "totalPages": 1 if items else 0,
+        "sort": "revenue",
+        "order": "desc",
+        "appliedFilters": applied_filters(filters),
+        "metadata": metadata,
+        "summary": {
+            "concentrationTop5Pct": 0.0,
+            "concentrationTop10Pct": 0.0,
+            "concentrationTop20Pct": round(
+                float((cumulative / total_revenue) * 100) if total_revenue else 0.0,
+                2,
+            ),
+        },
+    }
+
+
+def _ranking_sellers(
+    db: Session,
+    filters: AnalyticsFilters,
+    metadata: dict[str, Any],
+    limit: int = 15,
+) -> dict[str, Any]:
+    conditions = _sale_conditions(filters)
+    revenue_expr = func.coalesce(
+        func.sum(_header_revenue_expression()),
+        0,
+    ).label("revenue")
+    rows = db.execute(
+        select(
+            Seller.mercos_id,
+            Seller.name,
+            Seller.active,
+            func.count(Order.id).label("order_count"),
+            revenue_expr,
+            func.count(func.distinct(Order.customer_mercos_id)).label("customers"),
+        )
+        .join(Order, Order.seller_mercos_id == Seller.mercos_id)
+        .where(*conditions)
+        .group_by(Seller.mercos_id, Seller.name, Seller.active)
+        .order_by(desc(revenue_expr), Seller.name)
+        .limit(limit)
+    ).all()
+    items = []
+    for row in rows:
+        revenue = _decimal(row.revenue)
+        orders = int(row.order_count or 0)
+        items.append(
+            {
+                "id": row.mercos_id,
+                "name": row.name,
+                "active": row.active,
+                "orderCount": orders,
+                "revenue": revenue,
+                "averageTicket": revenue / orders if orders else ZERO,
+                "customers": int(row.customers or 0),
+                "newCustomers": None,
+                "newCustomersAvailability": "indisponível neste recorte",
+                "cancellations": 0,
+                "discountTotal": ZERO,
+            }
+        )
+    return {
+        "items": items,
+        "page": 1,
+        "pageSize": limit,
+        "totalItems": len(items),
+        "totalPages": 1 if items else 0,
+        "sort": "revenue",
+        "order": "desc",
+        "appliedFilters": applied_filters(filters),
+        "metadata": metadata,
+    }
+
+
+def _ranking_products(
+    db: Session,
+    filters: AnalyticsFilters,
+    metadata: dict[str, Any],
+    limit: int = 20,
+) -> dict[str, Any]:
+    conditions = [
+        *_sale_conditions(filters),
+        OrderItem.excluded.is_(False),
+        _valid_list_price_expression().is_not(None),
+    ]
+    revenue_expr = func.coalesce(
+        func.sum(_current_item_value_expression()),
+        0,
+    ).label("revenue")
+    rows = db.execute(
+        select(
+            Product.mercos_id,
+            Product.name,
+            Product.code,
+            Product.list_price,
+            func.coalesce(func.sum(OrderItem.quantity), 0).label("quantity_sold"),
+            func.count(func.distinct(Order.mercos_id)).label("order_count"),
+            revenue_expr,
+        )
+        .select_from(Order)
+        .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
+        .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
+        .where(*conditions)
+        .group_by(
+            Product.mercos_id,
+            Product.name,
+            Product.code,
+            Product.list_price,
+        )
+        .order_by(desc(revenue_expr), Product.name)
+        .limit(limit)
+    ).all()
+    total_revenue = sum((_decimal(row.revenue) for row in rows), ZERO)
+    cumulative = ZERO
+    items = []
+    for row in rows:
+        revenue = _decimal(row.revenue)
+        cumulative += revenue
+        list_price = (
+            None
+            if _decimal(row.list_price) in PLACEHOLDER_LIST_PRICES
+            else row.list_price
+        )
+        items.append(
+            {
+                "id": row.mercos_id,
+                "code": row.code,
+                "name": row.name,
+                "categoryId": None,
+                "active": True,
+                "quantitySold": _decimal(row.quantity_sold),
+                "orderCount": int(row.order_count or 0),
+                "revenue": revenue,
+                "revenueShare": (
+                    float((revenue / total_revenue) * 100) if total_revenue else 0.0
+                ),
+                "cumulativeRevenueShare": (
+                    float((cumulative / total_revenue) * 100)
+                    if total_revenue
+                    else 0.0
+                ),
+                "abcClass": None,
+                "averagePrice": (
+                    revenue / _decimal(row.quantity_sold)
+                    if row.quantity_sold
+                    else ZERO
+                ),
+                "listPrice": list_price,
+                "minimumPrice": None,
+                "stock": ZERO,
+                "stockValue": ZERO,
+                "averageDailyVelocity": ZERO,
+                "estimatedCoverageDays": None,
+                "stockoutRisk": False,
+                "excessStock": False,
+                "lastSaleAt": None,
+                "daysWithoutSale": None,
+                "neverSold": False,
+                "classification": "sem_venda_periodo",
+            }
+        )
+    return {
+        "items": items,
+        "page": 1,
+        "pageSize": limit,
+        "totalItems": len(items),
+        "totalPages": 1 if items else 0,
+        "sort": "revenue",
+        "order": "desc",
+        "appliedFilters": applied_filters(filters),
+        "metadata": metadata,
+    }
+
+
+def rankings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
+    metadata = analytics_metadata(db)
+
+    def safe(builder, page_size: int, sort: str, summary: dict[str, Any] | None = None):
+        try:
+            return builder()
+        except OperationalError:
+            db.rollback()
+            return _empty_ranking_page(
+                filters,
+                sort=sort,
+                page_size=page_size,
+                metadata=metadata,
+                summary=summary,
+            )
+
+    return {
+        "products": safe(
+            lambda: _ranking_products(db, filters, metadata),
+            20,
+            "revenue",
         ),
-        "customers": customers_page(
-            db,
-            filters,
-            page=1,
-            page_size=20,
-            search=None,
-            sort="revenue",
-            order="desc",
+        "customers": safe(
+            lambda: _ranking_customers(db, filters, metadata),
+            20,
+            "revenue",
+            {
+                "concentrationTop5Pct": 0.0,
+                "concentrationTop10Pct": 0.0,
+                "concentrationTop20Pct": 0.0,
+            },
         ),
-        "sellers": sellers_page(
-            db,
-            filters,
-            page=1,
-            page_size=15,
-            search=None,
-            sort="revenue",
-            order="desc",
+        "sellers": safe(
+            lambda: _ranking_sellers(db, filters, metadata),
+            15,
+            "revenue",
         ),
         "appliedFilters": applied_filters(filters),
-        "metadata": analytics_metadata(db),
+        "metadata": metadata,
     }
 
 
