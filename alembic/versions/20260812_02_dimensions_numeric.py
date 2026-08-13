@@ -102,6 +102,104 @@ def _to_numeric(table: str, column: str, precision: int, scale: int) -> None:
             batch.alter_column(column, type_=target)
 
 
+def _quote_identifier(value: str) -> str:
+    return f'"{value.replace(chr(34), chr(34) * 2)}"'
+
+
+def _drop_dependent_views() -> list[dict]:
+    bind = op.get_bind()
+    if bind.dialect.name != "postgresql":
+        return []
+    rows = bind.execute(
+        sa.text(
+            """
+            WITH RECURSIVE dependencies AS (
+                SELECT DISTINCT
+                    rewrite.ev_class AS view_oid,
+                    dependency.refobjid AS referenced_oid
+                FROM pg_rewrite AS rewrite
+                JOIN pg_depend AS dependency
+                  ON dependency.objid = rewrite.oid
+                JOIN pg_class AS view_class
+                  ON view_class.oid = rewrite.ev_class
+                WHERE view_class.relkind = 'v'
+                  AND dependency.deptype = 'n'
+            ),
+            roots AS (
+                SELECT DISTINCT dependencies.view_oid, 0 AS depth
+                FROM dependencies
+                JOIN pg_class AS referenced
+                  ON referenced.oid = dependencies.referenced_oid
+                JOIN pg_namespace AS referenced_schema
+                  ON referenced_schema.oid = referenced.relnamespace
+                WHERE referenced_schema.nspname = current_schema()
+                  AND referenced.relname IN ('products', 'orders', 'order_items')
+            ),
+            affected AS (
+                SELECT view_oid, depth FROM roots
+                UNION ALL
+                SELECT dependencies.view_oid, affected.depth + 1
+                FROM dependencies
+                JOIN affected
+                  ON dependencies.referenced_oid = affected.view_oid
+            )
+            SELECT
+                view_schema.nspname AS schema_name,
+                view_class.relname AS view_name,
+                pg_get_viewdef(view_class.oid, true) AS definition,
+                pg_get_userbyid(view_class.relowner) AS owner_name,
+                view_class.reloptions AS options,
+                max(affected.depth) AS depth
+            FROM affected
+            JOIN pg_class AS view_class
+              ON view_class.oid = affected.view_oid
+            JOIN pg_namespace AS view_schema
+              ON view_schema.oid = view_class.relnamespace
+            WHERE view_schema.nspname NOT IN ('pg_catalog', 'information_schema')
+            GROUP BY
+                view_class.oid,
+                view_schema.nspname,
+                view_class.relname,
+                view_class.relowner,
+                view_class.reloptions
+            ORDER BY depth DESC, view_schema.nspname, view_class.relname
+            """
+        )
+    ).mappings().all()
+    views = [dict(row) for row in rows]
+    for view in views:
+        qualified_name = (
+            f"{_quote_identifier(view['schema_name'])}."
+            f"{_quote_identifier(view['view_name'])}"
+        )
+        op.execute(f"DROP VIEW {qualified_name}")
+    return views
+
+
+def _restore_dependent_views(views: list[dict]) -> None:
+    for view in sorted(
+        views,
+        key=lambda item: (
+            item["depth"],
+            item["schema_name"],
+            item["view_name"],
+        ),
+    ):
+        qualified_name = (
+            f"{_quote_identifier(view['schema_name'])}."
+            f"{_quote_identifier(view['view_name'])}"
+        )
+        options = view["options"] or []
+        options_sql = f" WITH ({', '.join(options)})" if options else ""
+        op.execute(
+            f"CREATE VIEW {qualified_name}{options_sql} AS {view['definition']}"
+        )
+        op.execute(
+            f"ALTER VIEW {qualified_name} OWNER TO "
+            f"{_quote_identifier(view['owner_name'])}"
+        )
+
+
 def upgrade() -> None:
     tables = _tables()
     for table, with_parent in DIMENSIONS.items():
@@ -206,6 +304,7 @@ def upgrade() -> None:
             if name not in _indexes("orders"):
                 op.create_index(name, "orders", [column])
 
+    dependent_views = _drop_dependent_views()
     for table, column, precision, scale in (
         ("products", "list_price", 18, 2),
         ("products", "stock", 18, 4),
@@ -217,6 +316,7 @@ def upgrade() -> None:
         ("order_items", "total", 18, 2),
     ):
         _to_numeric(table, column, precision, scale)
+    _restore_dependent_views(dependent_views)
 
 
 def downgrade() -> None:
