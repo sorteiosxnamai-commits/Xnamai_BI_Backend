@@ -388,6 +388,15 @@ def test_paginated_entities_and_advanced_analytics_execute() -> None:
             sort="revenue",
             order="desc",
         )
+        products_by_price = products_page(
+            db,
+            filters,
+            page=1,
+            page_size=50,
+            search=None,
+            sort="list_price",
+            order="asc",
+        )
         customers = customers_page(
             db,
             filters,
@@ -409,6 +418,7 @@ def test_paginated_entities_and_advanced_analytics_execute() -> None:
 
         assert products["totalItems"] == 2
         assert products["items"][0]["id"] == "p1"
+        assert [item["id"] for item in products_by_price["items"]] == ["p2", "p1"]
         assert customers["items"][0]["id"] == "c1"
         assert sellers["items"][0]["id"] == "s1"
         assert geography(db, filters)["states"][0]["state"] == "SP"
