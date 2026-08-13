@@ -5,14 +5,17 @@
 - **Venda válida**: pedido cujo status normalizado pertence a `2` ou `pedido`.
 - **Cancelamento**: pedido cujo status pertence a `0`, `5`, `cancelled` ou
   `cancelado`. A regra canônica está em `app/domain/order_status.py`.
-- **Faturamento bruto**: soma de `gross_total`; usa `orders.total` somente
-  quando a fonte não informa o bruto.
+- **Faturamento bruto**: total líquido acrescido dos descontos calculados pela
+  diferença entre `preco_tabela` e `preco_liquido` históricos de cada item.
+  Pedidos sem preços completos continuam usando `orders.total` e são
+  identificados pela cobertura parcial.
 - **Faturamento líquido**: soma de `net_total`; usa `orders.total` quando o
   líquido não existe na fonte.
 - **Ticket médio**: faturamento líquido dividido pela quantidade de vendas
   válidas.
-- **Desconto total**: soma de `discount_value`; usa o campo legado `discount`
-  quando o valor explícito não existe.
+- **Desconto total**: soma das diferenças positivas entre preço de tabela e
+  preço líquido, multiplicadas pela quantidade; usa o campo legado `discount`
+  somente quando essa derivação não está disponível.
 - **Taxa de cancelamento**: cancelamentos divididos por todos os pedidos nos
   mesmos filtros.
 - **Compradores únicos**: clientes distintos com venda válida.

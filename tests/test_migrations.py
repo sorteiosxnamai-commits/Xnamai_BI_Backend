@@ -29,9 +29,11 @@ def test_phase2_migration_upgrades_legacy_order_items(tmp_path):
     assert "categories" in schema.get_table_names()
     assert "customer_segments" in schema.get_table_names()
     assert "product_prices" in schema.get_table_names()
-    assert "mercos_item_id" in {
+    item_columns = {
         column["name"] for column in schema.get_columns("order_items")
     }
+    assert "mercos_item_id" in item_columns
+    assert "list_unit_price" in item_columns
     unique_columns = {
         tuple(constraint["column_names"])
         for constraint in schema.get_unique_constraints("order_items")
@@ -44,5 +46,8 @@ def test_phase2_migration_upgrades_legacy_order_items(tmp_path):
     assert "export_runs" not in rolled_back.get_table_names()
     assert "categories" not in rolled_back.get_table_names()
     assert "mercos_item_id" not in {
+        column["name"] for column in rolled_back.get_columns("order_items")
+    }
+    assert "list_unit_price" not in {
         column["name"] for column in rolled_back.get_columns("order_items")
     }

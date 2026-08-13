@@ -116,6 +116,10 @@ class OrderItem(Base):
     code: Mapped[str | None] = mapped_column(String(100))
     name: Mapped[str] = mapped_column(String(400), default="")
     quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    list_unit_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 2),
+        nullable=True,
+    )
     unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
     discount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)
     total: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=0)

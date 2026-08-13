@@ -121,6 +121,7 @@ class ListWithItemsAdaptor:
                             "id": 601,
                             "produto_id": 3,
                             "quantidade": 2,
+                            "preco_tabela": "20,00",
                             "preco_liquido": "15,00",
                             "subtotal": "30,00",
                         }
@@ -148,6 +149,13 @@ async def test_order_sync_uses_items_from_v2_list_without_detail(
     with sync_db() as db:
         assert db.scalar(select(func.count(Order.id))) == 1
         assert db.scalar(select(func.count(OrderItem.id))) == 1
+        order = db.scalar(select(Order))
+        item = db.scalar(select(OrderItem))
+        assert order.net_total == Decimal("30.00")
+        assert order.gross_total == Decimal("40.00")
+        assert order.discount_value == Decimal("10.00")
+        assert order.discount_percent == Decimal("25.00")
+        assert item.list_unit_price == Decimal("20.00")
         run = db.scalar(select(SyncRun))
         assert run.details["detailsConsulted"] == 0
         assert run.details["itemsPersisted"] == 1

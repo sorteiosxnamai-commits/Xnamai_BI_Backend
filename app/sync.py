@@ -203,6 +203,28 @@ def _upsert_rows(db, resource: str, rows: list):
             obj.issued_at = dt(row.get("data_emissao") or row.get("data_criacao") or row.get("ultima_alteracao"))
             obj.total = f(row.get("total"))
             obj.discount = f(row.get("desconto"))
+            items = [
+                item
+                for item in (row.get("itens") or row.get("items") or [])
+                if str(item.get("excluido", False)).lower() not in {"true", "1"}
+            ]
+            derived_discount = Decimal("0")
+            complete_item_prices = bool(items)
+            for item in items:
+                list_unit = optional_decimal(item, "preco_tabela")
+                net_unit = optional_decimal(
+                    item,
+                    "preco_liquido",
+                    "preco_unitario",
+                    "preco",
+                )
+                if list_unit is None or net_unit is None:
+                    complete_item_prices = False
+                    continue
+                derived_discount += max(
+                    (list_unit - net_unit) * f(item.get("quantidade")),
+                    Decimal("0"),
+                )
             if "tipo_pedido_id" in row:
                 obj.order_type_mercos_id = (
                     str(row.get("tipo_pedido_id") or "") or None
@@ -223,26 +245,39 @@ def _upsert_rows(db, resource: str, rows: list):
                 obj.commercial_policy_mercos_id = (
                     str(row.get("politica_comercial_id") or "") or None
                 )
-            if "total_bruto" in row or "valor_bruto" in row:
-                obj.gross_total = optional_decimal(
-                    row,
-                    "total_bruto",
-                    "valor_bruto",
-                )
+            explicit_gross = optional_decimal(row, "total_bruto", "valor_bruto")
             obj.net_total = optional_decimal(row, "total_liquido", "valor_liquido", "total")
-            if "valor_desconto" in row or "desconto_valor" in row:
-                obj.discount_value = optional_decimal(
-                    row,
-                    "valor_desconto",
-                    "desconto_valor",
+            explicit_discount = optional_decimal(
+                row,
+                "valor_desconto",
+                "desconto_valor",
+            )
+            obj.discount_value = (
+                explicit_discount
+                if explicit_discount is not None
+                else derived_discount if complete_item_prices else None
+            )
+            obj.gross_total = (
+                explicit_gross
+                if explicit_gross is not None
+                else (
+                    obj.net_total + derived_discount
+                    if complete_item_prices and obj.net_total is not None
+                    else None
                 )
-            if "desconto_percentual" in row or "percentual_desconto" in row:
-                obj.discount_percent = optional_decimal(
-                    row,
-                    "desconto_percentual",
-                    "percentual_desconto",
-                )
-            items = row.get("itens") or row.get("items") or []
+            )
+            explicit_discount_percent = optional_decimal(
+                row,
+                "desconto_percentual",
+                "percentual_desconto",
+            )
+            obj.discount_percent = explicit_discount_percent
+            if (
+                explicit_discount_percent is None
+                and obj.gross_total
+                and obj.discount_value is not None
+            ):
+                obj.discount_percent = obj.discount_value / obj.gross_total * 100
             obj.item_count = len(items)
             obj.sku_count = len(
                 {
@@ -258,14 +293,16 @@ def _upsert_rows(db, resource: str, rows: list):
             db.add(obj)
             db.flush()
             db.execute(delete(OrderItem).where(OrderItem.order_mercos_id == mid))
-            for pos, item in enumerate(row.get("itens") or row.get("items") or []):
+            for pos, item in enumerate(items):
                 q = f(item.get("quantidade"))
-                unit = f(
-                    item.get("preco_liquido")
-                    or item.get("preco_unitario")
-                    or item.get("preco")
-                    or item.get("preco_tabela")
-                )
+                list_unit = optional_decimal(item, "preco_tabela")
+                unit = optional_decimal(
+                    item,
+                    "preco_liquido",
+                    "preco_unitario",
+                    "preco",
+                    "preco_tabela",
+                ) or Decimal("0")
                 total = f(item.get("subtotal") or item.get("total") or (q * unit))
                 db.add(
                     OrderItem(
@@ -284,6 +321,7 @@ def _upsert_rows(db, resource: str, rows: list):
                         code=str(item.get("produto_codigo") or item.get("codigo") or ""),
                         name=item.get("produto_nome") or item.get("nome") or item.get("descricao") or "Produto",
                         quantity=q,
+                        list_unit_price=list_unit,
                         unit_price=unit,
                         discount=f(item.get("desconto") or item.get("desconto_de_cupom")),
                         total=total,

@@ -304,7 +304,10 @@ def overview(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         else ZERO
     )
     definitions = {
-        "grossRevenue": "Soma do valor bruto informado pela fonte; usa total quando indisponível.",
+        "grossRevenue": (
+            "Total líquido acrescido dos descontos derivados da diferença "
+            "histórica entre preço de tabela e preço líquido dos itens."
+        ),
         "netRevenue": "Soma do valor líquido dos pedidos válidos; usa total quando indisponível.",
         "orders": "Quantidade de pedidos classificados como venda válida.",
         "averageTicket": "Faturamento líquido dividido pelos pedidos válidos.",
