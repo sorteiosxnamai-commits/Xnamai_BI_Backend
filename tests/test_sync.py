@@ -114,6 +114,29 @@ class FailingDetailAdaptor:
         raise HTTPException(502, "Adaptor inacessível")
 
 
+class ForbiddenOptionalResourceAdaptor:
+    async def list(self, resource: str, cursor: str | None):
+        raise HTTPException(403, "Sem permissão Mercos para o recurso")
+
+
+@pytest.mark.asyncio
+async def test_optional_resource_without_permission_is_unavailable(
+    sync_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(sync, "adaptor", ForbiddenOptionalResourceAdaptor())
+
+    result = await sync.sync_resource("carriers", full=False)
+
+    assert result["status"] == "unavailable"
+    with sync_db() as db:
+        state = db.get(SyncState, "carriers")
+        run = db.scalar(select(SyncRun))
+        assert state.status == "unavailable"
+        assert run.status == "unavailable"
+        assert run.failed == 0
+
+
 @pytest.mark.asyncio
 async def test_detail_failure_does_not_advance_cursor(sync_db, monkeypatch):
     with sync_db() as db:

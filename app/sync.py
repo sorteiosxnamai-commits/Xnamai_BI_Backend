@@ -52,6 +52,16 @@ CATALOG_RESOURCES = (
     "product-prices",
     "users",
 )
+OPTIONAL_CATALOG_RESOURCES = {
+    "categories",
+    "segments",
+    "order-types",
+    "payment-conditions",
+    "price-tables",
+    "carriers",
+    "commercial-policies",
+    "product-prices",
+}
 SYNC_RESOURCES = (*CATALOG_RESOURCES, "orders")
 
 
@@ -500,6 +510,36 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
         # Network blips / Render cold starts — keep cursor and allow auto-resume
         source_exc = exc.first_error if isinstance(exc, OrderDetailBatchError) else exc
+        unavailable = (
+            resource in OPTIONAL_CATALOG_RESOURCES
+            and isinstance(source_exc, HTTPException)
+            and source_exc.status_code == 403
+        )
+        if unavailable:
+            snapshot = _finish_sync_run(
+                run_id,
+                resource,
+                status="unavailable",
+                pages=pages,
+                received=received,
+                persisted=persisted,
+                failed=0,
+                cursor_after=committed_cursor,
+                details_consulted=details_consulted,
+                items_persisted=items_persisted,
+                started_at=started_at,
+                error=str(detail)[:1000],
+            )
+            log.warning(
+                "Sync %s unavailable: Mercos token has no permission",
+                resource,
+            )
+            return {
+                **snapshot,
+                "records": persisted,
+                "status": "unavailable",
+                "error": str(detail),
+            }
         transient = isinstance(source_exc, HTTPException) and (
             "inacessível" in str(source_exc.detail).lower()
             or source_exc.status_code in {429, 502, 503}
