@@ -22,6 +22,8 @@ services:
         value: "viewer"
       - key: AUTH_VIEWER_PASSWORD
         sync: false
+      - key: AUTH_DISABLED
+        value: "true"
       - key: AUTH_COOKIE_SECURE
         value: "true"
       - key: CORS_ORIGINS

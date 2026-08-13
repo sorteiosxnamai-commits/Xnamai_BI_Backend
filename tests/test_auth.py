@@ -63,3 +63,14 @@ def test_service_api_key_remains_available_for_non_browser_integrations(auth_set
         x_api_key=None,
     )
     assert viewer.role == "viewer"
+
+
+def test_public_mode_grants_direct_admin_access(auth_settings, monkeypatch):
+    public_config = auth_settings.model_copy(update={"auth_disabled": True})
+    monkeypatch.setattr(auth, "settings", lambda: public_config)
+
+    user = auth.current_user(credentials=None, x_api_key=None)
+    refreshed = auth.refresh_user(bi_refresh=None)
+
+    assert user == auth.AuthUser(username="public-admin", role="admin")
+    assert refreshed == user
