@@ -9,9 +9,12 @@ from app import adaptor as adaptor_module
 
 
 class FakeClient:
-    def __init__(self, responses: list[httpx.Response]):
+    def __init__(self, responses: list[httpx.Response], *, health_ok: bool = True):
         self.responses = responses
         self.calls = 0
+        self.health_calls = 0
+        self.health_ok = health_ok
+        self.urls: list[str] = []
 
     async def __aenter__(self):
         return self
@@ -19,7 +22,20 @@ class FakeClient:
     async def __aexit__(self, exc_type, exc, traceback):
         return None
 
-    async def get(self, *args, **kwargs):
+    async def get(self, url, *args, **kwargs):
+        target = str(url)
+        self.urls.append(target)
+        if "/health" in target:
+            self.health_calls += 1
+            request = httpx.Request("GET", target)
+            if self.health_ok:
+                return httpx.Response(200, json={"status": "ok"}, request=request)
+            return httpx.Response(
+                502,
+                text="<!DOCTYPE html><title>502</title>",
+                headers={"content-type": "text/html"},
+                request=request,
+            )
         response = self.responses[self.calls]
         self.calls += 1
         return response
@@ -45,7 +61,7 @@ def response(status: int, *, text: str = "") -> httpx.Response:
 
 
 @pytest.mark.asyncio
-async def test_list_waits_through_render_cold_start(monkeypatch):
+async def test_list_wakes_adaptor_before_orders(monkeypatch):
     fake = FakeClient(
         [
             response(502, text="<!DOCTYPE html><title>502</title>"),
@@ -71,7 +87,9 @@ async def test_list_waits_through_render_cold_start(monkeypatch):
     result = await adaptor_module.Adaptor().list("orders")
 
     assert result == {"data": [], "nextCursor": None}
+    assert fake.health_calls == 1
     assert fake.calls == 6
+    assert fake.urls[0].endswith("/health")
     assert [call.args[0] for call in sleep.await_args_list] == [1, 2, 4, 8, 16]
 
 
@@ -93,3 +111,5 @@ async def test_list_does_not_persist_provider_html(monkeypatch):
 
     assert "resposta HTML temporária do provedor" in exc_info.value.detail
     assert "<!DOCTYPE" not in exc_info.value.detail
+    assert fake.health_calls == 1
+    assert fake.calls == 1

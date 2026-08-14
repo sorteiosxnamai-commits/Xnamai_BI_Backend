@@ -10,7 +10,8 @@ from app.config import settings
 log = logging.getLogger("uvicorn.error")
 
 TRANSIENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError)
-DEFAULT_RETRIES = 8
+DEFAULT_RETRIES = 10
+WARMUP_RETRIES = 6
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -22,6 +23,24 @@ def _response_detail(response: httpx.Response) -> str:
 
 
 class Adaptor:
+    async def wake(self, *, retries: int = WARMUP_RETRIES) -> None:
+        cfg = settings()
+        if not cfg.mercos_adaptor_url:
+            return
+        url = f"{cfg.mercos_adaptor_url.rstrip('/')}/health"
+        for attempt in range(retries):
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    response = await client.get(url)
+                if not response.is_error:
+                    if attempt:
+                        log.info("Adaptor ready after %s health attempts", attempt + 1)
+                    return
+            except TRANSIENT:
+                pass
+            if attempt + 1 < retries:
+                await asyncio.sleep(min(2 ** attempt, 15))
+
     async def list(
         self,
         resource: str,
@@ -32,6 +51,7 @@ class Adaptor:
         cfg = settings()
         if not cfg.mercos_adaptor_url or not cfg.mercos_adaptor_api_key:
             raise HTTPException(503, "MERCOS_ADAPTOR_URL/API_KEY não configurados")
+        await self.wake()
         params = {"alterado_apos": cursor} if cursor else {}
         url = f"{cfg.mercos_adaptor_url.rstrip('/')}/v1/{resource}"
         last_exc: Exception | None = None
@@ -98,6 +118,7 @@ class Adaptor:
         cfg = settings()
         if not cfg.mercos_adaptor_url or not cfg.mercos_adaptor_api_key:
             raise HTTPException(503, "MERCOS_ADAPTOR_URL/API_KEY não configurados")
+        await self.wake()
         safe_id = quote(str(mercos_id), safe="")
         url = f"{cfg.mercos_adaptor_url.rstrip('/')}/v1/{resource}/{safe_id}"
         last_exc: Exception | None = None
@@ -150,3 +171,10 @@ class Adaptor:
 
 
 adaptor = Adaptor()
+
+
+async def keep_adaptor_warm() -> None:
+    try:
+        await adaptor.wake(retries=2)
+    except Exception as exc:
+        log.warning("Adaptor keep-warm failed: %s", type(exc).__name__)

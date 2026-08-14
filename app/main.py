@@ -30,6 +30,7 @@ from app.routers.auth import router as auth_router
 from app.routers.exports import router as exports_router
 from app.schemas.data_quality import DataQualityResponse
 from app.services.data_quality import build_data_quality_report
+from app.adaptor import keep_adaptor_warm
 from app.sync import (
     SYNC_LEASE_TTL,
     SYNC_RESOURCES,
@@ -116,9 +117,18 @@ async def lifespan(app):
             max_instances=1,
             coalesce=True,
         )
+        scheduler.add_job(
+            keep_adaptor_warm,
+            "interval",
+            minutes=8,
+            id="keep_adaptor_warm",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
         scheduler.start()
         log.info(
-            "Scheduler started (orders every %sm, catalog every %sh)",
+            "Scheduler started (orders every %sm, catalog every %sh, adaptor ping every 8m)",
             cfg.sync_orders_minutes,
             cfg.sync_catalog_hours,
         )
