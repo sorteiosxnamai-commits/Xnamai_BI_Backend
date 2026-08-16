@@ -178,7 +178,7 @@ def test_breakdowns_are_aggregated_server_side() -> None:
         result = breakdowns(db, AnalyticsFilters(period="all"))
 
         assert sum(row["orders"] for row in result["statuses"]) == 3
-        assert sum(row["orders"] for row in result["orderValueBands"]) == 1
+        assert sum(row["orders"] for row in result["orderValueBands"]) == 2
         assert sum(row["entities"] for row in result["productAbc"]) == 2
         assert sum(row["entities"] for row in result["customerAbc"]) == 1
 

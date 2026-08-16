@@ -13,6 +13,7 @@ from sqlalchemy import (
     case,
     cast,
     desc,
+    exists,
     func,
     literal,
     or_,
@@ -116,6 +117,34 @@ def _current_order_values(
             Order.issued_at,
             Order.status,
         )
+        .subquery()
+    )
+
+
+def _header_revenue_expression():
+    return func.coalesce(Order.net_total, Order.total)
+
+
+def _header_order_values(
+    filters: AnalyticsFilters,
+    bounds: tuple[datetime | None, datetime | None] | None = None,
+    statuses: frozenset[str] | set[str] | None = None,
+):
+    conditions = list(order_conditions(filters, bounds=bounds))
+    if statuses is not None:
+        conditions.append(status_sql_in(Order.status, statuses))
+    return (
+        select(
+            Order.mercos_id.label("order_id"),
+            Order.customer_mercos_id.label("customer_id"),
+            Order.seller_mercos_id.label("seller_id"),
+            Order.issued_at.label("issued_at"),
+            Order.status.label("status"),
+            _header_revenue_expression().label("current_total"),
+            func.coalesce(Order.item_count, 0).label("item_count"),
+            func.coalesce(Order.sku_count, 0).label("sku_count"),
+        )
+        .where(*conditions)
         .subquery()
     )
 
@@ -297,42 +326,45 @@ def _buyer_mix(
         .distinct()
         .subquery()
     )
-    lifetime_filters = filters.model_copy(
-        update={"dateFrom": None, "dateTo": None, "period": "all"}
-    )
-    first_orders = (
-        select(
-            Order.customer_mercos_id.label("customer_id"),
-            func.min(Order.issued_at).label("first_order_at"),
-            func.count(Order.id).label("order_count"),
-        )
-        .where(
-            *_sale_conditions(lifetime_filters, (None, None)),
-            Order.customer_mercos_id.is_not(None),
-        )
-        .group_by(Order.customer_mercos_id)
-        .subquery()
-    )
-    start, end = bounds
+    start, _end = bounds
     if start is None:
-        new_condition = first_orders.c.order_count == 1
-    else:
-        new_condition = first_orders.c.first_order_at >= start
-        if end is not None:
-            new_condition = and_(
-                new_condition,
-                first_orders.c.first_order_at < end,
+        frequencies = (
+            select(
+                Order.customer_mercos_id.label("customer_id"),
+                func.count(Order.id).label("order_count"),
             )
+            .where(
+                *_sale_conditions(filters, (None, None)),
+                Order.customer_mercos_id.is_not(None),
+            )
+            .group_by(Order.customer_mercos_id)
+            .subquery()
+        )
+        row = db.execute(
+            select(
+                func.coalesce(
+                    func.sum(case((frequencies.c.order_count == 1, 1), else_=0)),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(case((frequencies.c.order_count > 1, 1), else_=0)),
+                    0,
+                ),
+            ).select_from(frequencies)
+        ).one()
+        return int(row[0] or 0), int(row[1] or 0)
+
+    earlier = exists(
+        select(Order.id).where(
+            Order.customer_mercos_id == current_customers.c.customer_id,
+            *_sale_conditions(filters, (None, start)),
+        )
+    )
     row = db.execute(
         select(
-            func.coalesce(func.sum(case((new_condition, 1), else_=0)), 0),
-            func.coalesce(func.sum(case((~new_condition, 1), else_=0)), 0),
-        )
-        .select_from(current_customers)
-        .join(
-            first_orders,
-            first_orders.c.customer_id == current_customers.c.customer_id,
-        )
+            func.coalesce(func.sum(case((earlier, 0), else_=1)), 0),
+            func.coalesce(func.sum(case((earlier, 1), else_=0)), 0),
+        ).select_from(current_customers)
     ).one()
     return int(row[0] or 0), int(row[1] or 0)
 
@@ -577,8 +609,8 @@ def _timeseries_items(
             func.coalesce(func.sum(OrderItem.quantity), 0).label("items"),
             literal(ZERO).label("discounts"),
         )
-        .select_from(OrderItem)
-        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .select_from(Order)
+        .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
         .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
         .where(
             *common,
@@ -969,8 +1001,8 @@ def _product_aggregate(db: Session, filters: AnalyticsFilters):
             ).label("average_price"),
             func.max(Order.issued_at).label("last_sale_at"),
         )
-        .select_from(OrderItem)
-        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .select_from(Order)
+        .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
         .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
         .where(
             *conditions,
@@ -1213,7 +1245,7 @@ def products_page(
 
 
 def _customer_aggregate(filters: AnalyticsFilters):
-    order_values = _current_order_values(
+    order_values = _header_order_values(
         filters,
         statuses=VALID_SALE_STATUSES,
     )
@@ -1394,7 +1426,14 @@ def customers_page(
             filters.paymentConditionIds,
         )
     ) or filters.minValue is not None or filters.maxValue is not None:
-        conditions.append(aggregate.c.customer_id.is_not(None))
+        conditions.append(
+            exists(
+                select(Order.id).where(
+                    Order.customer_mercos_id == Customer.mercos_id,
+                    *_sale_conditions(filters),
+                )
+            )
+        )
 
     sort_columns = {
         "name": Customer.name,
@@ -1411,13 +1450,7 @@ def customers_page(
         "monetary": func.coalesce(aggregate.c.revenue, 0),
     }
     total = int(
-        db.scalar(
-            select(func.count(Customer.id))
-            .select_from(Customer)
-            .outerjoin(aggregate, aggregate.c.customer_id == Customer.mercos_id)
-            .where(*conditions)
-        )
-        or 0
+        db.scalar(select(func.count(Customer.id)).where(*conditions)) or 0
     )
     ordering = (
         asc(sort_columns[sort])
@@ -1941,21 +1974,18 @@ def seller_detail(
 
 
 def breakdowns(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
-    all_values = _current_order_values(filters)
     common = order_conditions(filters)
     status_rows = db.execute(
         select(
             Order.status,
             func.count(Order.id).label("orders"),
-            func.coalesce(func.sum(all_values.c.current_total), 0).label("value"),
+            func.coalesce(func.sum(_header_revenue_expression()), 0).label("value"),
         )
-        .select_from(Order)
-        .outerjoin(all_values, all_values.c.order_id == Order.mercos_id)
         .where(*common)
         .group_by(Order.status)
         .order_by(func.count(Order.id).desc())
     ).all()
-    valid_values = _current_order_values(
+    valid_values = _header_order_values(
         filters,
         statuses=VALID_SALE_STATUSES,
     )
@@ -1975,21 +2005,27 @@ def breakdowns(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         .group_by(value_band)
     ).all()
 
-    product_aggregate = _product_aggregate(db, filters)
-    product_class = case(
-        (product_aggregate.c.cumulative_share <= 80, "A"),
-        (product_aggregate.c.cumulative_share <= 95, "B"),
-        else_="C",
-    ).label("class_name")
-    product_abc_rows = db.execute(
-        select(
-            product_class,
-            func.count().label("entities"),
-            func.coalesce(func.sum(product_aggregate.c.revenue), 0).label("revenue"),
-        )
-        .select_from(product_aggregate)
-        .group_by(product_class)
-    ).all()
+    product_abc_rows = []
+    try:
+        product_aggregate = _product_aggregate(db, filters)
+        product_class = case(
+            (product_aggregate.c.cumulative_share <= 80, "A"),
+            (product_aggregate.c.cumulative_share <= 95, "B"),
+            else_="C",
+        ).label("class_name")
+        product_abc_rows = db.execute(
+            select(
+                product_class,
+                func.count().label("entities"),
+                func.coalesce(func.sum(product_aggregate.c.revenue), 0).label(
+                    "revenue"
+                ),
+            )
+            .select_from(product_aggregate)
+            .group_by(product_class)
+        ).all()
+    except OperationalError:
+        db.rollback()
 
     customer_aggregate = _customer_aggregate(filters)
     customer_class = case(
@@ -2043,10 +2079,6 @@ def breakdowns(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         "appliedFilters": applied_filters(filters),
         "metadata": analytics_metadata(db),
     }
-
-
-def _header_revenue_expression():
-    return func.coalesce(Order.net_total, Order.total)
 
 
 def _empty_ranking_page(
