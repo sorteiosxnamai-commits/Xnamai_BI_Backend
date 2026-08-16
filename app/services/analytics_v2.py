@@ -1348,15 +1348,57 @@ def _empty_customer_cohort() -> dict[str, Any]:
         "averageMonthlyOrders": 0.0,
         "averageRevenuePerCustomer": ZERO,
         "averageOrderValue": ZERO,
+        "members": [],
+        "membersOmitted": 0,
     }
 
 
-def _customer_cohort(rows, *, total_revenue: Decimal, total_orders: int, months: float):
+def _cohort_members(rows, *, rank_start: int, months: float, limit: int | None):
+    omitted = 0
+    selected = rows
+    if limit is not None and len(rows) > limit:
+        selected = rows[:limit]
+        omitted = len(rows) - limit
+    members = []
+    for offset, row in enumerate(selected):
+        orders = int(row.order_count or 0)
+        revenue = _decimal(row.revenue)
+        members.append(
+            {
+                "id": str(row.customer_id),
+                "name": row.name or str(row.customer_id),
+                "rank": rank_start + offset,
+                "revenue": revenue,
+                "orderCount": orders,
+                "averageMonthlyOrders": round(
+                    orders / months if months else 0.0,
+                    2,
+                ),
+            }
+        )
+    return members, omitted
+
+
+def _customer_cohort(
+    rows,
+    *,
+    total_revenue: Decimal,
+    total_orders: int,
+    months: float,
+    rank_start: int = 1,
+    member_limit: int | None = None,
+):
     if not rows:
         return _empty_customer_cohort()
     revenue = sum((_decimal(row.revenue) for row in rows), ZERO)
     orders = sum(int(row.order_count or 0) for row in rows)
     count = len(rows)
+    members, omitted = _cohort_members(
+        rows,
+        rank_start=rank_start,
+        months=months,
+        limit=member_limit,
+    )
     return {
         "customerCount": count,
         "orderCount": orders,
@@ -1377,6 +1419,8 @@ def _customer_cohort(rows, *, total_revenue: Decimal, total_orders: int, months:
             _decimal(revenue / count) if count else ZERO
         ),
         "averageOrderValue": _decimal(revenue / orders) if orders else ZERO,
+        "members": members,
+        "membersOmitted": omitted,
     }
 
 
@@ -1550,10 +1594,13 @@ def customers_page(
         )
     ranked = db.execute(
         select(
+            aggregate.c.customer_id,
+            Customer.name,
             aggregate.c.revenue,
             aggregate.c.order_count,
             aggregate.c.first_order_at,
         )
+        .join(Customer, Customer.mercos_id == aggregate.c.customer_id)
         .where(func.coalesce(aggregate.c.order_count, 0) > 0)
         .order_by(aggregate.c.revenue.desc(), aggregate.c.order_count.desc())
     ).all()
@@ -1571,12 +1618,17 @@ def customers_page(
         "total_orders": total_orders,
         "months": months,
     }
-    top5 = _customer_cohort(ranked[:5], **cohort_args)
-    top10 = _customer_cohort(ranked[:10], **cohort_args)
-    top20 = _customer_cohort(ranked[:20], **cohort_args)
-    ranks6to10 = _customer_cohort(ranked[5:10], **cohort_args)
-    ranks11to20 = _customer_cohort(ranked[10:20], **cohort_args)
-    rest = _customer_cohort(ranked[20:], **cohort_args)
+    top5 = _customer_cohort(ranked[:5], rank_start=1, **cohort_args)
+    top10 = _customer_cohort(ranked[:10], rank_start=1, **cohort_args)
+    top20 = _customer_cohort(ranked[:20], rank_start=1, **cohort_args)
+    ranks6to10 = _customer_cohort(ranked[5:10], rank_start=6, **cohort_args)
+    ranks11to20 = _customer_cohort(ranked[10:20], rank_start=11, **cohort_args)
+    rest = _customer_cohort(
+        ranked[20:],
+        rank_start=21,
+        member_limit=300,
+        **cohort_args,
+    )
 
     return {
         "items": items,

@@ -668,3 +668,15 @@ def test_customers_summary_splits_top_cohorts_and_long_tail() -> None:
         ]
         assert summary["concentrationTop10Pct"] == 76.09
         assert summary["concentrationTop20Pct"] == 97.83
+        assert [member["name"] for member in summary["top5"]["members"]] == [
+            "Cliente 01",
+            "Cliente 02",
+            "Cliente 03",
+            "Cliente 04",
+            "Cliente 05",
+        ]
+        assert summary["top5"]["members"][0]["rank"] == 1
+        assert summary["ranks6to10"]["members"][0]["name"] == "Cliente 06"
+        assert summary["ranks6to10"]["members"][0]["rank"] == 6
+        assert len(summary["rest"]["members"]) == 5
+        assert summary["rest"]["members"][0]["id"] == "c21"
