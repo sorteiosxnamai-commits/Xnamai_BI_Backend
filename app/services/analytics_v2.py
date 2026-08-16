@@ -1245,7 +1245,7 @@ def products_page(
 
 
 def _customer_aggregate(filters: AnalyticsFilters):
-    order_values = _header_order_values(
+    order_values = _current_order_values(
         filters,
         statuses=VALID_SALE_STATUSES,
     )

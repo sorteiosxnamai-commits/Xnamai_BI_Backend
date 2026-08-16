@@ -705,9 +705,12 @@ def test_excluded_customers_leave_the_totals_and_the_list() -> None:
         )
 
         assert "c1" in [item["id"] for item in included["items"]]
-        assert included["summary"]["totalRevenue"] == Decimal("150")
+        assert included["summary"]["totalRevenue"] == Decimal("160")
         assert "c1" not in [item["id"] for item in excluded["items"]]
         assert excluded["summary"]["totalRevenue"] == Decimal("0")
         assert excluded["summary"]["top5"]["members"] == []
         assert excluded["appliedFilters"]["excludedCustomerIds"] == ["c1"]
+        assert included["summary"]["totalRevenue"] == overview(
+            db, AnalyticsFilters(period="all")
+        )["kpis"]["netRevenue"]["value"]
 
