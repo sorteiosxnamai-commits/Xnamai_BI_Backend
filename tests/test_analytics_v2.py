@@ -638,16 +638,33 @@ def test_customers_summary_splits_top_cohorts_and_long_tail() -> None:
         )
 
         summary = result["summary"]
+        exclusive = [
+            summary["top5"],
+            summary["ranks6to10"],
+            summary["ranks11to20"],
+            summary["rest"],
+        ]
         assert summary["periodMonths"] == 1.0
+        assert summary["totalRevenue"] == Decimal("23000")
         assert summary["top5"]["customerCount"] == 5
         assert summary["top5"]["averageMonthlyOrders"] == 3.0
+        assert summary["top5"]["averageRevenuePerCustomer"] == Decimal("3000")
+        assert summary["top5"]["averageOrderValue"] == Decimal("1000")
         assert summary["top5"]["revenueSharePct"] == 65.22
-        assert summary["top10"]["averageMonthlyOrders"] == 2.0
-        assert summary["top10"]["revenueSharePct"] == 76.09
-        assert summary["top20"]["averageMonthlyOrders"] == 1.5
-        assert summary["top20"]["revenueSharePct"] == 97.83
+        assert summary["ranks6to10"]["customerCount"] == 5
+        assert summary["ranks6to10"]["revenueSharePct"] == 10.87
+        assert summary["ranks6to10"]["averageRevenuePerCustomer"] == Decimal("500")
+        assert summary["ranks6to10"]["averageOrderValue"] == Decimal("500")
+        assert summary["ranks11to20"]["customerCount"] == 10
+        assert summary["ranks11to20"]["revenueSharePct"] == 21.74
         assert summary["rest"]["customerCount"] == 5
         assert summary["rest"]["averageMonthlyOrders"] == 1.0
         assert summary["rest"]["revenueSharePct"] == 2.17
-        assert summary["concentrationRestPct"] == 2.17
-        assert summary["concentrationTop20Pct"] == summary["top20"]["revenueSharePct"]
+        assert summary["rest"]["averageRevenuePerCustomer"] == Decimal("100")
+        assert summary["rest"]["averageOrderValue"] == Decimal("100")
+        assert sum(band["revenueSharePct"] for band in exclusive) == 100.0
+        assert sum((band["revenue"] for band in exclusive), Decimal("0")) == summary[
+            "totalRevenue"
+        ]
+        assert summary["concentrationTop10Pct"] == 76.09
+        assert summary["concentrationTop20Pct"] == 97.83

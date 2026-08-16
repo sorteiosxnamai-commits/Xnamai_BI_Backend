@@ -1309,10 +1309,13 @@ def _period_months(
 def _empty_customer_cohort() -> dict[str, Any]:
     return {
         "customerCount": 0,
+        "orderCount": 0,
         "revenue": ZERO,
         "revenueSharePct": 0.0,
         "orderSharePct": 0.0,
         "averageMonthlyOrders": 0.0,
+        "averageRevenuePerCustomer": ZERO,
+        "averageOrderValue": ZERO,
     }
 
 
@@ -1324,6 +1327,7 @@ def _customer_cohort(rows, *, total_revenue: Decimal, total_orders: int, months:
     count = len(rows)
     return {
         "customerCount": count,
+        "orderCount": orders,
         "revenue": revenue,
         "revenueSharePct": round(
             float((revenue / total_revenue) * 100) if total_revenue else 0.0,
@@ -1337,6 +1341,10 @@ def _customer_cohort(rows, *, total_revenue: Decimal, total_orders: int, months:
             orders / count / months if months else 0.0,
             2,
         ),
+        "averageRevenuePerCustomer": (
+            _decimal(revenue / count) if count else ZERO
+        ),
+        "averageOrderValue": _decimal(revenue / orders) if orders else ZERO,
     }
 
 
@@ -1525,30 +1533,17 @@ def customers_page(
             default=None,
         ),
     )
-    top5 = _customer_cohort(
-        ranked[:5],
-        total_revenue=total_revenue,
-        total_orders=total_orders,
-        months=months,
-    )
-    top10 = _customer_cohort(
-        ranked[:10],
-        total_revenue=total_revenue,
-        total_orders=total_orders,
-        months=months,
-    )
-    top20 = _customer_cohort(
-        ranked[:20],
-        total_revenue=total_revenue,
-        total_orders=total_orders,
-        months=months,
-    )
-    rest = _customer_cohort(
-        ranked[20:],
-        total_revenue=total_revenue,
-        total_orders=total_orders,
-        months=months,
-    )
+    cohort_args = {
+        "total_revenue": total_revenue,
+        "total_orders": total_orders,
+        "months": months,
+    }
+    top5 = _customer_cohort(ranked[:5], **cohort_args)
+    top10 = _customer_cohort(ranked[:10], **cohort_args)
+    top20 = _customer_cohort(ranked[:20], **cohort_args)
+    ranks6to10 = _customer_cohort(ranked[5:10], **cohort_args)
+    ranks11to20 = _customer_cohort(ranked[10:20], **cohort_args)
+    rest = _customer_cohort(ranked[20:], **cohort_args)
 
     return {
         "items": items,
@@ -1562,6 +1557,7 @@ def customers_page(
         "metadata": analytics_metadata(db),
         "summary": {
             "periodMonths": round(months, 2),
+            "totalRevenue": total_revenue,
             "concentrationTop5Pct": top5["revenueSharePct"],
             "concentrationTop10Pct": top10["revenueSharePct"],
             "concentrationTop20Pct": top20["revenueSharePct"],
@@ -1569,6 +1565,8 @@ def customers_page(
             "top5": top5,
             "top10": top10,
             "top20": top20,
+            "ranks6to10": ranks6to10,
+            "ranks11to20": ranks11to20,
             "rest": rest,
         },
     }
