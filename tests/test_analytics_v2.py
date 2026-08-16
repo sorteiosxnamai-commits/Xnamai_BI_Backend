@@ -559,3 +559,95 @@ def test_paginated_entities_and_advanced_analytics_execute() -> None:
             states=["SP"],
         )
         assert cities["items"] == [{"id": "São Paulo", "label": "São Paulo"}]
+
+
+def test_customers_summary_splits_top_cohorts_and_long_tail() -> None:
+    with make_session() as db:
+        db.add(Seller(mercos_id="s1", name="Vendedor", active=True))
+        db.add(
+            Product(
+                mercos_id="p1",
+                code="P1",
+                name="Produto",
+                list_price=Decimal("100"),
+                stock=Decimal("10"),
+                active=True,
+            )
+        )
+        issued_at = datetime(2026, 8, 1, 15, tzinfo=timezone.utc)
+        rows: list = []
+        item_id = 1
+        for index in range(1, 26):
+            customer_id = f"c{index:02d}"
+            rows.append(
+                Customer(
+                    mercos_id=customer_id,
+                    name=f"Cliente {index:02d}",
+                    city="São Paulo",
+                    state="SP",
+                    active=True,
+                )
+            )
+            if index <= 5:
+                order_count, quantity = 3, Decimal("10")
+            elif index <= 20:
+                order_count, quantity = 1, Decimal("5")
+            else:
+                order_count, quantity = 1, Decimal("1")
+            for order_n in range(order_count):
+                order_id = f"{customer_id}-{order_n}"
+                rows.append(
+                    Order(
+                        mercos_id=order_id,
+                        number=str(item_id),
+                        customer_mercos_id=customer_id,
+                        seller_mercos_id="s1",
+                        status="2",
+                        issued_at=issued_at,
+                        total=quantity * Decimal("100"),
+                        item_count=1,
+                        sku_count=1,
+                    )
+                )
+                rows.append(
+                    OrderItem(
+                        order_mercos_id=order_id,
+                        position=0,
+                        mercos_item_id=str(item_id),
+                        product_mercos_id="p1",
+                        name="Produto",
+                        quantity=quantity,
+                        total=quantity * Decimal("100"),
+                    )
+                )
+                item_id += 1
+        db.add_all(rows)
+        db.commit()
+
+        result = customers_page(
+            db,
+            AnalyticsFilters(
+                dateFrom=date(2026, 7, 17),
+                dateTo=date(2026, 8, 15),
+            ),
+            page=1,
+            page_size=10,
+            search=None,
+            sort="revenue",
+            order="desc",
+        )
+
+        summary = result["summary"]
+        assert summary["periodMonths"] == 1.0
+        assert summary["top5"]["customerCount"] == 5
+        assert summary["top5"]["averageMonthlyOrders"] == 3.0
+        assert summary["top5"]["revenueSharePct"] == 65.22
+        assert summary["top10"]["averageMonthlyOrders"] == 2.0
+        assert summary["top10"]["revenueSharePct"] == 76.09
+        assert summary["top20"]["averageMonthlyOrders"] == 1.5
+        assert summary["top20"]["revenueSharePct"] == 97.83
+        assert summary["rest"]["customerCount"] == 5
+        assert summary["rest"]["averageMonthlyOrders"] == 1.0
+        assert summary["rest"]["revenueSharePct"] == 2.17
+        assert summary["concentrationRestPct"] == 2.17
+        assert summary["concentrationTop20Pct"] == summary["top20"]["revenueSharePct"]

@@ -1284,6 +1284,62 @@ CUSTOMER_SORT_NAMES = {
 }
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _period_months(
+    filters: AnalyticsFilters,
+    *,
+    earliest: datetime | None = None,
+) -> float:
+    start, end = date_bounds(filters)
+    effective_end = _aware(end) or datetime.now(timezone.utc)
+    start = _aware(start) or _aware(earliest)
+    if start is None:
+        return 1.0
+    days = max((effective_end - start).total_seconds() / 86400.0, 1.0)
+    return days / 30.0
+
+
+def _empty_customer_cohort() -> dict[str, Any]:
+    return {
+        "customerCount": 0,
+        "revenue": ZERO,
+        "revenueSharePct": 0.0,
+        "orderSharePct": 0.0,
+        "averageMonthlyOrders": 0.0,
+    }
+
+
+def _customer_cohort(rows, *, total_revenue: Decimal, total_orders: int, months: float):
+    if not rows:
+        return _empty_customer_cohort()
+    revenue = sum((_decimal(row.revenue) for row in rows), ZERO)
+    orders = sum(int(row.order_count or 0) for row in rows)
+    count = len(rows)
+    return {
+        "customerCount": count,
+        "revenue": revenue,
+        "revenueSharePct": round(
+            float((revenue / total_revenue) * 100) if total_revenue else 0.0,
+            2,
+        ),
+        "orderSharePct": round(
+            (orders / total_orders) * 100 if total_orders else 0.0,
+            2,
+        ),
+        "averageMonthlyOrders": round(
+            orders / count / months if months else 0.0,
+            2,
+        ),
+    }
+
+
 def customers_page(
     db: Session,
     filters: AnalyticsFilters,
@@ -1451,26 +1507,48 @@ def customers_page(
                 },
             }
         )
-    ranked_revenues = list(
-        db.scalars(
-            select(aggregate.c.revenue)
-            .where(aggregate.c.revenue.is_not(None))
-            .order_by(aggregate.c.revenue.desc())
+    ranked = db.execute(
+        select(
+            aggregate.c.revenue,
+            aggregate.c.order_count,
+            aggregate.c.first_order_at,
         )
+        .where(func.coalesce(aggregate.c.order_count, 0) > 0)
+        .order_by(aggregate.c.revenue.desc(), aggregate.c.order_count.desc())
+    ).all()
+    total_revenue = sum((_decimal(row.revenue) for row in ranked), ZERO)
+    total_orders = sum(int(row.order_count or 0) for row in ranked)
+    months = _period_months(
+        filters,
+        earliest=min(
+            (row.first_order_at for row in ranked if row.first_order_at),
+            default=None,
+        ),
     )
-    total_revenue = sum((_decimal(value) for value in ranked_revenues), ZERO)
-
-    def concentration(limit: int) -> float:
-        if total_revenue == 0:
-            return 0.0
-        return round(
-            float(
-                (sum((_decimal(value) for value in ranked_revenues[:limit]), ZERO)
-                / total_revenue)
-                * 100
-            ),
-            2,
-        )
+    top5 = _customer_cohort(
+        ranked[:5],
+        total_revenue=total_revenue,
+        total_orders=total_orders,
+        months=months,
+    )
+    top10 = _customer_cohort(
+        ranked[:10],
+        total_revenue=total_revenue,
+        total_orders=total_orders,
+        months=months,
+    )
+    top20 = _customer_cohort(
+        ranked[:20],
+        total_revenue=total_revenue,
+        total_orders=total_orders,
+        months=months,
+    )
+    rest = _customer_cohort(
+        ranked[20:],
+        total_revenue=total_revenue,
+        total_orders=total_orders,
+        months=months,
+    )
 
     return {
         "items": items,
@@ -1483,9 +1561,15 @@ def customers_page(
         "appliedFilters": applied_filters(filters),
         "metadata": analytics_metadata(db),
         "summary": {
-            "concentrationTop5Pct": concentration(5),
-            "concentrationTop10Pct": concentration(10),
-            "concentrationTop20Pct": concentration(20),
+            "periodMonths": round(months, 2),
+            "concentrationTop5Pct": top5["revenueSharePct"],
+            "concentrationTop10Pct": top10["revenueSharePct"],
+            "concentrationTop20Pct": top20["revenueSharePct"],
+            "concentrationRestPct": rest["revenueSharePct"],
+            "top5": top5,
+            "top10": top10,
+            "top20": top20,
+            "rest": rest,
         },
     }
 
