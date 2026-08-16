@@ -21,6 +21,10 @@ def analytics_filters(
     statuses: list[str] | None = Query(None),
     seller_ids: list[str] | None = Query(None, alias="sellerIds"),
     customer_ids: list[str] | None = Query(None, alias="customerIds"),
+    excluded_customer_ids: list[str] | None = Query(
+        None,
+        alias="excludedCustomerIds",
+    ),
     product_ids: list[str] | None = Query(None, alias="productIds"),
     category_ids: list[str] | None = Query(None, alias="categoryIds"),
     states: list[str] | None = Query(None),
@@ -43,6 +47,7 @@ def analytics_filters(
         statuses=statuses or [],
         sellerIds=seller_ids or [],
         customerIds=customer_ids or [],
+        excludedCustomerIds=excluded_customer_ids or [],
         productIds=product_ids or [],
         categoryIds=category_ids or [],
         states=states or [],
@@ -117,6 +122,10 @@ def order_conditions(
         conditions.append(Order.seller_mercos_id.in_(filters.sellerIds))
     if filters.customerIds:
         conditions.append(Order.customer_mercos_id.in_(filters.customerIds))
+    if filters.excludedCustomerIds:
+        conditions.append(
+            Order.customer_mercos_id.notin_(filters.excludedCustomerIds)
+        )
     if filters.orderTypeIds:
         conditions.append(Order.order_type_mercos_id.in_(filters.orderTypeIds))
     if filters.paymentConditionIds:

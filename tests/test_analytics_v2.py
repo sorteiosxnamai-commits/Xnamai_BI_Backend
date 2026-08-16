@@ -680,3 +680,34 @@ def test_customers_summary_splits_top_cohorts_and_long_tail() -> None:
         assert summary["ranks6to10"]["members"][0]["rank"] == 6
         assert len(summary["rest"]["members"]) == 5
         assert summary["rest"]["members"][0]["id"] == "c21"
+
+
+def test_excluded_customers_leave_the_totals_and_the_list() -> None:
+    with make_session() as db:
+        seed_orders(db)
+        included = customers_page(
+            db,
+            AnalyticsFilters(period="all"),
+            page=1,
+            page_size=50,
+            search=None,
+            sort="revenue",
+            order="desc",
+        )
+        excluded = customers_page(
+            db,
+            AnalyticsFilters(period="all", excludedCustomerIds=["c1"]),
+            page=1,
+            page_size=50,
+            search=None,
+            sort="revenue",
+            order="desc",
+        )
+
+        assert "c1" in [item["id"] for item in included["items"]]
+        assert included["summary"]["totalRevenue"] == Decimal("150")
+        assert "c1" not in [item["id"] for item in excluded["items"]]
+        assert excluded["summary"]["totalRevenue"] == Decimal("0")
+        assert excluded["summary"]["top5"]["members"] == []
+        assert excluded["appliedFilters"]["excludedCustomerIds"] == ["c1"]
+

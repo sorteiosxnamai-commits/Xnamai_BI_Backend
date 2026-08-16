@@ -18,6 +18,7 @@ class AnalyticsFilters(BaseModel):
     statuses: list[str] = Field(default_factory=list)
     sellerIds: list[str] = Field(default_factory=list)
     customerIds: list[str] = Field(default_factory=list)
+    excludedCustomerIds: list[str] = Field(default_factory=list)
     productIds: list[str] = Field(default_factory=list)
     categoryIds: list[str] = Field(default_factory=list)
     states: list[str] = Field(default_factory=list)

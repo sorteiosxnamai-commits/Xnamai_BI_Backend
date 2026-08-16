@@ -1453,6 +1453,8 @@ def customers_page(
         )
     if filters.customerIds:
         conditions.append(Customer.mercos_id.in_(filters.customerIds))
+    if filters.excludedCustomerIds:
+        conditions.append(Customer.mercos_id.notin_(filters.excludedCustomerIds))
     if filters.states:
         conditions.append(Customer.state.in_(filters.states))
     if filters.cities:
