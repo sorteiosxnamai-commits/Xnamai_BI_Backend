@@ -205,34 +205,8 @@ def _customer_filters(*, finished_ids: set[str], search: str | None):
     return filters
 
 
-def list_leads(db: Session, *, search: str | None = None, top: int = 20, queue_limit: int = 80) -> dict:
-    attendances = _attendances_by_customer(db)
-    finished_ids = {
-        customer_id for customer_id, row in attendances.items() if row.status == "finished"
-    }
-    sellers = {row.mercos_id: row.name for row in db.scalars(select(Seller))}
-    stats_sq = _order_stats_subquery()
-    filters = _customer_filters(finished_ids=finished_ids, search=search)
-
-    count_stmt = select(func.count(Customer.id))
-    if filters:
-        count_stmt = count_stmt.where(*filters)
-    total_count = int(db.scalar(count_stmt) or 0)
-
-    in_progress = int(
-        db.scalar(
-            select(func.count())
-            .select_from(CrmAttendance)
-            .where(CrmAttendance.status == "in_progress")
-        )
-        or 0
-    )
-
-    top_n = max(1, min(top, 50))
-    queue_n = max(1, min(queue_limit, 200))
-    limit = top_n + queue_n
-
-    stmt = select(
+def _lead_select_stmt(stats_sq):
+    return select(
         Customer,
         stats_sq.c.orders,
         stats_sq.c.revenue,
@@ -240,16 +214,9 @@ def list_leads(db: Session, *, search: str | None = None, top: int = 20, queue_l
         stats_sq.c.first_order_at,
         stats_sq.c.last_seller_id,
     ).outerjoin(stats_sq, Customer.mercos_id == stats_sq.c.customer_mercos_id)
-    if filters:
-        stmt = stmt.where(*filters)
-    rows = db.execute(
-        stmt.order_by(
-            stats_sq.c.revenue.desc().nulls_last(),
-            stats_sq.c.last_order_at.asc().nulls_first(),
-            Customer.name.asc(),
-        ).limit(limit)
-    ).all()
 
+
+def _rows_to_leads(rows, attendances, sellers) -> list[dict]:
     visible = []
     for customer, orders, revenue, last_order_at, first_order_at, last_seller_id in rows:
         stats = None
@@ -275,17 +242,117 @@ def list_leads(db: Session, *, search: str | None = None, top: int = 20, queue_l
                 [],
             )
         )
+    return visible
 
-    last_products = _last_products_map(db, [row["id"] for row in visible[:top_n]], 3)
-    for row in visible:
+
+def list_leads(
+    db: Session,
+    *,
+    search: str | None = None,
+    top: int = 20,
+    queue_page: int = 1,
+    queue_page_size: int = 40,
+    view: str = "main",
+) -> dict:
+    attendances = _attendances_by_customer(db)
+    finished_ids = {
+        customer_id for customer_id, row in attendances.items() if row.status == "finished"
+    }
+    sellers = {row.mercos_id: row.name for row in db.scalars(select(Seller))}
+    stats_sq = _order_stats_subquery()
+    filters = _customer_filters(finished_ids=finished_ids, search=search)
+
+    in_progress = int(
+        db.scalar(
+            select(func.count())
+            .select_from(CrmAttendance)
+            .where(CrmAttendance.status == "in_progress")
+        )
+        or 0
+    )
+
+    page = max(1, queue_page)
+    page_size = max(1, min(queue_page_size, 100))
+    top_n = max(1, min(top, 50))
+
+    def count_with(extra_filters: list | None = None) -> int:
+        stmt = select(func.count(Customer.id)).select_from(Customer).outerjoin(
+            stats_sq, Customer.mercos_id == stats_sq.c.customer_mercos_id
+        )
+        all_filters = [*filters, *(extra_filters or [])]
+        if all_filters:
+            stmt = stmt.where(*all_filters)
+        return int(db.scalar(stmt) or 0)
+
+    new_count = count_with([stats_sq.c.customer_mercos_id.is_(None)])
+
+    if view == "new":
+        view_filters = [*filters, stats_sq.c.customer_mercos_id.is_(None)]
+        total_count = new_count
+        offset = (page - 1) * page_size
+        stmt = _lead_select_stmt(stats_sq).where(*view_filters)
+        rows = db.execute(
+            stmt.order_by(
+                Customer.created_at_source.desc().nulls_last(),
+                Customer.name.asc(),
+            )
+            .offset(offset)
+            .limit(page_size)
+        ).all()
+        visible = _rows_to_leads(rows, attendances, sellers)
+        loaded = offset + len(visible)
+        return {
+            "view": "new",
+            "count": total_count,
+            "newCount": total_count,
+            "topCount": 0,
+            "top": [],
+            "queue": visible,
+            "queuePage": page,
+            "queuePageSize": page_size,
+            "queueTotal": total_count,
+            "hasMore": loaded < total_count,
+            "inProgress": in_progress,
+            "open": max(0, total_count - in_progress),
+        }
+
+    total_count = count_with()
+    stmt = _lead_select_stmt(stats_sq)
+    if filters:
+        stmt = stmt.where(*filters)
+    order = (
+        stats_sq.c.revenue.desc().nulls_last(),
+        stats_sq.c.last_order_at.asc().nulls_first(),
+        Customer.name.asc(),
+    )
+
+    top_rows = db.execute(stmt.order_by(*order).limit(top_n)).all()
+    queue_offset = top_n + (page - 1) * page_size
+    queue_rows = db.execute(
+        stmt.order_by(*order).offset(queue_offset).limit(page_size)
+    ).all()
+
+    visible_top = _rows_to_leads(top_rows, attendances, sellers)
+    visible_queue = _rows_to_leads(queue_rows, attendances, sellers)
+
+    last_products = _last_products_map(db, [row["id"] for row in visible_top], 3)
+    for row in visible_top:
         row["lastProducts"] = last_products.get(row["id"], [])
 
+    queue_total = max(0, total_count - top_n)
+    loaded_queue = (page - 1) * page_size + len(visible_queue)
+
     return {
+        "view": "main",
         "count": total_count,
-        "topCount": min(top_n, len(visible)),
-        "top": visible[:top_n],
-        "queue": visible[top_n:],
-        "hidden": max(0, total_count - len(visible)),
+        "newCount": new_count,
+        "topCount": len(visible_top),
+        "top": visible_top,
+        "queue": visible_queue,
+        "queuePage": page,
+        "queuePageSize": page_size,
+        "queueTotal": queue_total,
+        "hasMore": loaded_queue < queue_total,
         "inProgress": in_progress,
         "open": max(0, total_count - in_progress),
     }

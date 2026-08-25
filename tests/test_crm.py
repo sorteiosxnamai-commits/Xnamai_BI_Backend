@@ -117,6 +117,23 @@ def test_crm_queue_hides_finished_leads_and_exposes_top_20():
             assert body["top"][0]["id"] == "c-top"
             assert body["queue"][0]["id"] in {"c-queue", "c-done"}
             assert body["top"][0]["lastProducts"][0]["name"] == "Fone X"
+            assert body["hasMore"] is False
+            assert body["queueTotal"] == 2
+
+            page2 = client.get("/api/v1/crm/leads?top=1&queuePage=2&queuePageSize=1")
+            assert page2.status_code == 200
+            page2_body = page2.json()
+            assert len(page2_body["queue"]) == 1
+
+            session.add(Customer(mercos_id="c-new", name="Lead Novo", city="Curitiba", state="PR", active=True))
+            session.commit()
+            new_view = client.get("/api/v1/crm/leads?view=new")
+            assert new_view.status_code == 200
+            new_body = new_view.json()
+            assert new_body["view"] == "new"
+            assert new_body["count"] == 1
+            assert new_body["queue"][0]["id"] == "c-new"
+            assert new_body["queue"][0]["orders"] == 0
 
             detail = client.get("/api/v1/crm/leads/c-top")
             assert detail.status_code == 200
@@ -138,7 +155,7 @@ def test_crm_queue_hides_finished_leads_and_exposes_top_20():
             dash = client.get("/api/v1/crm/dashboard")
             assert dash.status_code == 200
             assert dash.json()["kpis"]["finishedToday"] == 1
-            assert dash.json()["kpis"]["openLeads"] == 2
+            assert dash.json()["kpis"]["openLeads"] == 3
     finally:
         app.dependency_overrides.clear()
         session.close()

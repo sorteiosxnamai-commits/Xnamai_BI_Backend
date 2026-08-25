@@ -17,10 +17,19 @@ class ClaimRequest(BaseModel):
 def get_leads(
     search: str | None = Query(default=None, max_length=200),
     top: int = Query(default=20, ge=1, le=50),
-    queueLimit: int = Query(default=40, ge=1, le=200),
+    view: str = Query(default="main", pattern="^(main|new)$"),
+    queuePage: int = Query(default=1, ge=1),
+    queuePageSize: int = Query(default=40, ge=1, le=100),
     db: Session = Depends(db_session),
 ):
-    return list_leads(db, search=search, top=top, queue_limit=queueLimit)
+    return list_leads(
+        db,
+        search=search,
+        top=top,
+        queue_page=queuePage,
+        queue_page_size=queuePageSize,
+        view=view,
+    )
 
 
 @router.get("/leads/{customer_id}")
