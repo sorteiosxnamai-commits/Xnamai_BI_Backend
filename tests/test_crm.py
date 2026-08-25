@@ -52,6 +52,56 @@ def test_current_user_requires_token_or_api_key(monkeypatch):
     assert service.username == "service"
 
 
+def test_crm_revenue_keeps_lifetime_totals_above_order_cap():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    session.add_all(
+        [
+            Customer(mercos_id="c-big", name="Cliente Grande", city="SP", state="SP", active=True),
+            Order(
+                mercos_id="o-big-1",
+                number="900",
+                customer_mercos_id="c-big",
+                status="2",
+                issued_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                total=Decimal("300000"),
+                net_total=Decimal("300000"),
+            ),
+            Order(
+                mercos_id="o-big-2",
+                number="901",
+                customer_mercos_id="c-big",
+                status="2",
+                issued_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                total=Decimal("300000"),
+                net_total=Decimal("300000"),
+            ),
+        ]
+    )
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[db_session] = override_db
+    try:
+        with TestClient(app) as client:
+            listed = client.get("/api/v1/crm/leads?top=1")
+            assert listed.status_code == 200
+            body = listed.json()
+            assert body["top"][0]["id"] == "c-big"
+            assert body["top"][0]["revenue"] == 600000.0
+            assert body["top"][0]["ticketAverage"] == 300000.0
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
 def test_crm_queue_hides_finished_leads_and_exposes_top_20():
     engine = create_engine(
         "sqlite://",

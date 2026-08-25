@@ -5,17 +5,28 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.analytics import MAX_ORDER_TOTAL, REVENUE_STATUSES, classify_customer, _aware, _now
+from app.domain.order_status import status_sql_in
 from app.models import CrmAttendance, Customer, Order, OrderItem, Product, Seller
 
 
-def _money(value) -> float:
+def _money(value, *, cap: bool = True) -> float:
     try:
         amount = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
-    if amount < 0 or amount > float(MAX_ORDER_TOTAL):
+    if amount < 0:
+        return 0.0
+    if cap and amount > float(MAX_ORDER_TOTAL):
         return 0.0
     return round(amount, 2)
+
+
+def _money_total(value) -> float:
+    return _money(value, cap=False)
+
+
+def _order_amount():
+    return func.coalesce(Order.net_total, Order.total, Order.gross_total, 0)
 
 
 def _iso(value):
@@ -67,21 +78,22 @@ def _attendances_by_customer(db: Session) -> dict[str, CrmAttendance]:
 
 
 def _order_stats(db: Session):
+    amount = _order_amount()
     rows = db.execute(
         select(
             Order.customer_mercos_id.label("customer_mercos_id"),
             func.count(Order.id).label("orders"),
-            func.coalesce(func.sum(Order.total), 0).label("revenue"),
+            func.coalesce(func.sum(amount), 0).label("revenue"),
             func.max(Order.issued_at).label("last_order_at"),
             func.min(Order.issued_at).label("first_order_at"),
             func.max(Order.seller_mercos_id).label("last_seller_id"),
         )
         .where(
-            func.lower(Order.status).in_(REVENUE_STATUSES),
+            status_sql_in(Order.status, REVENUE_STATUSES),
             Order.customer_mercos_id.is_not(None),
             Order.customer_mercos_id != "",
-            Order.total > 0,
-            Order.total < MAX_ORDER_TOTAL,
+            amount > 0,
+            amount < MAX_ORDER_TOTAL,
         )
         .group_by(Order.customer_mercos_id)
     ).all()
@@ -107,7 +119,7 @@ def _last_products_map(db: Session, customer_ids: list[str], limit_each: int = 3
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
         .where(
             Order.customer_mercos_id.in_(customer_ids),
-            func.lower(Order.status).in_(REVENUE_STATUSES),
+            status_sql_in(Order.status, REVENUE_STATUSES),
             OrderItem.excluded.is_(False),
         )
         .subquery("crm_last_products")
@@ -136,7 +148,7 @@ def _lead_summary(customer: Customer, stats, attendance: CrmAttendance | None, s
     last = _aware(stats.last_order_at) if stats else None
     first = _aware(stats.first_order_at) if stats else None
     orders = int(stats.orders) if stats else 0
-    revenue = _money(stats.revenue) if stats else 0.0
+    revenue = _money_total(stats.revenue) if stats else 0.0
     segment = classify_customer(stats, inactive_days=90, risk_days=90, now=now)
     status = attendance.status if attendance else "open"
     seller_id = stats.last_seller_id if stats else None
@@ -164,21 +176,22 @@ def _lead_summary(customer: Customer, stats, attendance: CrmAttendance | None, s
 
 
 def _order_stats_subquery():
+    amount = _order_amount()
     return (
         select(
             Order.customer_mercos_id.label("customer_mercos_id"),
             func.count(Order.id).label("orders"),
-            func.coalesce(func.sum(Order.total), 0).label("revenue"),
+            func.coalesce(func.sum(amount), 0).label("revenue"),
             func.max(Order.issued_at).label("last_order_at"),
             func.min(Order.issued_at).label("first_order_at"),
             func.max(Order.seller_mercos_id).label("last_seller_id"),
         )
         .where(
-            func.lower(Order.status).in_(REVENUE_STATUSES),
+            status_sql_in(Order.status, REVENUE_STATUSES),
             Order.customer_mercos_id.is_not(None),
             Order.customer_mercos_id != "",
-            Order.total > 0,
-            Order.total < MAX_ORDER_TOTAL,
+            amount > 0,
+            amount < MAX_ORDER_TOTAL,
         )
         .group_by(Order.customer_mercos_id)
         .subquery("crm_order_stats")
@@ -538,7 +551,10 @@ def crm_dashboard(db: Session, *, days: int = 30) -> dict:
     open_count = sum(1 for row in customer_rows if row.mercos_id not in finished_ids)
 
     def revenue_for(ids: set[str]) -> float:
-        return round(sum(_money(stats_map.get(customer_id).revenue) for customer_id in ids if stats_map.get(customer_id)), 2)
+        return round(
+            sum(_money_total(stats_map.get(customer_id).revenue) for customer_id in ids if stats_map.get(customer_id)),
+            2,
+        )
 
     finished_today = [row for row in finished if row.finished_at and _aware(row.finished_at) >= today]
     finished_month = [row for row in finished if row.finished_at and _aware(row.finished_at) >= month]
@@ -558,7 +574,7 @@ def crm_dashboard(db: Session, *, days: int = 30) -> dict:
         bucket = daily.setdefault(key, {"date": key, "attendances": 0, "revenue": 0.0})
         bucket["attendances"] += 1
         stats = stats_map.get(row.customer_mercos_id)
-        bucket["revenue"] = round(bucket["revenue"] + (_money(stats.revenue) if stats else 0), 2)
+        bucket["revenue"] = round(bucket["revenue"] + (_money_total(stats.revenue) if stats else 0), 2)
 
     recent = sorted(finished, key=lambda row: row.finished_at or row.updated_at, reverse=True)[:12]
     names = {row.mercos_id: row.name for row in customer_rows}
@@ -582,7 +598,9 @@ def crm_dashboard(db: Session, *, days: int = 30) -> dict:
                 "name": names.get(row.customer_mercos_id) or row.customer_mercos_id,
                 "sellerName": row.seller_name,
                 "finishedAt": _iso(row.finished_at),
-                "revenue": _money(stats_map[row.customer_mercos_id].revenue) if stats_map.get(row.customer_mercos_id) else 0,
+                "revenue": _money_total(stats_map[row.customer_mercos_id].revenue)
+                if stats_map.get(row.customer_mercos_id)
+                else 0,
             }
             for row in recent
         ],
@@ -597,5 +615,5 @@ def _seller_breakdown(finished: list[CrmAttendance], stats_map) -> list[dict]:
         bucket = grouped.setdefault(name, {"sellerName": name, "attendances": 0, "revenue": 0.0})
         bucket["attendances"] += 1
         stats = stats_map.get(row.customer_mercos_id)
-        bucket["revenue"] = round(bucket["revenue"] + (_money(stats.revenue) if stats else 0), 2)
+        bucket["revenue"] = round(bucket["revenue"] + (_money_total(stats.revenue) if stats else 0), 2)
     return sorted(grouped.values(), key=lambda row: (-row["attendances"], -row["revenue"]))
