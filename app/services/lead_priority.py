@@ -74,13 +74,16 @@ def _heuristic_score_expr(db: Session, stats_sq):
     days = _days_since_last_order(db, stats_sq.c.last_order_at)
     revenue = cast(func.coalesce(stats_sq.c.revenue, 0), Float)
     orders = cast(func.coalesce(stats_sq.c.orders, 0), Float)
+    dialect = db.get_bind().dialect.name
+    scalar_max = func.greatest if dialect == "postgresql" else func.max
+    scalar_min = func.least if dialect == "postgresql" else func.min
     recency = case(
         (days < 7, 0.15),
         (days < 30, 0.35 + ((days - 7) / 23.0) * 0.35),
         (days <= 180, 0.7 + ((days - 30) / 150.0) * 0.3),
-        else_=func.max(0.35, 180.0 / days),
+        else_=scalar_max(0.35, 180.0 / days),
     )
-    frequency = func.min(func.sqrt(orders), 8.0)
+    frequency = scalar_min(func.sqrt(orders), 8.0)
     return func.ln(revenue + 1) * recency * frequency
 
 
