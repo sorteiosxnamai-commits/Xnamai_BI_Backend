@@ -632,12 +632,15 @@ def _upsert_attendance(db: Session, customer_id: str) -> CrmAttendance:
 
 
 def claim_lead(db: Session, customer_id: str, seller_name: str | None) -> dict:
+    seller = (seller_name or "").strip()
+    if not seller:
+        raise HTTPException(422, "Informe o nome do vendedor para iniciar o atendimento")
     row = _upsert_attendance(db, customer_id)
     if row.status == "finished":
         raise HTTPException(409, "Este lead ja foi finalizado")
     now = datetime.now(timezone.utc)
     row.status = "in_progress"
-    row.seller_name = (seller_name or row.seller_name or "").strip() or None
+    row.seller_name = seller
     row.claimed_at = row.claimed_at or now
     row.updated_at = now
     db.add(row)
@@ -645,7 +648,29 @@ def claim_lead(db: Session, customer_id: str, seller_name: str | None) -> dict:
     return lead_detail(db, customer_id)
 
 
-def finish_lead(db: Session, customer_id: str, seller_name: str | None, notes: str | None) -> dict:
+def finish_lead(
+    db: Session,
+    customer_id: str,
+    seller_name: str | None,
+    notes: str | None,
+    *,
+    outcome: str,
+    sale_value: float | None = None,
+    order_number: str | None = None,
+) -> dict:
+    normalized_outcome = (outcome or "").strip().lower()
+    if normalized_outcome not in {"won", "lost", "discarded"}:
+        raise HTTPException(422, "Resultado invalido")
+    cleaned_notes = (notes or "").strip() or None
+    if normalized_outcome == "discarded" and not cleaned_notes:
+        raise HTTPException(422, "Informe o motivo do descarte na observacao")
+    if normalized_outcome == "won":
+        try:
+            value = float(sale_value or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value <= 0:
+            raise HTTPException(422, "Informe o valor da venda")
     row = _upsert_attendance(db, customer_id)
     if row.status == "finished":
         raise HTTPException(409, "Este lead ja foi finalizado")
@@ -654,13 +679,32 @@ def finish_lead(db: Session, customer_id: str, seller_name: str | None, notes: s
     row.seller_name = (seller_name or row.seller_name or "").strip() or None
     row.finished_at = now
     row.updated_at = now
-    if notes:
-        row.notes = notes.strip()
+    row.outcome = normalized_outcome
+    row.notes = cleaned_notes
+    if normalized_outcome == "won":
+        row.sale_value = round(float(sale_value or 0), 2)
+        row.order_number = (order_number or "").strip() or None
+    else:
+        row.sale_value = None
+        row.order_number = None
     if not row.claimed_at:
         row.claimed_at = now
     db.add(row)
     db.commit()
-    return {"id": customer_id, "status": "finished", "finishedAt": _iso(now)}
+    return {
+        "id": customer_id,
+        "status": "finished",
+        "outcome": normalized_outcome,
+        "saleValue": _money_total(row.sale_value) if row.sale_value is not None else None,
+        "orderNumber": row.order_number,
+        "finishedAt": _iso(now),
+    }
+
+
+def _attendance_sale_value(row: CrmAttendance) -> float:
+    if row.outcome == "won" and row.sale_value is not None:
+        return _money_total(row.sale_value)
+    return 0.0
 
 
 def crm_dashboard(db: Session, *, days: int = 30) -> dict:
@@ -697,10 +741,15 @@ def crm_dashboard(db: Session, *, days: int = 30) -> dict:
         if not finished_at:
             continue
         key = finished_at.date().isoformat()
-        bucket = daily.setdefault(key, {"date": key, "attendances": 0, "revenue": 0.0})
+        bucket = daily.setdefault(key, {"date": key, "attendances": 0, "revenue": 0.0, "sales": 0})
         bucket["attendances"] += 1
-        stats = stats_map.get(row.customer_mercos_id)
-        bucket["revenue"] = round(bucket["revenue"] + (_money_total(stats.revenue) if stats else 0), 2)
+        sale = _attendance_sale_value(row)
+        bucket["revenue"] = round(bucket["revenue"] + sale, 2)
+        if row.outcome == "won":
+            bucket["sales"] += 1
+
+    won_period = [row for row in finished_period if row.outcome == "won"]
+    sales_value_period = round(sum(_attendance_sale_value(row) for row in won_period), 2)
 
     recent = sorted(finished, key=lambda row: row.finished_at or row.updated_at, reverse=True)[:12]
     names = {row.mercos_id: row.name for row in customer_rows}
@@ -712,6 +761,8 @@ def crm_dashboard(db: Session, *, days: int = 30) -> dict:
             "finishedToday": len(finished_today),
             "finishedMonth": len(finished_month),
             "finishedPeriod": len(finished_period),
+            "salesWonPeriod": len(won_period),
+            "salesValuePeriod": sales_value_period,
             "billingOpen": revenue_for({row.mercos_id for row in customer_rows if row.mercos_id not in finished_ids}),
             "billingFinished": revenue_for({row.customer_mercos_id for row in finished}),
             "billingFinishedPeriod": revenue_for({row.customer_mercos_id for row in finished_period}),
@@ -724,22 +775,30 @@ def crm_dashboard(db: Session, *, days: int = 30) -> dict:
                 "name": names.get(row.customer_mercos_id) or row.customer_mercos_id,
                 "sellerName": row.seller_name,
                 "finishedAt": _iso(row.finished_at),
+                "outcome": row.outcome,
+                "saleValue": _attendance_sale_value(row) or None,
+                "orderNumber": row.order_number,
                 "revenue": _money_total(stats_map[row.customer_mercos_id].revenue)
                 if stats_map.get(row.customer_mercos_id)
                 else 0,
             }
             for row in recent
         ],
-        "sellers": _seller_breakdown(finished_period, stats_map),
+        "sellers": _seller_breakdown(finished_period),
     }
 
 
-def _seller_breakdown(finished: list[CrmAttendance], stats_map) -> list[dict]:
+def _seller_breakdown(finished: list[CrmAttendance]) -> list[dict]:
     grouped: dict[str, dict] = {}
     for row in finished:
         name = row.seller_name or "Sem vendedor"
-        bucket = grouped.setdefault(name, {"sellerName": name, "attendances": 0, "revenue": 0.0})
+        bucket = grouped.setdefault(
+            name,
+            {"sellerName": name, "attendances": 0, "revenue": 0.0, "salesWon": 0},
+        )
         bucket["attendances"] += 1
-        stats = stats_map.get(row.customer_mercos_id)
-        bucket["revenue"] = round(bucket["revenue"] + (_money_total(stats.revenue) if stats else 0), 2)
-    return sorted(grouped.values(), key=lambda row: (-row["attendances"], -row["revenue"]))
+        sale = _attendance_sale_value(row)
+        bucket["revenue"] = round(bucket["revenue"] + sale, 2)
+        if row.outcome == "won":
+            bucket["salesWon"] += 1
+    return sorted(grouped.values(), key=lambda row: (-row["revenue"], -row["attendances"]))

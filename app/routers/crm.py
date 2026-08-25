@@ -10,8 +10,15 @@ router = APIRouter(prefix="/api/v1/crm", tags=["crm"])
 
 
 class ClaimRequest(BaseModel):
+    sellerName: str = Field(min_length=1, max_length=200)
+
+
+class FinishRequest(BaseModel):
     sellerName: str | None = Field(default=None, max_length=200)
     notes: str | None = Field(default=None, max_length=2000)
+    outcome: str = Field(pattern="^(won|lost|discarded)$")
+    saleValue: float | None = Field(default=None, ge=0)
+    orderNumber: str | None = Field(default=None, max_length=80)
 
 
 @router.get("/leads")
@@ -50,15 +57,21 @@ def get_lead_analysis(
 
 
 @router.post("/leads/{customer_id}/claim")
-def post_claim(customer_id: str, payload: ClaimRequest | None = None, db: Session = Depends(db_session)):
-    body = payload or ClaimRequest()
-    return claim_lead(db, customer_id, body.sellerName)
+def post_claim(customer_id: str, payload: ClaimRequest, db: Session = Depends(db_session)):
+    return claim_lead(db, customer_id, payload.sellerName)
 
 
 @router.post("/leads/{customer_id}/finish")
-def post_finish(customer_id: str, payload: ClaimRequest | None = None, db: Session = Depends(db_session)):
-    body = payload or ClaimRequest()
-    return finish_lead(db, customer_id, body.sellerName, body.notes)
+def post_finish(customer_id: str, payload: FinishRequest, db: Session = Depends(db_session)):
+    return finish_lead(
+        db,
+        customer_id,
+        seller_name=payload.sellerName,
+        notes=payload.notes,
+        outcome=payload.outcome,
+        sale_value=payload.saleValue,
+        order_number=payload.orderNumber,
+    )
 
 
 @router.get("/dashboard")

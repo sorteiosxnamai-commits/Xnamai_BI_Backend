@@ -268,7 +268,7 @@ def test_crm_queue_hides_finished_leads_and_exposes_top_20():
             assert claimed.status_code == 200
             assert claimed.json()["attendanceStatus"] == "in_progress"
 
-            finished = client.post("/api/v1/crm/leads/c-top/finish", json={"sellerName": "Ana"})
+            finished = client.post("/api/v1/crm/leads/c-top/finish", json={"sellerName": "Ana", "outcome": "won", "saleValue": 1500, "orderNumber": "999"})
             assert finished.status_code == 200
             after = client.get("/api/v1/crm/leads")
             ids = [row["id"] for row in after.json()["top"] + after.json()["queue"]]
