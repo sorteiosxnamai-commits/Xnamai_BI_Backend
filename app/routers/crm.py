@@ -17,7 +17,7 @@ class ClaimRequest(BaseModel):
 def get_leads(
     search: str | None = Query(default=None, max_length=200),
     top: int = Query(default=20, ge=1, le=50),
-    queueLimit: int = Query(default=80, ge=1, le=200),
+    queueLimit: int = Query(default=40, ge=1, le=200),
     db: Session = Depends(db_session),
 ):
     return list_leads(db, search=search, top=top, queue_limit=queueLimit)

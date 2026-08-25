@@ -91,7 +91,7 @@ def _order_stats(db: Session):
 def _last_products_map(db: Session, customer_ids: list[str], limit_each: int = 3) -> dict[str, list[dict]]:
     if not customer_ids:
         return {}
-    rows = db.execute(
+    ranked = (
         select(
             Order.customer_mercos_id,
             OrderItem.name,
@@ -100,6 +100,9 @@ def _last_products_map(db: Session, customer_ids: list[str], limit_each: int = 3
             OrderItem.total,
             Order.issued_at,
             Order.number,
+            func.row_number()
+            .over(partition_by=Order.customer_mercos_id, order_by=Order.issued_at.desc())
+            .label("rn"),
         )
         .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
         .where(
@@ -107,13 +110,14 @@ def _last_products_map(db: Session, customer_ids: list[str], limit_each: int = 3
             func.lower(Order.status).in_(REVENUE_STATUSES),
             OrderItem.excluded.is_(False),
         )
-        .order_by(Order.issued_at.desc())
+        .subquery("crm_last_products")
+    )
+    rows = db.execute(
+        select(ranked).where(ranked.c.rn <= limit_each).order_by(ranked.c.customer_mercos_id, ranked.c.rn)
     ).all()
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         bucket = grouped.setdefault(row.customer_mercos_id, [])
-        if len(bucket) >= limit_each:
-            continue
         bucket.append(
             {
                 "name": row.name or row.code or "Produto",
@@ -272,7 +276,7 @@ def list_leads(db: Session, *, search: str | None = None, top: int = 20, queue_l
             )
         )
 
-    last_products = _last_products_map(db, [row["id"] for row in visible], 3)
+    last_products = _last_products_map(db, [row["id"] for row in visible[:top_n]], 3)
     for row in visible:
         row["lastProducts"] = last_products.get(row["id"], [])
 
