@@ -120,9 +120,9 @@ def test_analytics_http_contracts_cover_pages_charts_and_drilldowns(http_client)
         assert entity_key in response.json()
 
 
-def test_analytics_allows_direct_access_without_credentials(http_client):
+def test_analytics_requires_credentials(http_client):
     app.dependency_overrides.pop(current_user)
 
     response = http_client.get("/api/v1/analytics/overview?period=all")
 
-    assert response.status_code == 200
+    assert response.status_code == 401

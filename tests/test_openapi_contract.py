@@ -30,6 +30,11 @@ def test_required_bi_contract_is_published():
         "/api/v1/auth/refresh",
         "/api/v1/auth/logout",
         "/api/v1/auth/me",
+        "/api/v1/crm/leads",
+        "/api/v1/crm/leads/{customer_id}",
+        "/api/v1/crm/leads/{customer_id}/claim",
+        "/api/v1/crm/leads/{customer_id}/finish",
+        "/api/v1/crm/dashboard",
     }
     assert required <= set(paths)
 

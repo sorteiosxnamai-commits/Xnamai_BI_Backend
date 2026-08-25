@@ -10,8 +10,8 @@ from app.config import Settings
 def auth_settings(monkeypatch):
     config = Settings(
         jwt_secret="test-secret-with-enough-entropy",
-        auth_admin_username="admin",
-        auth_admin_password="admin-pass",
+        auth_admin_username="admin@xnamai.com",
+        auth_admin_password="123456",
         auth_viewer_username="viewer",
         auth_viewer_password="viewer-pass",
         auth_cookie_secure=False,
@@ -23,7 +23,7 @@ def auth_settings(monkeypatch):
 
 def test_login_issues_access_and_http_only_refresh(auth_settings):
     user = auth.authenticate(
-        auth.LoginRequest(username="admin", password="admin-pass")
+        auth.LoginRequest(username="admin@xnamai.com", password="123456")
     )
     response = Response()
 
@@ -43,30 +43,19 @@ def test_viewer_cannot_use_admin_dependency(auth_settings):
     assert error.value.status_code == 403
 
 
-def test_direct_access_ignores_credentials_and_tokens(auth_settings):
-    user = auth.current_user(
-        credentials=None,
-        x_api_key="service-key",
-    )
-    assert user.username == "public-admin"
+def test_api_key_grants_service_admin(auth_settings):
+    user = auth.current_user(credentials=None, x_api_key="service-key")
+    assert user.username == "service"
     assert user.role == "admin"
 
-    token = auth._token(
-        auth.AuthUser(username="viewer", role="viewer"),
-        "access",
-        auth.timedelta(minutes=5),
-    )
-    direct_user = auth.current_user(
-        credentials=HTTPAuthorizationCredentials(
-            scheme="Bearer",
-            credentials=token,
-        ),
-        x_api_key=None,
-    )
-    assert direct_user == user
+
+def test_missing_credentials_are_rejected(auth_settings):
+    with pytest.raises(HTTPException) as error:
+        auth.current_user(credentials=None, x_api_key=None)
+    assert error.value.status_code == 401
 
 
-def test_refresh_without_cookie_grants_direct_admin_access(auth_settings):
-    refreshed = auth.refresh_user(bi_refresh=None)
-
-    assert refreshed == auth.AuthUser(username="public-admin", role="admin")
+def test_refresh_without_cookie_is_rejected(auth_settings):
+    with pytest.raises(HTTPException) as error:
+        auth.refresh_user(bi_refresh=None)
+    assert error.value.status_code == 401

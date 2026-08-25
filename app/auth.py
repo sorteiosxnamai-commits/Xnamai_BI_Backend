@@ -35,8 +35,16 @@ class AuthResponse(BaseModel):
     user: AuthUser
 
 
+def _digest_equal(left: str, right: str) -> bool:
+    if len(left) != len(right):
+        return False
+    return secrets.compare_digest(left, right)
+
+
 def _credentials(username: str, password: str) -> AuthUser | None:
     config = settings()
+    given_user = (username or "").strip().casefold()
+    given_password = password or ""
     candidates = (
         (
             config.auth_admin_username,
@@ -50,10 +58,10 @@ def _credentials(username: str, password: str) -> AuthUser | None:
         ),
     )
     for expected_user, expected_password, role in candidates:
-        if (
-            expected_password
-            and secrets.compare_digest(username, expected_user)
-            and secrets.compare_digest(password, expected_password)
+        if not expected_password:
+            continue
+        if _digest_equal(given_user, expected_user.strip().casefold()) and _digest_equal(
+            given_password, expected_password
         ):
             return AuthUser(username=expected_user, role=role)
     return None
@@ -145,8 +153,12 @@ def current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     x_api_key: str | None = Header(None),
 ) -> AuthUser:
-    del credentials, x_api_key
-    return AuthUser(username="public-admin", role="admin")
+    expected_key = settings().bi_api_key
+    if x_api_key and expected_key and _digest_equal(x_api_key, expected_key):
+        return AuthUser(username="service", role="admin")
+    if credentials and credentials.credentials:
+        return decode_token(credentials.credentials, "access")
+    raise HTTPException(401, "Não autenticado")
 
 
 def require_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
@@ -156,8 +168,9 @@ def require_admin(user: AuthUser = Depends(current_user)) -> AuthUser:
 
 
 def refresh_user(bi_refresh: str | None = Cookie(None)) -> AuthUser:
-    del bi_refresh
-    return AuthUser(username="public-admin", role="admin")
+    if not bi_refresh:
+        raise HTTPException(401, "Sessão expirada")
+    return decode_token(bi_refresh, "refresh")
 
 
 def clear_refresh_cookie(response: Response) -> None:

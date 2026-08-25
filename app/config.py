@@ -53,8 +53,8 @@ class Settings(BaseSettings):
     mercos_adaptor_api_key: str = ""
     bi_api_key: str = "change-me"
     jwt_secret: str = "change-me-in-production"
-    auth_admin_username: str = "admin"
-    auth_admin_password: str = ""
+    auth_admin_username: str = "admin@xnamai.com"
+    auth_admin_password: str = "123456"
     auth_viewer_username: str = "viewer"
     auth_viewer_password: str = ""
     auth_access_minutes: int = 15

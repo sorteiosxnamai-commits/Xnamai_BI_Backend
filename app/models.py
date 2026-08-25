@@ -254,6 +254,23 @@ class SyncRun(Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class CrmAttendance(Base):
+    __tablename__ = "crm_attendances"
+    __table_args__ = (
+        UniqueConstraint("customer_mercos_id", name="uq_crm_attendances_customer"),
+        Index("ix_crm_attendances_status_finished", "status", "finished_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_mercos_id: Mapped[str] = mapped_column(String(80), index=True)
+    seller_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(30), default="open", index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ExportRun(Base):
     __tablename__ = "export_runs"
     __table_args__ = (Index("ix_export_runs_started_at", "started_at"),)
