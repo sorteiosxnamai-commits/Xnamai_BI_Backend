@@ -25,7 +25,7 @@ services:
       - key: AUTH_COOKIE_SECURE
         value: "true"
       - key: CORS_ORIGINS
-        sync: false
+        value: "http://localhost:5173,https://xnamai-bi-frontend.vercel.app"
       - key: SYNC_ORDERS_MINUTES
         value: "10"
       - key: SYNC_CATALOG_HOURS

@@ -142,9 +142,11 @@ async def lifespan(app):
 
 app = FastAPI(title="Xnamai BI API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(ApiRateLimitMiddleware, requests_per_minute=300)
+_cors = settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings().origins,
+    allow_origins=_cors.origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],

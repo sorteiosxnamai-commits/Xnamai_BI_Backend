@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session
 
 from app.analytics import MAX_ORDER_TOTAL, REVENUE_STATUSES, classify_customer, _aware, _now
 from app.models import CrmAttendance, Customer, Order, OrderItem, Product, Seller
@@ -159,80 +159,131 @@ def _lead_summary(customer: Customer, stats, attendance: CrmAttendance | None, s
     }
 
 
+def _order_stats_subquery():
+    return (
+        select(
+            Order.customer_mercos_id.label("customer_mercos_id"),
+            func.count(Order.id).label("orders"),
+            func.coalesce(func.sum(Order.total), 0).label("revenue"),
+            func.max(Order.issued_at).label("last_order_at"),
+            func.min(Order.issued_at).label("first_order_at"),
+            func.max(Order.seller_mercos_id).label("last_seller_id"),
+        )
+        .where(
+            func.lower(Order.status).in_(REVENUE_STATUSES),
+            Order.customer_mercos_id.is_not(None),
+            Order.customer_mercos_id != "",
+            Order.total > 0,
+            Order.total < MAX_ORDER_TOTAL,
+        )
+        .group_by(Order.customer_mercos_id)
+        .subquery("crm_order_stats")
+    )
+
+
+def _customer_filters(*, finished_ids: set[str], search: str | None):
+    filters = []
+    if finished_ids:
+        filters.append(Customer.mercos_id.notin_(finished_ids))
+    needle = (search or "").strip()
+    if needle:
+        pattern = f"%{needle}%"
+        filters.append(
+            or_(
+                Customer.name.ilike(pattern),
+                Customer.city.ilike(pattern),
+                Customer.state.ilike(pattern),
+                Customer.email.ilike(pattern),
+                Customer.phone.ilike(pattern),
+                Customer.document.ilike(pattern),
+            )
+        )
+    return filters
+
+
 def list_leads(db: Session, *, search: str | None = None, top: int = 20, queue_limit: int = 80) -> dict:
     attendances = _attendances_by_customer(db)
     finished_ids = {
         customer_id for customer_id, row in attendances.items() if row.status == "finished"
     }
-    stats_map = _order_stats(db)
     sellers = {row.mercos_id: row.name for row in db.scalars(select(Seller))}
-    customers = [
-        customer
-        for customer in db.scalars(
-            select(Customer).options(
-                load_only(
-                    Customer.mercos_id,
-                    Customer.name,
-                    Customer.city,
-                    Customer.state,
-                    Customer.email,
-                    Customer.phone,
-                    Customer.document,
-                )
-            )
+    stats_sq = _order_stats_subquery()
+    filters = _customer_filters(finished_ids=finished_ids, search=search)
+
+    count_stmt = select(func.count(Customer.id))
+    if filters:
+        count_stmt = count_stmt.where(*filters)
+    total_count = int(db.scalar(count_stmt) or 0)
+
+    in_progress = int(
+        db.scalar(
+            select(func.count())
+            .select_from(CrmAttendance)
+            .where(CrmAttendance.status == "in_progress")
         )
-        if customer.mercos_id not in finished_ids
-    ]
-    needle = (search or "").strip().casefold()
-    if needle:
-        customers = [
-            customer
-            for customer in customers
-            if needle in " ".join(
-                filter(
-                    None,
-                    [
-                        customer.name,
-                        customer.city,
-                        customer.state,
-                        customer.email,
-                        customer.phone,
-                        customer.document,
-                    ],
-                )
-            ).casefold()
-        ]
-    leads = [
-        _lead_summary(
-            customer,
-            stats_map.get(customer.mercos_id),
-            attendances.get(customer.mercos_id),
-            sellers,
-            [],
-        )
-        for customer in customers
-    ]
-    leads.sort(
-        key=lambda row: (
-            -(row.get("revenue") or 0),
-            row.get("daysSinceLastOrder") if row.get("daysSinceLastOrder") is not None else 10**9,
-            (row.get("name") or "").lower(),
-        )
+        or 0
     )
+
     top_n = max(1, min(top, 50))
     queue_n = max(1, min(queue_limit, 200))
-    visible = leads[: top_n + queue_n]
+    limit = top_n + queue_n
+
+    stmt = select(
+        Customer,
+        stats_sq.c.orders,
+        stats_sq.c.revenue,
+        stats_sq.c.last_order_at,
+        stats_sq.c.first_order_at,
+        stats_sq.c.last_seller_id,
+    ).outerjoin(stats_sq, Customer.mercos_id == stats_sq.c.customer_mercos_id)
+    if filters:
+        stmt = stmt.where(*filters)
+    rows = db.execute(
+        stmt.order_by(
+            stats_sq.c.revenue.desc().nulls_last(),
+            stats_sq.c.last_order_at.asc().nulls_first(),
+            Customer.name.asc(),
+        ).limit(limit)
+    ).all()
+
+    visible = []
+    for customer, orders, revenue, last_order_at, first_order_at, last_seller_id in rows:
+        stats = None
+        if orders is not None:
+            stats = type(
+                "Stats",
+                (),
+                {
+                    "customer_mercos_id": customer.mercos_id,
+                    "orders": orders,
+                    "revenue": revenue,
+                    "last_order_at": last_order_at,
+                    "first_order_at": first_order_at,
+                    "last_seller_id": last_seller_id,
+                },
+            )()
+        visible.append(
+            _lead_summary(
+                customer,
+                stats,
+                attendances.get(customer.mercos_id),
+                sellers,
+                [],
+            )
+        )
+
     last_products = _last_products_map(db, [row["id"] for row in visible], 3)
     for row in visible:
         row["lastProducts"] = last_products.get(row["id"], [])
+
     return {
-        "count": len(leads),
-        "topCount": min(top_n, len(leads)),
+        "count": total_count,
+        "topCount": min(top_n, len(visible)),
         "top": visible[:top_n],
         "queue": visible[top_n:],
-        "hidden": max(0, len(leads) - len(visible)),
-        "inProgress": sum(1 for row in leads if row["attendanceStatus"] == "in_progress"),
-        "open": sum(1 for row in leads if row["attendanceStatus"] != "in_progress"),
+        "hidden": max(0, total_count - len(visible)),
+        "inProgress": in_progress,
+        "open": max(0, total_count - in_progress),
     }
 
 
