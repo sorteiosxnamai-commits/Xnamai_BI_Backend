@@ -46,8 +46,8 @@ def _lead_priority_order(db: Session, stats_sq):
     days_since = _days_since_last_order(db, stats_sq.c.last_order_at)
     priority = cast(stats_sq.c.revenue, Float) * days_since
     return (
-        priority.desc(),
-        days_since.desc(),
+        priority.desc().nulls_last(),
+        days_since.desc().nulls_last(),
         stats_sq.c.revenue.desc().nulls_last(),
         Customer.name.asc(),
     )
@@ -353,10 +353,9 @@ def list_leads(
             "open": max(0, total_count - in_progress),
         }
 
-    total_count = count_with()
-    stmt = _lead_select_stmt(stats_sq)
-    if filters:
-        stmt = stmt.where(*filters)
+    total_count = count_with([stats_sq.c.customer_mercos_id.isnot(None)])
+    buyer_filters = [*filters, stats_sq.c.customer_mercos_id.isnot(None)]
+    stmt = _lead_select_stmt(stats_sq).where(*buyer_filters)
     order = _lead_priority_order(db, stats_sq)
 
     top_rows = db.execute(stmt.order_by(*order).limit(top_n)).all()

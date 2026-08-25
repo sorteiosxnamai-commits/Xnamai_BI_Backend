@@ -233,6 +233,12 @@ def test_crm_queue_hides_finished_leads_and_exposes_top_20():
             assert new_body["queue"][0]["id"] == "c-new"
             assert new_body["queue"][0]["orders"] == 0
 
+            never_in_main = client.get("/api/v1/crm/leads?top=20")
+            assert never_in_main.status_code == 200
+            main_ids = {row["id"] for row in never_in_main.json()["top"]}
+            assert "c-new" not in main_ids
+            assert all(row["orders"] > 0 for row in never_in_main.json()["top"])
+
             detail = client.get("/api/v1/crm/leads/c-top")
             assert detail.status_code == 200
             payload = detail.json()
