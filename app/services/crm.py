@@ -366,16 +366,17 @@ def list_leads(
 
         total_count = count_with([stats_sq.c.customer_mercos_id.isnot(None)])
         buyer_filters = [*filters, stats_sq.c.customer_mercos_id.isnot(None)]
-        to_score = pick_buyers_for_ai_scoring(
-            db,
-            finished_ids=finished_ids,
-            search=search,
-            limit=AI_BATCH_SIZE,
-            refresh=refresh_ai,
-        )
-        if to_score:
-            score_leads_with_ai(db, to_score, force=refresh_ai)
-            attendances = _attendances_by_customer(db)
+        if page == 1 or refresh_ai:
+            to_score = pick_buyers_for_ai_scoring(
+                db,
+                finished_ids=finished_ids,
+                search=search,
+                limit=AI_BATCH_SIZE,
+                refresh=refresh_ai,
+            )
+            if to_score:
+                score_leads_with_ai(db, to_score, force=refresh_ai)
+                attendances = _attendances_by_customer(db)
 
         heuristic = _heuristic_score_expr(db, stats_sq)
         offset = (page - 1) * page_size

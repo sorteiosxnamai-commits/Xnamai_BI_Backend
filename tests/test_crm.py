@@ -251,6 +251,12 @@ def test_crm_queue_hides_finished_leads_and_exposes_top_20():
             scores = [row["aiScore"] for row in ai_body["queue"] if row["aiScore"] is not None]
             assert scores == sorted(scores, reverse=True)
 
+            ai_page2 = client.get("/api/v1/crm/leads?view=ai&queuePage=2&queuePageSize=1")
+            assert ai_page2.status_code == 200
+            page2_ids = {row["id"] for row in ai_page2.json()["queue"]}
+            page1_ids = {row["id"] for row in ai_body["queue"][:1]}
+            assert page1_ids.isdisjoint(page2_ids)
+
             detail = client.get("/api/v1/crm/leads/c-top")
             assert detail.status_code == 200
             payload = detail.json()
