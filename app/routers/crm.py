@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.database import db_session
 from app.services.crm import claim_lead, crm_dashboard, finish_lead, lead_detail, list_leads
+from app.services.lead_analysis import analyze_lead
 
 router = APIRouter(prefix="/api/v1/crm", tags=["crm"])
 
@@ -35,6 +36,15 @@ def get_leads(
 @router.get("/leads/{customer_id}")
 def get_lead(customer_id: str, db: Session = Depends(db_session)):
     return lead_detail(db, customer_id)
+
+
+@router.get("/leads/{customer_id}/analysis")
+def get_lead_analysis(
+    customer_id: str,
+    refresh: bool = Query(default=False),
+    db: Session = Depends(db_session),
+):
+    return analyze_lead(db, customer_id, refresh=refresh)
 
 
 @router.post("/leads/{customer_id}/claim")

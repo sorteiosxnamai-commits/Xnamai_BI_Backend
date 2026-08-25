@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     sync_orders_minutes: int = 10
     sync_catalog_hours: int = 6
     log_level: str = "INFO"
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
 
     @field_validator("database_url", mode="before")
     @classmethod
