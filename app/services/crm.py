@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select
+from sqlalchemy import Float, cast, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.analytics import MAX_ORDER_TOTAL, REVENUE_STATUSES, classify_customer, _aware, _now
@@ -27,6 +27,30 @@ def _money_total(value) -> float:
 
 def _order_amount():
     return func.coalesce(Order.net_total, Order.total, Order.gross_total, 0)
+
+
+def _days_since_last_order(db: Session, last_order_at):
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+        return func.coalesce(
+            func.julianday("now") - func.julianday(last_order_at),
+            9999.0,
+        )
+    return func.coalesce(
+        cast(func.extract("epoch", func.now() - last_order_at), Float) / 86400.0,
+        9999.0,
+    )
+
+
+def _lead_priority_order(db: Session, stats_sq):
+    days_since = _days_since_last_order(db, stats_sq.c.last_order_at)
+    priority = cast(stats_sq.c.revenue, Float) * days_since
+    return (
+        priority.desc(),
+        days_since.desc(),
+        stats_sq.c.revenue.desc().nulls_last(),
+        Customer.name.asc(),
+    )
 
 
 def _iso(value):
@@ -333,11 +357,7 @@ def list_leads(
     stmt = _lead_select_stmt(stats_sq)
     if filters:
         stmt = stmt.where(*filters)
-    order = (
-        stats_sq.c.revenue.desc().nulls_last(),
-        stats_sq.c.last_order_at.asc().nulls_first(),
-        Customer.name.asc(),
-    )
+    order = _lead_priority_order(db, stats_sq)
 
     top_rows = db.execute(stmt.order_by(*order).limit(top_n)).all()
     queue_offset = top_n + (page - 1) * page_size

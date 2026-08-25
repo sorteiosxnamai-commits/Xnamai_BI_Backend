@@ -52,6 +52,54 @@ def test_current_user_requires_token_or_api_key(monkeypatch):
     assert service.username == "service"
 
 
+def test_crm_prioritizes_high_revenue_inactive_clients():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    session.add_all(
+        [
+            Customer(mercos_id="c-recent", name="Comprou Ontem", city="SP", state="SP", active=True),
+            Customer(mercos_id="c-idle", name="Parado Ha Meses", city="SP", state="SP", active=True),
+            Order(
+                mercos_id="o-recent",
+                number="1",
+                customer_mercos_id="c-recent",
+                status="2",
+                issued_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                total=Decimal("400000"),
+                net_total=Decimal("400000"),
+            ),
+            Order(
+                mercos_id="o-idle",
+                number="2",
+                customer_mercos_id="c-idle",
+                status="2",
+                issued_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+                total=Decimal("300000"),
+                net_total=Decimal("300000"),
+            ),
+        ]
+    )
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[db_session] = override_db
+    try:
+        with TestClient(app) as client:
+            listed = client.get("/api/v1/crm/leads?top=1")
+            assert listed.status_code == 200
+            assert listed.json()["top"][0]["id"] == "c-idle"
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
 def test_crm_revenue_keeps_lifetime_totals_above_order_cap():
     engine = create_engine(
         "sqlite://",
