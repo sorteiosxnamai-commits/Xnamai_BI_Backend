@@ -196,6 +196,8 @@ def _lead_summary(customer: Customer, stats, attendance: CrmAttendance | None, s
         "claimedBy": attendance.seller_name if attendance else None,
         "claimedAt": _iso(attendance.claimed_at) if attendance else None,
         "lastProducts": last_products,
+        "aiScore": float(attendance.ai_priority_score) if attendance and attendance.ai_priority_score is not None else None,
+        "aiReason": attendance.ai_priority_reason if attendance else None,
     }
 
 
@@ -290,6 +292,7 @@ def list_leads(
     queue_page: int = 1,
     queue_page_size: int = 40,
     view: str = "main",
+    refresh_ai: bool = False,
 ) -> dict:
     attendances = _attendances_by_customer(db)
     finished_ids = {
@@ -351,6 +354,109 @@ def list_leads(
             "hasMore": loaded < total_count,
             "inProgress": in_progress,
             "open": max(0, total_count - in_progress),
+        }
+
+    if view == "ai":
+        from app.services.lead_priority import (
+            AI_BATCH_SIZE,
+            _heuristic_score_expr,
+            pick_buyers_for_ai_scoring,
+            score_leads_with_ai,
+        )
+
+        total_count = count_with([stats_sq.c.customer_mercos_id.isnot(None)])
+        buyer_filters = [*filters, stats_sq.c.customer_mercos_id.isnot(None)]
+        to_score = pick_buyers_for_ai_scoring(
+            db,
+            finished_ids=finished_ids,
+            search=search,
+            limit=AI_BATCH_SIZE,
+            refresh=refresh_ai,
+        )
+        if to_score:
+            score_leads_with_ai(db, to_score, force=refresh_ai)
+            attendances = _attendances_by_customer(db)
+
+        heuristic = _heuristic_score_expr(db, stats_sq)
+        offset = (page - 1) * page_size
+        stmt = (
+            select(
+                Customer,
+                stats_sq.c.orders,
+                stats_sq.c.revenue,
+                stats_sq.c.last_order_at,
+                stats_sq.c.first_order_at,
+                stats_sq.c.last_seller_id,
+                CrmAttendance.ai_priority_score,
+            )
+            .select_from(Customer)
+            .outerjoin(stats_sq, Customer.mercos_id == stats_sq.c.customer_mercos_id)
+            .outerjoin(CrmAttendance, Customer.mercos_id == CrmAttendance.customer_mercos_id)
+            .where(*buyer_filters)
+        )
+        rows = db.execute(
+            stmt.order_by(
+                CrmAttendance.ai_priority_score.desc().nulls_last(),
+                heuristic.desc(),
+                stats_sq.c.revenue.desc().nulls_last(),
+                Customer.name.asc(),
+            )
+            .offset(offset)
+            .limit(page_size)
+        ).all()
+
+        visible = []
+        for customer, orders, revenue, last_order_at, first_order_at, last_seller_id, _ai_score in rows:
+            stats = None
+            if orders is not None:
+                stats = type(
+                    "Stats",
+                    (),
+                    {
+                        "customer_mercos_id": customer.mercos_id,
+                        "orders": orders,
+                        "revenue": revenue,
+                        "last_order_at": last_order_at,
+                        "first_order_at": first_order_at,
+                        "last_seller_id": last_seller_id,
+                    },
+                )()
+            visible.append(
+                _lead_summary(
+                    customer,
+                    stats,
+                    attendances.get(customer.mercos_id),
+                    sellers,
+                    [],
+                )
+            )
+
+        ai_scored = int(
+            db.scalar(
+                select(func.count())
+                .select_from(Customer)
+                .outerjoin(stats_sq, Customer.mercos_id == stats_sq.c.customer_mercos_id)
+                .join(CrmAttendance, Customer.mercos_id == CrmAttendance.customer_mercos_id)
+                .where(*buyer_filters, CrmAttendance.ai_priority_score.isnot(None))
+            )
+            or 0
+        )
+        loaded = offset + len(visible)
+        return {
+            "view": "ai",
+            "count": total_count,
+            "newCount": new_count,
+            "topCount": 0,
+            "top": [],
+            "queue": visible,
+            "queuePage": page,
+            "queuePageSize": page_size,
+            "queueTotal": total_count,
+            "hasMore": loaded < total_count,
+            "inProgress": in_progress,
+            "open": max(0, total_count - in_progress),
+            "aiScored": ai_scored,
+            "aiPending": max(0, total_count - ai_scored),
         }
 
     total_count = count_with([stats_sq.c.customer_mercos_id.isnot(None)])

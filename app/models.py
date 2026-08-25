@@ -7,6 +7,7 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    Float,
     JSON,
     Numeric,
     String,
@@ -269,6 +270,9 @@ class CrmAttendance(Base):
     notes: Mapped[str | None] = mapped_column(Text)
     ai_analysis: Mapped[dict | None] = mapped_column(JSON, default=None)
     ai_analysis_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ai_priority_score: Mapped[float | None] = mapped_column(Float, index=True)
+    ai_priority_reason: Mapped[str | None] = mapped_column(Text)
+    ai_priority_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

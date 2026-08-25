@@ -239,6 +239,18 @@ def test_crm_queue_hides_finished_leads_and_exposes_top_20():
             assert "c-new" not in main_ids
             assert all(row["orders"] > 0 for row in never_in_main.json()["top"])
 
+            ai_view = client.get("/api/v1/crm/leads?view=ai&queuePageSize=10")
+            assert ai_view.status_code == 200
+            ai_body = ai_view.json()
+            assert ai_body["view"] == "ai"
+            assert ai_body["count"] == 3
+            assert ai_body["aiScored"] >= 3
+            assert len(ai_body["queue"]) >= 1
+            assert ai_body["queue"][0]["aiScore"] is not None
+            assert ai_body["queue"][0]["orders"] > 0
+            scores = [row["aiScore"] for row in ai_body["queue"] if row["aiScore"] is not None]
+            assert scores == sorted(scores, reverse=True)
+
             detail = client.get("/api/v1/crm/leads/c-top")
             assert detail.status_code == 200
             payload = detail.json()

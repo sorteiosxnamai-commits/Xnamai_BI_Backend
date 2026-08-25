@@ -18,9 +18,10 @@ class ClaimRequest(BaseModel):
 def get_leads(
     search: str | None = Query(default=None, max_length=200),
     top: int = Query(default=20, ge=1, le=50),
-    view: str = Query(default="main", pattern="^(main|new)$"),
+    view: str = Query(default="main", pattern="^(main|new|ai)$"),
     queuePage: int = Query(default=1, ge=1),
     queuePageSize: int = Query(default=40, ge=1, le=100),
+    refreshAi: bool = Query(default=False),
     db: Session = Depends(db_session),
 ):
     return list_leads(
@@ -30,6 +31,7 @@ def get_leads(
         queue_page=queuePage,
         queue_page_size=queuePageSize,
         view=view,
+        refresh_ai=refreshAi,
     )
 
 
