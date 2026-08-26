@@ -19,6 +19,7 @@ from app.services.analytics_v2 import (
     orders_page,
     overview,
     product_detail,
+    product_insights,
     products_page,
     rankings,
     seller_detail,
@@ -101,6 +102,14 @@ def get_order_detail(
     if result is None:
         raise HTTPException(404, "Pedido não encontrado nos filtros aplicados")
     return result
+
+
+@router.get("/product-insights")
+def get_product_insights(
+    filters: AnalyticsFilters = Depends(analytics_filters),
+    db: Session = Depends(db_session),
+):
+    return product_insights(db, filters)
 
 
 @router.get("/products", response_model=PageResponse)

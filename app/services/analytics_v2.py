@@ -2114,24 +2114,231 @@ def breakdowns(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
             }
             for row in value_rows
         ],
-        "productAbc": [
-            {
-                "class": row.class_name,
-                "entities": int(row.entities or 0),
-                "revenue": _decimal(row.revenue),
-            }
-            for row in product_abc_rows
-        ],
-        "customerAbc": [
-            {
-                "class": row.class_name,
-                "entities": int(row.entities or 0),
-                "revenue": _decimal(row.revenue),
-            }
-            for row in customer_abc_rows
-        ],
+        "productAbc": _abc_with_shares(product_abc_rows),
+        "customerAbc": _abc_with_shares(customer_abc_rows),
         "appliedFilters": applied_filters(filters),
         "metadata": analytics_metadata(db),
+    }
+
+
+def _abc_with_shares(rows) -> list[dict[str, Any]]:
+    total_revenue = sum((_decimal(row.revenue) for row in rows), ZERO)
+    total_entities = sum(int(row.entities or 0) for row in rows)
+    items = []
+    for row in rows:
+        revenue = _decimal(row.revenue)
+        entities = int(row.entities or 0)
+        items.append(
+            {
+                "class": row.class_name,
+                "entities": entities,
+                "revenue": revenue,
+                "revenueSharePct": (
+                    (revenue / total_revenue * Decimal("100")).quantize(Decimal("0.01"))
+                    if total_revenue > 0
+                    else ZERO
+                ),
+                "entitySharePct": (
+                    (Decimal(entities) / Decimal(total_entities) * Decimal("100")).quantize(
+                        Decimal("0.01")
+                    )
+                    if total_entities > 0
+                    else ZERO
+                ),
+            }
+        )
+    order = {"A": 0, "B": 1, "C": 2}
+    return sorted(items, key=lambda item: order.get(str(item["class"]), 9))
+
+
+def product_insights(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
+    """Market-style product analytics: ABC Pareto, concentration and mix %."""
+    metadata = analytics_metadata(db)
+    empty = {
+        "summary": {
+            "productsWithSales": 0,
+            "totalRevenue": ZERO,
+            "totalQuantity": ZERO,
+            "productsFor80Pct": 0,
+            "productsFor95Pct": 0,
+            "top10RevenueSharePct": ZERO,
+            "top20RevenueSharePct": ZERO,
+            "averageRevenuePerSku": ZERO,
+        },
+        "productAbc": [],
+        "pareto": [],
+        "topByQuantity": [],
+        "classificationMix": [],
+        "quantityVsRevenue": [],
+        "appliedFilters": applied_filters(filters),
+        "metadata": metadata,
+    }
+    try:
+        aggregate = _product_aggregate(db, filters)
+        ranked = db.execute(
+            select(
+                Product.mercos_id,
+                Product.code,
+                Product.name,
+                Product.stock,
+                aggregate.c.quantity_sold,
+                aggregate.c.order_count,
+                aggregate.c.revenue,
+                aggregate.c.revenue_share,
+                aggregate.c.cumulative_share,
+            )
+            .join(aggregate, aggregate.c.product_id == Product.mercos_id)
+            .where(aggregate.c.revenue > 0)
+            .order_by(aggregate.c.revenue.desc(), Product.name.asc())
+        ).all()
+    except OperationalError:
+        db.rollback()
+        return empty
+    if not ranked:
+        return empty
+
+    total_revenue = sum((_decimal(row.revenue) for row in ranked), ZERO)
+    total_quantity = sum((_decimal(row.quantity_sold) for row in ranked), ZERO)
+    products_with_sales = len(ranked)
+
+    def _share_at(limit: int) -> Decimal:
+        if total_revenue <= 0:
+            return ZERO
+        partial = sum((_decimal(row.revenue) for row in ranked[:limit]), ZERO)
+        return (partial / total_revenue * Decimal("100")).quantize(Decimal("0.01"))
+
+    products_for_80 = next(
+        (index + 1 for index, row in enumerate(ranked) if _decimal(row.cumulative_share) >= 80),
+        products_with_sales,
+    )
+    products_for_95 = next(
+        (index + 1 for index, row in enumerate(ranked) if _decimal(row.cumulative_share) >= 95),
+        products_with_sales,
+    )
+
+    abc_buckets: dict[str, dict[str, Any]] = {
+        "A": {"class": "A", "entities": 0, "revenue": ZERO},
+        "B": {"class": "B", "entities": 0, "revenue": ZERO},
+        "C": {"class": "C", "entities": 0, "revenue": ZERO},
+    }
+    pareto = []
+    quantity_vs_revenue = []
+    classification_counts: dict[str, int] = {}
+
+    for index, row in enumerate(ranked):
+        cumulative = _decimal(row.cumulative_share)
+        abc_class = "A" if cumulative <= 80 else "B" if cumulative <= 95 else "C"
+        revenue = _decimal(row.revenue)
+        quantity = _decimal(row.quantity_sold)
+        stock = _decimal(row.stock)
+        abc_buckets[abc_class]["entities"] += 1
+        abc_buckets[abc_class]["revenue"] += revenue
+
+        if stock <= 0:
+            classification = "sem_estoque"
+        elif quantity <= 0:
+            classification = "sem_venda_periodo"
+        else:
+            classification = f"classe_{abc_class.lower()}"
+        classification_counts[classification] = classification_counts.get(classification, 0) + 1
+
+        if index < 25:
+            pareto.append(
+                {
+                    "rank": index + 1,
+                    "id": row.mercos_id,
+                    "code": row.code,
+                    "name": row.name,
+                    "revenue": revenue,
+                    "quantitySold": quantity,
+                    "revenueSharePct": _decimal(row.revenue_share),
+                    "cumulativeSharePct": cumulative,
+                    "abcClass": abc_class,
+                }
+            )
+        if index < 12:
+            quantity_vs_revenue.append(
+                {
+                    "name": (row.name or row.code or row.mercos_id)[:42],
+                    "quantitySold": quantity,
+                    "revenue": revenue,
+                    "abcClass": abc_class,
+                }
+            )
+
+    top_by_quantity = sorted(
+        ranked,
+        key=lambda row: (_decimal(row.quantity_sold), _decimal(row.revenue)),
+        reverse=True,
+    )[:10]
+    top_quantity_items = [
+        {
+            "rank": index + 1,
+            "id": row.mercos_id,
+            "name": row.name,
+            "quantitySold": _decimal(row.quantity_sold),
+            "revenue": _decimal(row.revenue),
+            "quantitySharePct": (
+                (_decimal(row.quantity_sold) / total_quantity * Decimal("100")).quantize(
+                    Decimal("0.01")
+                )
+                if total_quantity > 0
+                else ZERO
+            ),
+        }
+        for index, row in enumerate(top_by_quantity)
+    ]
+
+    classification_total = sum(classification_counts.values()) or 1
+    classification_mix = [
+        {
+            "classification": key,
+            "products": count,
+            "sharePct": (
+                Decimal(count) / Decimal(classification_total) * Decimal("100")
+            ).quantize(Decimal("0.01")),
+        }
+        for key, count in sorted(
+            classification_counts.items(), key=lambda item: (-item[1], item[0])
+        )
+    ]
+
+    return {
+        "summary": {
+            "productsWithSales": products_with_sales,
+            "totalRevenue": total_revenue,
+            "totalQuantity": total_quantity,
+            "productsFor80Pct": products_for_80,
+            "productsFor95Pct": products_for_95,
+            "top10RevenueSharePct": _share_at(10),
+            "top20RevenueSharePct": _share_at(20),
+            "averageRevenuePerSku": (
+                (total_revenue / Decimal(products_with_sales)).quantize(Decimal("0.01"))
+                if products_with_sales
+                else ZERO
+            ),
+        },
+        "productAbc": _abc_with_shares(
+            [
+                type(
+                    "AbcRow",
+                    (),
+                    {
+                        "class_name": bucket["class"],
+                        "entities": bucket["entities"],
+                        "revenue": bucket["revenue"],
+                    },
+                )()
+                for bucket in abc_buckets.values()
+                if bucket["entities"] > 0
+            ]
+        ),
+        "pareto": pareto,
+        "topByQuantity": top_quantity_items,
+        "classificationMix": classification_mix,
+        "quantityVsRevenue": quantity_vs_revenue,
+        "appliedFilters": applied_filters(filters),
+        "metadata": metadata,
     }
 
 
