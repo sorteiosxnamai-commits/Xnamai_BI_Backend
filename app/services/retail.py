@@ -123,13 +123,46 @@ def candidate_pool(
     return pool
 
 
+def catalog_progress(db: Session) -> dict[str, int]:
+    """Fast catalog totals without loading every product row."""
+    pool_size = int(
+        db.scalar(select(func.count()).select_from(Product).where(Product.active.is_(True))) or 0
+    )
+    analyzed_count = int(
+        db.scalar(
+            select(func.count())
+            .select_from(RetailProductAnalysis)
+            .join(Product, Product.mercos_id == RetailProductAnalysis.product_mercos_id)
+            .where(
+                Product.active.is_(True),
+                RetailProductAnalysis.generated_at.is_not(None),
+            )
+        )
+        or 0
+    )
+    pending = max(0, pool_size - analyzed_count)
+    return {
+        "poolSize": pool_size,
+        "analyzedCount": analyzed_count,
+        "pendingCount": pending,
+    }
+
+
 def _analysis_map(db: Session, product_ids: list[str]) -> dict[str, RetailProductAnalysis]:
     if not product_ids:
         return {}
-    rows = db.scalars(
-        select(RetailProductAnalysis).where(RetailProductAnalysis.product_mercos_id.in_(product_ids))
-    ).all()
-    return {row.product_mercos_id: row for row in rows}
+    # Chunk large IN lists for SQLite/Postgres safety
+    out: dict[str, RetailProductAnalysis] = {}
+    chunk = 500
+    for i in range(0, len(product_ids), chunk):
+        part = product_ids[i : i + chunk]
+        rows = db.scalars(
+            select(RetailProductAnalysis).where(RetailProductAnalysis.product_mercos_id.in_(part))
+        ).all()
+        for row in rows:
+            out[row.product_mercos_id] = row
+    return out
+
 
 
 def _appeal_score(ai_payload: dict | None, scores: dict | None) -> float:
@@ -372,13 +405,48 @@ def recommended_products(
             cached["fromCache"] = True
             return cached
 
-    pool = candidate_pool(db, limit=pool_size, days=days)
-    analyses = _analysis_map(db, [item["id"] for item in pool])
-    scored = [compose_product_score(item, analyses.get(item["id"]), economics=economics) for item in pool]
-    # Analyzed with real prices first; then by recommendation score.
+    progress = catalog_progress(db)
+    # Score only products that already have AI analysis (keeps Top 100 fast).
+    analyzed_rows = db.execute(
+        select(Product, RetailProductAnalysis)
+        .join(
+            RetailProductAnalysis,
+            RetailProductAnalysis.product_mercos_id == Product.mercos_id,
+        )
+        .where(
+            Product.active.is_(True),
+            RetailProductAnalysis.generated_at.is_not(None),
+        )
+    ).all()
+
+    sales = _product_sales_subquery(db, days=days)
+    sales_map = {
+        row.product_id: row
+        for row in db.execute(
+            select(sales.c.product_id, sales.c.quantity, sales.c.revenue, sales.c.orders)
+        ).all()
+    }
+
+    scored: list[dict[str, Any]] = []
+    for product, analysis in analyzed_rows:
+        sales_row = sales_map.get(product.mercos_id)
+        candidate = {
+            "id": product.mercos_id,
+            "code": product.code,
+            "name": product.name,
+            "categoryId": product.category_mercos_id or product.category_id,
+            "listPrice": _money(product.list_price),
+            "minimumPrice": _money(product.minimum_price) if product.minimum_price is not None else None,
+            "stock": _money(product.stock),
+            "active": bool(product.active),
+            "mercosRevenue": _money(sales_row.revenue) if sales_row else 0.0,
+            "mercosQuantity": _money(sales_row.quantity) if sales_row else 0.0,
+            "mercosOrders": int(sales_row.orders or 0) if sales_row else 0,
+        }
+        scored.append(compose_product_score(candidate, analysis, economics=economics))
+
     scored.sort(
         key=lambda row: (
-            1 if row["analyzed"] else 0,
             1 if any(c.get("hasPrice") for c in (row.get("channels") or [])) else 0,
             row["recomendacaoScore"],
             row["mercosRevenue"],
@@ -389,14 +457,13 @@ def recommended_products(
     for index, row in enumerate(top_rows, start=1):
         row["rank"] = index
 
-    analyzed_count = sum(1 for row in pool if analyses.get(row["id"]) and analyses[row["id"]].generated_at)
     platform_dist: dict[str, int] = {}
     appeal_dist = {"alto": 0, "medio": 0, "baixo": 0}
     margins = []
     for row in top_rows:
         key = str(row.get("melhorPlataforma") or "site_proprio")
         platform_dist[key] = platform_dist.get(key, 0) + 1
-        apelo = str(row.get("apelo") or "medio").lower().replace("?", "e")
+        apelo = str(row.get("apelo") or "medio").lower().replace(chr(0xe9), "e").replace(chr(0xea), "e")
         if apelo not in appeal_dist:
             apelo = "medio"
         appeal_dist[apelo] += 1
@@ -405,9 +472,9 @@ def recommended_products(
 
     payload = {
         "items": top_rows,
-        "poolSize": len(pool),
-        "analyzedCount": analyzed_count,
-        "pendingCount": max(0, len(pool) - analyzed_count),
+        "poolSize": progress["poolSize"],
+        "analyzedCount": progress["analyzedCount"],
+        "pendingCount": progress["pendingCount"],
         "top": top,
         "fromCache": False,
         "dashboard": {
@@ -426,8 +493,8 @@ def recommended_products(
         "economics": merge_economics(economics),
         "disclaimer": (
             "Custo = preco de tabela Mercos. "
-            "Preco por plataforma = anuncio do mesmo produto e mesma quantidade (pack/kit). "
-            "Pool = catalogo ativo; Top 100 apos rateamento B2C. Cache Redis/memoria."
+            "Preco por plataforma = anuncio do mesmo produto e mesma quantidade. "
+            "Top 100 atualiza conforme o catalogo e analisado em paralelo."
         ),
     }
     try:

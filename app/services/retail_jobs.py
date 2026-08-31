@@ -17,6 +17,7 @@ from app.cache.redis_cache import RETAIL_JOB_KEY, cache_set, invalidate_retail_l
 from app.config import settings
 from app.database import SessionLocal
 from app.models import RetailAnalysisJob
+from app.services.retail import catalog_progress
 from app.services.retail_analysis import analyze_product, pending_candidate_ids
 
 log = logging.getLogger(__name__)
@@ -24,9 +25,22 @@ log = logging.getLogger(__name__)
 HEARTBEAT_STALE = timedelta(minutes=6)
 ACTIVE_STATUSES = ("queued", "running")
 RESUMABLE_STATUSES = ("interrupted", "failed")
+# Cap product_ids per job so POST /analyze-jobs stays fast (mode=all auto-chains).
+JOB_CHUNK_MAX = 200
 _worker_lock = threading.Lock()
 _job_db_lock = threading.Lock()
 _running_job_ids: set[int] = set()
+
+
+def _job_chunk_size(batch_size: int) -> int:
+    workers = _concurrency_hint(batch_size)
+    return max(40, min(JOB_CHUNK_MAX, workers * max(1, batch_size) * 8))
+
+
+def _concurrency_hint(batch_size: int) -> int:
+    configured = int(getattr(settings(), "retail_concurrency", 5) or 5)
+    batch = max(1, int(batch_size or 5))
+    return max(1, min(12, configured, max(batch, 3)))
 
 
 def _now() -> datetime:
@@ -39,13 +53,17 @@ def _iso(value) -> str | None:
 
 
 def _concurrency(job: RetailAnalysisJob | None = None) -> int:
-    configured = int(getattr(settings(), "retail_concurrency", 5) or 5)
     batch = int((job.batch_size if job else 5) or 5)
-    # batch_size doubles as preferred parallelism hint (capped).
-    return max(1, min(12, configured, max(batch, 3)))
+    return _concurrency_hint(batch)
 
 
-def job_payload(job: RetailAnalysisJob, *, catalog_pending: int | None = None) -> dict[str, Any]:
+def job_payload(
+    job: RetailAnalysisJob,
+    *,
+    catalog_pending: int | None = None,
+    catalog_analyzed: int | None = None,
+    catalog_pool: int | None = None,
+) -> dict[str, Any]:
     total = len(job.product_ids or [])
     cursor = int(job.cursor or 0)
     remaining_in_job = max(0, total - cursor)
@@ -66,6 +84,8 @@ def job_payload(job: RetailAnalysisJob, *, catalog_pending: int | None = None) -
         "lastError": job.last_error,
         "errors": (job.errors or [])[-10:],
         "catalogPending": catalog_pending,
+        "catalogAnalyzed": catalog_analyzed,
+        "catalogPoolSize": catalog_pool,
         "heartbeatAt": _iso(job.heartbeat_at),
         "startedAt": _iso(job.started_at),
         "finishedAt": _iso(job.finished_at),
@@ -167,11 +187,13 @@ def start_job(
             invalidate_retail_lists()
             return resumable, False
 
-    pending = pending_candidate_ids(db, pool_size=None)
+    # Never embed the full ~14k catalog in one request (proxy/browser timeout).
+    chunk = _job_chunk_size(batch_size) if mode == "all" else batch_size
+    pending = pending_candidate_ids(db, pool_size=None, limit=chunk)
     if not pending:
         raise HTTPException(400, "Nenhum produto pendente para analisar")
 
-    ids = pending if mode == "all" else pending[:batch_size]
+    ids = pending
     now = _now()
     job = RetailAnalysisJob(
         status="queued",
@@ -333,22 +355,18 @@ def run_job_worker(job_id: int) -> None:
                     finished_at=_now(),
                     current_product_id=None,
                 )
-            # Auto-chain remaining catalog in all-mode
+            # Auto-chain next chunk while catalog still has pending items.
             if job.mode == "all" and job.status == "completed" and int(job.processed or 0) > 0:
-                remaining = pending_candidate_ids(db, pool_size=None)
-                if remaining:
-                    next_job, _ = start_job(
+                progress = catalog_progress(db)
+                if progress["pendingCount"] > 0:
+                    next_job, created = start_job(
                         db,
                         mode="all",
                         batch_size=job.batch_size or 10,
                         resume=False,
                     )
-                    threading.Thread(
-                        target=run_job_worker,
-                        args=(next_job.id,),
-                        daemon=True,
-                        name=f"retail-job-{next_job.id}",
-                    ).start()
+                    if created or next_job.status in ACTIVE_STATUSES:
+                        enqueue_job_worker(next_job.id)
         invalidate_retail_lists()
     finally:
         with _worker_lock:
@@ -368,13 +386,29 @@ def enqueue_job_worker(job_id: int) -> None:
 def status_snapshot(db: Session, job: RetailAnalysisJob | None = None) -> dict[str, Any]:
     reclaim_stale_jobs(db)
     job = job or get_active_job(db) or latest_job(db)
-    pending = len(pending_candidate_ids(db, pool_size=None))
+    progress = catalog_progress(db)
+    pending = progress["pendingCount"]
+    analyzed = progress["analyzedCount"]
+    pool = progress["poolSize"]
     if not job:
-        payload = {"job": None, "catalogPending": pending, "hasActiveJob": False}
+        payload = {
+            "job": None,
+            "catalogPending": pending,
+            "catalogAnalyzed": analyzed,
+            "catalogPoolSize": pool,
+            "hasActiveJob": False,
+        }
     else:
         payload = {
-            "job": job_payload(job, catalog_pending=pending),
+            "job": job_payload(
+                job,
+                catalog_pending=pending,
+                catalog_analyzed=analyzed,
+                catalog_pool=pool,
+            ),
             "catalogPending": pending,
+            "catalogAnalyzed": analyzed,
+            "catalogPoolSize": pool,
             "hasActiveJob": job.status in ACTIVE_STATUSES,
         }
     try:

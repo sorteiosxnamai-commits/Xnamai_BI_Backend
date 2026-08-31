@@ -396,23 +396,77 @@ def pending_candidate_ids(
     *,
     pool_size: int | None = CANDIDATE_POOL_SIZE,
     refresh_stale: bool = False,
+    limit: int | None = None,
 ) -> list[str]:
-    pool = candidate_pool(db, limit=pool_size)
-    product_ids = [item["id"] for item in pool]
-    rows = {
-        row.product_mercos_id: row
-        for row in db.scalars(
-            select(RetailProductAnalysis).where(RetailProductAnalysis.product_mercos_id.in_(product_ids))
-        ).all()
-    } if product_ids else {}
-    pending: list[str] = []
-    for item in pool:
-        row = rows.get(item["id"])
-        if row is None or row.generated_at is None:
-            pending.append(item["id"])
-        elif refresh_stale and not _is_fresh(row):
-            pending.append(item["id"])
-    return pending
+    """Return pending product ids, optionally capped to avoid huge payloads/timeouts."""
+    from sqlalchemy import Float, cast, func
+
+    from app.services.retail import _product_sales_subquery
+
+    # Stale refresh still needs row-level freshness checks.
+    if refresh_stale:
+        pool = candidate_pool(db, limit=pool_size)
+        product_ids = [item["id"] for item in pool]
+        rows = {
+            row.product_mercos_id: row
+            for row in db.scalars(
+                select(RetailProductAnalysis).where(RetailProductAnalysis.product_mercos_id.in_(product_ids))
+            ).all()
+        } if product_ids else {}
+        pending: list[str] = []
+        for item in pool:
+            row = rows.get(item["id"])
+            if row is None or row.generated_at is None or not _is_fresh(row):
+                pending.append(item["id"])
+            if limit is not None and len(pending) >= int(limit):
+                break
+        return pending
+
+    sales = _product_sales_subquery(db, days=90)
+    analyzed_ids = select(RetailProductAnalysis.product_mercos_id).where(
+        RetailProductAnalysis.generated_at.is_not(None)
+    )
+    stmt = (
+        select(Product.mercos_id)
+        .outerjoin(sales, sales.c.product_id == Product.mercos_id)
+        .where(
+            Product.active.is_(True),
+            Product.mercos_id.notin_(analyzed_ids),
+        )
+        .order_by(
+            cast(func.coalesce(sales.c.revenue, 0), Float).desc(),
+            cast(func.coalesce(sales.c.quantity, 0), Float).desc(),
+            Product.name.asc(),
+        )
+    )
+    if pool_size is not None:
+        # Preserve legacy semantics: only consider top-N of the active catalog.
+        ranked = (
+            select(Product.mercos_id)
+            .outerjoin(sales, sales.c.product_id == Product.mercos_id)
+            .where(Product.active.is_(True))
+            .order_by(
+                cast(func.coalesce(sales.c.revenue, 0), Float).desc(),
+                cast(func.coalesce(sales.c.quantity, 0), Float).desc(),
+                Product.name.asc(),
+            )
+            .limit(max(1, int(pool_size)))
+            .subquery()
+        )
+        stmt = (
+            select(Product.mercos_id)
+            .join(ranked, ranked.c.mercos_id == Product.mercos_id)
+            .outerjoin(sales, sales.c.product_id == Product.mercos_id)
+            .where(Product.mercos_id.notin_(analyzed_ids))
+            .order_by(
+                cast(func.coalesce(sales.c.revenue, 0), Float).desc(),
+                cast(func.coalesce(sales.c.quantity, 0), Float).desc(),
+                Product.name.asc(),
+            )
+        )
+    if limit is not None:
+        stmt = stmt.limit(max(1, int(limit)))
+    return list(db.scalars(stmt).all())
 
 
 def analyze_batch(
@@ -423,8 +477,10 @@ def analyze_batch(
     refresh: bool = False,
     economics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from app.services.retail import catalog_progress
+
     limit = max(1, min(20, int(limit)))
-    ids = pending_candidate_ids(db, pool_size=pool_size, refresh_stale=refresh)[:limit]
+    ids = pending_candidate_ids(db, pool_size=pool_size, refresh_stale=refresh, limit=limit)
     processed: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for product_id in ids:
@@ -449,15 +505,14 @@ def analyze_batch(
             log.exception("Retail batch failed for %s", product_id)
             errors.append({"id": product_id, "error": str(getattr(error, "detail", error))})
 
-    pool = candidate_pool(db, limit=pool_size)
-    remaining = pending_candidate_ids(db, pool_size=pool_size)
+    progress = catalog_progress(db)
     return {
         "processed": processed,
         "processedCount": len(processed),
         "errors": errors,
-        "pendingCount": len(remaining),
-        "poolSize": len(pool),
-        "analyzedCount": max(0, len(pool) - len(remaining)),
+        "pendingCount": progress["pendingCount"],
+        "poolSize": progress["poolSize"],
+        "analyzedCount": progress["analyzedCount"],
     }
 
 
