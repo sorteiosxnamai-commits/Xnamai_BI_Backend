@@ -29,6 +29,7 @@ from app.routers.analytics import router as analytics_router
 from app.routers.auth import router as auth_router
 from app.routers.crm import router as crm_router
 from app.routers.exports import router as exports_router
+from app.routers.retail import router as retail_router
 from app.schemas.data_quality import DataQualityResponse
 from app.services.data_quality import build_data_quality_report
 from app.adaptor import keep_adaptor_warm
@@ -167,6 +168,7 @@ async def database_timeout_handler(request, exc: OperationalError):
 auth = current_user
 app.include_router(auth_router)
 app.include_router(crm_router)
+app.include_router(retail_router)
 app.include_router(analytics_router, dependencies=[Depends(current_user)])
 app.include_router(exports_router)
 

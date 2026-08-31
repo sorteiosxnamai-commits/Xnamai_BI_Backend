@@ -280,6 +280,21 @@ class CrmAttendance(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class RetailProductAnalysis(Base):
+    __tablename__ = "retail_product_analyses"
+    __table_args__ = (
+        UniqueConstraint("product_mercos_id", name="uq_retail_product_analyses_product"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_mercos_id: Mapped[str] = mapped_column(String(80), index=True)
+    ai_payload: Mapped[dict | None] = mapped_column(JSON, default=None)
+    market_prices: Mapped[dict | None] = mapped_column(JSON, default=None)
+    scores: Mapped[dict | None] = mapped_column(JSON, default=None)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ExportRun(Base):
     __tablename__ = "export_runs"
     __table_args__ = (Index("ix_export_runs_started_at", "started_at"),)
