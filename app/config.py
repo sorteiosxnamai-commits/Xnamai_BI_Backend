@@ -68,7 +68,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     redis_url: str = ""
-    retail_concurrency: int = 5
+    retail_concurrency: int = 2
+    retail_openai_max_inflight: int = 4
     retail_cache_ttl_seconds: int = 120
 
     @field_validator("database_url", mode="before")

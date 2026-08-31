@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -30,6 +32,19 @@ from app.services.retail_pack import detect_pack_units
 from app.cache.redis_cache import invalidate_retail_lists, cache_set, RETAIL_ANALYSIS_PREFIX
 
 log = logging.getLogger(__name__)
+
+# Cap total simultaneous OpenAI calls across product workers + platform searches.
+_openai_lock = threading.Lock()
+_openai_semaphore: threading.Semaphore | None = None
+
+
+def _openai_gate() -> threading.Semaphore:
+    global _openai_semaphore
+    with _openai_lock:
+        if _openai_semaphore is None:
+            limit = int(getattr(settings(), "retail_openai_max_inflight", 4) or 4)
+            _openai_semaphore = threading.Semaphore(max(1, min(8, limit)))
+        return _openai_semaphore
 
 PLATFORM_KEYS = (
     "mercado_livre",
@@ -208,6 +223,7 @@ def _call_openai(
     instructions: str,
     use_web_search: bool = True,
     timeout_seconds: float = 90.0,
+    retries: int = 2,
 ) -> dict:
     cfg = settings()
     if not cfg.openai_api_key:
@@ -225,26 +241,58 @@ def _call_openai(
             }
         ]
         body["include"] = ["web_search_call.action.sources"]
-    with httpx.Client(timeout=httpx.Timeout(timeout_seconds, connect=15.0)) as client:
-        response = client.post(
-            "https://api.openai.com/v1/responses",
-            headers={
-                "Authorization": f"Bearer {cfg.openai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-        )
-    if response.status_code >= 400:
-        log.error("OpenAI retail error %s: %s", response.status_code, response.text[:800])
-        raise HTTPException(502, "Falha ao gerar analise varejo com IA")
-    payload = response.json()
-    text = _extract_output_text(payload)
-    if not text:
-        raise HTTPException(502, "IA nao retornou analise")
-    analysis = _parse_analysis(text)
-    if use_web_search and not analysis.get("sources"):
-        analysis["sources"] = _extract_sources(payload)
-    return analysis
+
+    last_error: Exception | None = None
+    attempts = max(1, int(retries) + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            with _openai_gate():
+                with httpx.Client(timeout=httpx.Timeout(timeout_seconds, connect=15.0)) as client:
+                    response = client.post(
+                        "https://api.openai.com/v1/responses",
+                        headers={
+                            "Authorization": f"Bearer {cfg.openai_api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=body,
+                    )
+            if response.status_code >= 400:
+                log.error("OpenAI retail error %s: %s", response.status_code, response.text[:800])
+                # Retry transient OpenAI overload/rate limits.
+                if response.status_code in {408, 429, 500, 502, 503, 504} and attempt < attempts:
+                    time.sleep(min(8.0, attempt * 1.5))
+                    continue
+                raise HTTPException(502, "Falha ao gerar analise varejo com IA")
+            payload = response.json()
+            text = _extract_output_text(payload)
+            if not text:
+                raise HTTPException(502, "IA nao retornou analise")
+            analysis = _parse_analysis(text)
+            if use_web_search and not analysis.get("sources"):
+                analysis["sources"] = _extract_sources(payload)
+            return analysis
+        except HTTPException:
+            raise
+        except (httpx.TimeoutException, httpx.TransportError) as error:
+            last_error = error
+            log.warning(
+                "OpenAI retail timeout/transport attempt %s/%s: %s",
+                attempt,
+                attempts,
+                error,
+            )
+            if attempt < attempts:
+                time.sleep(min(8.0, attempt * 1.5))
+                continue
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+            log.exception("OpenAI retail unexpected error")
+            break
+
+    detail = "Timeout OpenAI na analise varejo"
+    if last_error:
+        detail = f"{detail}: {last_error}"
+    raise HTTPException(504, detail)
 
 
 def _search_platform_listings(product: dict[str, Any], platform_key: str) -> dict[str, Any]:
@@ -254,6 +302,7 @@ def _search_platform_listings(product: dict[str, Any], platform_key: str) -> dic
             instructions=PLATFORM_SEARCH_INSTRUCTIONS,
             use_web_search=True,
             timeout_seconds=100.0,
+            retries=1,
         )
     except Exception as error:  # noqa: BLE001 - one platform must not kill the batch
         log.warning("Platform search failed for %s/%s: %s", product.get("id"), platform_key, error)
@@ -267,7 +316,8 @@ def _search_platform_listings(product: dict[str, Any], platform_key: str) -> dic
 def gather_market_prices_parallel(product: dict[str, Any]) -> dict[str, Any]:
     """Search each marketplace in parallel and keep multiple seller listings."""
     results: dict[str, Any] = {}
-    workers = max(1, min(len(PLATFORM_KEYS), int(getattr(settings(), "retail_concurrency", 5) or 5)))
+    # Keep platform fan-out modest; global semaphore already caps OpenAI load.
+    workers = max(1, min(3, len(PLATFORM_KEYS)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="retail-mkt") as pool:
         futures = {
             pool.submit(_search_platform_listings, product, key): key for key in PLATFORM_KEYS
@@ -286,35 +336,41 @@ def gather_market_prices_parallel(product: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _fallback_recommendation(market_prices: dict[str, Any]) -> dict:
+    priced = [
+        key for key, value in market_prices.items() if isinstance(value, dict) and value.get("price")
+    ]
+    best = priced[0] if priced else "site_proprio"
+    return {
+        "apelo": "medio",
+        "apeloJustificativa": "Sintese automatica apos busca de precos",
+        "potencialScore": 60,
+        "melhorPlataforma": best,
+        "porquePlataforma": "Melhor canal entre os que retornaram anuncio real",
+        "porqueCanalDetalhe": "Recomendacao derivada dos precos coletados em paralelo.",
+        "comparativoCanais": [],
+        "melhorEnvio": "melhor_envio",
+        "envioJustificativa": "Padrao",
+        "motivoEscolha": "Precos reais coletados por plataforma",
+        "razoes": ["Busca paralela multi-vendedor"],
+        "risco": "medio",
+        "confidence": "media",
+        "sources": [],
+    }
+
+
 def _synthesize_recommendation(product: dict[str, Any], market_prices: dict[str, Any]) -> dict:
     try:
         return _call_openai(
             _build_synthesis_prompt(product, market_prices),
             instructions=SYNTHESIS_INSTRUCTIONS,
             use_web_search=False,
-            timeout_seconds=60.0,
+            timeout_seconds=75.0,
+            retries=2,
         )
-    except HTTPException:
-        priced = [
-            key for key, value in market_prices.items() if isinstance(value, dict) and value.get("price")
-        ]
-        best = priced[0] if priced else "site_proprio"
-        return {
-            "apelo": "medio",
-            "apeloJustificativa": "Sintese automatica apos busca de precos",
-            "potencialScore": 60,
-            "melhorPlataforma": best,
-            "porquePlataforma": "Melhor canal entre os que retornaram anuncio real",
-            "porqueCanalDetalhe": "Recomendacao derivada dos precos coletados em paralelo.",
-            "comparativoCanais": [],
-            "melhorEnvio": "melhor_envio",
-            "envioJustificativa": "Padrao",
-            "motivoEscolha": "Precos reais coletados por plataforma",
-            "razoes": ["Busca paralela multi-vendedor"],
-            "risco": "medio",
-            "confidence": "media",
-            "sources": [],
-        }
+    except Exception as error:  # noqa: BLE001 - keep market prices even if synthesis times out
+        log.warning("Retail synthesis fallback for %s: %s", product.get("id"), error)
+        return _fallback_recommendation(market_prices)
 
 
 def _heuristic_analysis(product: dict[str, Any], economics: dict[str, Any] | None = None) -> dict:

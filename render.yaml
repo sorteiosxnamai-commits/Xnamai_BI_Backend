@@ -34,4 +34,8 @@ services:
         sync: false
       - key: OPENAI_MODEL
         value: "gpt-4o-mini"
+      - key: RETAIL_CONCURRENCY
+        value: "2"
+      - key: RETAIL_OPENAI_MAX_INFLIGHT
+        value: "4"
 
