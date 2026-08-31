@@ -295,6 +295,27 @@ class RetailProductAnalysis(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class RetailAnalysisJob(Base):
+    __tablename__ = "retail_analysis_jobs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    mode: Mapped[str] = mapped_column(String(20), default="batch")
+    batch_size: Mapped[int] = mapped_column(Integer, default=10)
+    product_ids: Mapped[list] = mapped_column(JSON, default=list)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    current_product_id: Mapped[str | None] = mapped_column(String(80))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    errors: Mapped[list] = mapped_column(JSON, default=list)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ExportRun(Base):
     __tablename__ = "export_runs"
     __table_args__ = (Index("ix_export_runs_started_at", "started_at"),)

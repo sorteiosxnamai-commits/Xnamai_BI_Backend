@@ -208,7 +208,7 @@ def test_recommended_uses_full_catalog_and_real_prices():
         session.close()
 
 
-def test_analyze_batch_does_not_invent_prices_without_openai(monkeypatch):
+def test_analyze_batch_starts_async_job():
     session = _session()
     _seed_products(session)
 
@@ -217,16 +217,13 @@ def test_analyze_batch_does_not_invent_prices_without_openai(monkeypatch):
 
     app.dependency_overrides[db_session] = override_db
     try:
-        from fastapi import HTTPException
-
-        with patch("app.services.retail_analysis._call_openai") as mocked:
-            mocked.side_effect = HTTPException(503, "OPENAI_API_KEY nao configurada")
+        with patch("app.services.retail_jobs.enqueue_job_worker") as enqueue:
             with TestClient(app) as client:
                 response = client.post("/api/v1/retail/analyze-batch", json={"limit": 2})
-                assert response.status_code == 200
+                assert response.status_code == 202
                 body = response.json()
-                assert body["processedCount"] == 0
-                assert len(body["errors"]) == 2
+                assert body["job"]["total"] == 2
+                assert enqueue.called
     finally:
         app.dependency_overrides.clear()
         session.close()
