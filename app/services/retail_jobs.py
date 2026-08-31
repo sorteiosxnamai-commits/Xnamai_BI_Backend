@@ -22,7 +22,8 @@ from app.services.retail_analysis import analyze_product, pending_candidate_ids
 
 log = logging.getLogger(__name__)
 
-HEARTBEAT_STALE = timedelta(minutes=6)
+HEARTBEAT_STALE = timedelta(minutes=12)
+HEARTBEAT_TICK = 45  # seconds between live heartbeat refreshes
 ACTIVE_STATUSES = ("queued", "running")
 RESUMABLE_STATUSES = ("interrupted", "failed")
 # Cap product_ids per job so POST /analyze-jobs stays fast (mode=all auto-chains).
@@ -30,6 +31,9 @@ JOB_CHUNK_MAX = 200
 _worker_lock = threading.Lock()
 _job_db_lock = threading.Lock()
 _running_job_ids: set[int] = set()
+_auto_resume_lock = threading.Lock()
+_last_auto_resume_at: datetime | None = None
+_AUTO_RESUME_COOLDOWN = timedelta(seconds=20)
 
 
 def _job_chunk_size(batch_size: int) -> int:
@@ -177,14 +181,20 @@ def _recent_batches(db: Session, *, limit: int = 5) -> list[dict[str, Any]]:
 def reclaim_stale_jobs(db: Session) -> int:
     now = _now()
     changed = 0
+    heartbeat_only = 0
     rows = list(
         db.scalars(select(RetailAnalysisJob).where(RetailAnalysisJob.status.in_(list(ACTIVE_STATUSES))))
     )
     for job in rows:
+        # Local worker still alive — refresh heartbeat instead of false-interrupting long IA calls.
+        if job.id in _running_job_ids:
+            job.heartbeat_at = now
+            job.updated_at = now
+            db.add(job)
+            heartbeat_only += 1
+            continue
         heartbeat = _aware(job.heartbeat_at) or _aware(job.updated_at) or _aware(job.started_at)
         if heartbeat and (now - heartbeat) < HEARTBEAT_STALE:
-            continue
-        if job.id in _running_job_ids and heartbeat and (now - heartbeat) < HEARTBEAT_STALE:
             continue
         job.status = "interrupted"
         job.last_error = job.last_error or "Job interrompido por timeout/heartbeat (pode retomar)"
@@ -193,10 +203,68 @@ def reclaim_stale_jobs(db: Session) -> int:
         job.finished_at = now
         db.add(job)
         changed += 1
-    if changed:
+    if changed or heartbeat_only:
         db.commit()
+    if changed:
         invalidate_retail_lists()
     return changed
+
+
+def ensure_catalog_pipeline(db: Session) -> RetailAnalysisJob | None:
+    """Keep mode=all catalog runs alive: auto-resume interrupted lots and chain next chunks."""
+    global _last_auto_resume_at
+    reclaim_stale_jobs(db)
+    active = get_active_job(db)
+    if active:
+        if active.status in ACTIVE_STATUSES and active.id not in _running_job_ids:
+            enqueue_job_worker(active.id)
+        return active
+
+    job = latest_job(db)
+    if not job or job.mode != "all":
+        return None
+
+    progress = catalog_progress(db)
+    pending = int(progress["pendingCount"] or 0)
+    if pending <= 0 and job.status not in RESUMABLE_STATUSES:
+        return None
+
+    now = _now()
+    with _auto_resume_lock:
+        if _last_auto_resume_at and (now - _last_auto_resume_at) < _AUTO_RESUME_COOLDOWN:
+            return job if job.status in RESUMABLE_STATUSES else None
+        _last_auto_resume_at = now
+
+    # Resume interrupted/failed lot with remaining product_ids.
+    if job.status in RESUMABLE_STATUSES:
+        remaining = int(job.cursor or 0) < len(job.product_ids or [])
+        if remaining:
+            _touch(
+                db,
+                job,
+                status="queued",
+                finished_at=None,
+                last_error=None,
+                current_product_id=None,
+            )
+            enqueue_job_worker(job.id)
+            invalidate_retail_lists()
+            return job
+        if pending <= 0:
+            return job
+
+    # Finished (or empty) lot with catalog still pending → next chunk.
+    if job.status in {"completed", *RESUMABLE_STATUSES} and pending > 0:
+        next_job, created = start_job(
+            db,
+            mode="all",
+            batch_size=job.batch_size or 10,
+            resume=False,
+        )
+        if created or next_job.status in ACTIVE_STATUSES:
+            enqueue_job_worker(next_job.id)
+        return next_job
+    return None
 
 
 def get_active_job(db: Session) -> RetailAnalysisJob | None:
@@ -373,6 +441,24 @@ def run_job_worker(job_id: int) -> None:
             return
         _running_job_ids.add(job_id)
 
+    stop_heartbeat = threading.Event()
+
+    def _heartbeat_loop() -> None:
+        while not stop_heartbeat.wait(HEARTBEAT_TICK):
+            try:
+                with SessionLocal() as db:
+                    job = db.scalar(select(RetailAnalysisJob).where(RetailAnalysisJob.id == job_id))
+                    if not job or job.status == "cancelled":
+                        return
+                    if job.status not in ACTIVE_STATUSES:
+                        return
+                    job.heartbeat_at = _now()
+                    job.updated_at = _now()
+                    db.add(job)
+                    db.commit()
+            except Exception:  # noqa: BLE001
+                log.exception("Retail job %s heartbeat refresh failed", job_id)
+
     try:
         with SessionLocal() as db:
             job = db.scalar(select(RetailAnalysisJob).where(RetailAnalysisJob.id == job_id))
@@ -391,6 +477,13 @@ def run_job_worker(job_id: int) -> None:
                 started_at=job.started_at or _now(),
                 finished_at=None,
             )
+
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_loop,
+            name=f"retail-hb-{job_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
         def worker_loop() -> None:
             while True:
@@ -447,6 +540,7 @@ def run_job_worker(job_id: int) -> None:
                         enqueue_job_worker(next_job.id)
         invalidate_retail_lists()
     finally:
+        stop_heartbeat.set()
         with _worker_lock:
             _running_job_ids.discard(job_id)
 
@@ -462,8 +556,9 @@ def enqueue_job_worker(job_id: int) -> None:
 
 
 def status_snapshot(db: Session, job: RetailAnalysisJob | None = None) -> dict[str, Any]:
-    reclaim_stale_jobs(db)
-    job = job or get_active_job(db) or latest_job(db)
+    # Keep catalog parallel pipeline alive without manual "Retomar".
+    ensured = ensure_catalog_pipeline(db)
+    job = job or ensured or get_active_job(db) or latest_job(db)
     progress = catalog_progress(db)
     pending = progress["pendingCount"]
     analyzed = progress["analyzedCount"]
