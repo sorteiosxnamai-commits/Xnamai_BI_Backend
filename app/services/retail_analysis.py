@@ -27,7 +27,12 @@ from app.services.retail import (
     product_analysis_detail,
 )
 from app.services.retail_economics import evaluate_channels, merge_economics
-from app.services.retail_listings import collapse_platform_market_price
+from app.services.retail_listings import (
+    collapse_platform_market_price,
+    collect_listings,
+    merge_platform_payloads,
+    sources_from_market_prices,
+)
 from app.services.retail_pack import detect_pack_units
 from app.cache.redis_cache import invalidate_retail_lists, cache_set, RETAIL_ANALYSIS_PREFIX
 
@@ -84,17 +89,24 @@ PLATFORM_SEARCH_HINTS = {
 
 PLATFORM_SEARCH_INSTRUCTIONS = (
     "Voce e um pesquisador de precos de varejo B2C no Brasil. "
-    "Use web_search. Foque SOMENTE na plataforma pedida. "
-    "Encontre no minimo 2 e de preferencia 3 anuncios/vendedores DIFERENTES do MESMO produto. "
-    "Compare modelo, marca e quantidade (pack/kit). "
+    "Use a ferramenta web_search VARIAS VEZES (no minimo 4 queries diferentes) "
+    "focando SOMENTE na plataforma pedida. "
+    "Meta: encontrar de 3 a 5 anuncios/vendedores DIFERENTES do MESMO produto "
+    "(mesmo modelo/marca/quantidade). "
+    "Nao pare no primeiro resultado. Compare precos entre lojas. "
     "NUNCA copie o preco de tabela Mercos como preco de venda. "
-    "Nao invente precos, vendedores ou URLs. Se nao achar apos varias buscas, price null. "
+    "Nao invente precos, vendedores ou URLs. "
+    "Se achar menos de 3, continue buscando com queries alternativas "
+    "(modelo, marca, sinonimos, 'comprar', 'preco', 'oferta'). "
     "Responda SOMENTE JSON valido (sem markdown): "
     '{"platform":"shopee","listings":['
-    '{"price":799.0,"units":1,"freight":18,"seller":"Loja A","url":"https://...","source":"Shopee","packMatch":true,"title":"..."},'
-    '{"price":820.0,"units":1,"freight":15,"seller":"Loja B","url":"https://...","source":"Shopee","packMatch":true,"title":"..."}'
-    '],"notes":"resumo da busca","searchesTried":3}'
+    '{"price":260.1,"units":1,"freight":18,"seller":"Loja A","url":"https://...","source":"Shopee","packMatch":true,"title":"..."},'
+    '{"price":249.9,"units":1,"freight":15,"seller":"Loja B","url":"https://...","source":"Shopee","packMatch":true,"title":"..."},'
+    '{"price":275.0,"units":1,"freight":12,"seller":"Loja C","url":"https://...","source":"Shopee","packMatch":true,"title":"..."}'
+    '],"notes":"resumo da busca","searchesTried":5}'
 )
+
+MIN_SELLERS_TARGET = 3
 
 SYNTHESIS_INSTRUCTIONS = (
     "Voce e um analista de varejo B2C no Brasil (XNamai). "
@@ -174,31 +186,65 @@ def _parse_analysis(text: str) -> dict:
     return parsed
 
 
-def _build_platform_prompt(product: dict[str, Any], platform_key: str) -> str:
+def _search_tokens(product: dict[str, Any]) -> list[str]:
+    name = str(product.get("name") or "")
+    code = str(product.get("code") or "")
+    parts = [part for part in re.split(r"[\s\-_/|,]+", f"{name} {code}") if len(part) >= 3]
+    # Prefer distinctive tokens (model codes, brand-like words).
+    ranked = sorted(set(parts), key=lambda item: (-len(item), item.lower()))
+    return ranked[:10]
+
+
+def _build_platform_prompt(product: dict[str, Any], platform_key: str, *, deepen: bool = False) -> str:
     units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
     hint = PLATFORM_SEARCH_HINTS.get(platform_key) or {"label": platform_key, "queryHint": platform_key}
     name = product.get("name") or ""
     code = product.get("code") or ""
-    # Short searchable tokens help marketplaces (model codes like PGT-HY320).
-    tokens = [part for part in re.split(r"[\s\-_/]+", f"{name} {code}") if len(part) >= 3][:8]
+    tokens = _search_tokens(product)
+    core = " ".join(tokens[:5])
+    brandish = " ".join(tokens[:3])
+    queries = [
+        f'"{name}" {hint.get("queryHint")}',
+        f"{core} {hint.get('queryHint')}",
+        f"{brandish} preco {hint['label']} Brasil",
+        f"{core} comprar {hint['label']}",
+        f"{code} {hint['label']} oferta" if code else f"{brandish} oferta {hint['label']}",
+        f"{core} site:{hint.get('sites', '')}",
+    ]
+    deepen_block = ""
+    if deepen:
+        deepen_block = (
+            "\nMODO APROFUNDAMENTO: a primeira rodada trouxe poucos vendedores. "
+            "OBRIGATORIO executar pelo menos 5 web_search novas com queries alternativas, "
+            "sinonimos e termos como 'original', 'novo', 'barato', 'frete gratis'. "
+            "Priorize vendedores/URLs ainda nao listados.\n"
+        )
     return (
         f"Plataforma alvo: {hint['label']} ({platform_key}).\n"
-        f"Buscas obrigatorias (faca varias): "
-        f"\"{name}\" {hint.get('queryHint')}; "
-        f"{' '.join(tokens[:4])} {hint.get('queryHint')}; "
-        f"{code} {hint['label']} Brasil.\n"
+        f"{deepen_block}"
+        f"Execute TODAS estas buscas (e outras se precisar):\n- "
+        + "\n- ".join(queries)
+        + "\n"
         f"Produto: {name}\n"
         f"Codigo interno: {code}\n"
-        f"Quantidade do SKU: {units} unidade(s). So aceite anuncios com a mesma quantidade "
-        f"(ou informe units diferentes e packMatch=false).\n"
+        f"Quantidade do SKU: {units} unidade(s). Aceite so mesma quantidade "
+        f"(ou informe units e packMatch=false).\n"
         f"Custo Mercos (NAO e preco de venda): {product.get('listPrice')}.\n"
-        f"Retorne pelo menos 2-3 vendedores/anuncios diferentes com price, seller e url. "
-        f"Se achar so 1, ainda assim retorne; null so se realmente nao existir."
+        f"Meta minima: {MIN_SELLERS_TARGET} vendedores diferentes com price, seller e url. "
+        f"Ideal: 4-5. Nao invente dados."
     )
 
 
 def _build_synthesis_prompt(product: dict[str, Any], market_prices: dict[str, Any]) -> str:
     units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
+    seller_stats = {
+        key: {
+            "sellersCompared": (value or {}).get("sellersCompared"),
+            "price": (value or {}).get("price"),
+            "listings": len((value or {}).get("listings") or []),
+        }
+        for key, value in (market_prices or {}).items()
+    }
     context = {
         "id": product.get("id"),
         "name": product.get("name"),
@@ -209,10 +255,12 @@ def _build_synthesis_prompt(product: dict[str, Any], market_prices: dict[str, An
         "mercosRevenue90d": product.get("mercosRevenue"),
         "mercosQuantity90d": product.get("mercosQuantity"),
         "marketPrices": market_prices,
+        "sellerCoverage": seller_stats,
     }
     return (
-        "Com os precos reais abaixo (ja pesquisados em paralelo por plataforma, "
-        "com multiplos vendedores quando disponiveis), monte a recomendacao B2C.\n"
+        "Com os precos reais abaixo (pesquisados em paralelo por plataforma, "
+        "com multiplos vendedores quando disponiveis), monte a recomendacao B2C. "
+        "Inclua em sources TODAS as URLs de anuncios encontrados.\n"
         f"{json.dumps(context, ensure_ascii=False, default=str)}"
     )
 
@@ -270,6 +318,13 @@ def _call_openai(
             analysis = _parse_analysis(text)
             if use_web_search and not analysis.get("sources"):
                 analysis["sources"] = _extract_sources(payload)
+            elif use_web_search:
+                # Keep tool sources too.
+                merged = list(analysis.get("sources") or [])
+                for source in _extract_sources(payload):
+                    if source not in merged:
+                        merged.append(source)
+                analysis["sources"] = merged
             return analysis
         except HTTPException:
             raise
@@ -296,27 +351,60 @@ def _call_openai(
 
 
 def _search_platform_listings(product: dict[str, Any], platform_key: str) -> dict[str, Any]:
-    try:
-        raw = _call_openai(
-            _build_platform_prompt(product, platform_key),
-            instructions=PLATFORM_SEARCH_INSTRUCTIONS,
-            use_web_search=True,
-            timeout_seconds=100.0,
-            retries=1,
-        )
-    except Exception as error:  # noqa: BLE001 - one platform must not kill the batch
-        log.warning("Platform search failed for %s/%s: %s", product.get("id"), platform_key, error)
-        return {"platform": platform_key, "listings": [], "notes": f"busca falhou: {error}"}
-    if not isinstance(raw, dict):
-        return {"platform": platform_key, "listings": [], "notes": "resposta invalida"}
-    raw["platform"] = platform_key
-    return raw
+    list_price = float(product.get("listPrice") or 0)
+    rounds: list[dict[str, Any]] = []
+
+    def _one(deepen: bool) -> dict[str, Any]:
+        try:
+            raw = _call_openai(
+                _build_platform_prompt(product, platform_key, deepen=deepen),
+                instructions=PLATFORM_SEARCH_INSTRUCTIONS,
+                use_web_search=True,
+                timeout_seconds=110.0,
+                retries=1,
+            )
+        except Exception as error:  # noqa: BLE001 - one platform must not kill the batch
+            log.warning(
+                "Platform search failed for %s/%s deepen=%s: %s",
+                product.get("id"),
+                platform_key,
+                deepen,
+                error,
+            )
+            return {"platform": platform_key, "listings": [], "notes": f"busca falhou: {error}"}
+        if not isinstance(raw, dict):
+            return {"platform": platform_key, "listings": [], "notes": "resposta invalida"}
+        raw["platform"] = platform_key
+        return raw
+
+    first = _one(deepen=False)
+    rounds.append(first)
+    first_count = len(collect_listings(first, list_price=list_price))
+    if first_count < MIN_SELLERS_TARGET:
+        rounds.append(_one(deepen=True))
+
+    merged = merge_platform_payloads(*rounds, list_price=list_price)
+    # Keep raw-ish shape for gather collapse (already collapsed).
+    return {
+        "platform": platform_key,
+        "listings": merged.get("listings") or [],
+        "notes": merged.get("notes"),
+        "searchesTried": merged.get("searchesTried"),
+        "price": merged.get("price"),
+        "seller": merged.get("seller"),
+        "url": merged.get("url"),
+        "freight": merged.get("freight"),
+        "units": merged.get("units"),
+        "packMatch": merged.get("packMatch"),
+        "source": merged.get("source"),
+        "sellersCompared": merged.get("sellersCompared"),
+    }
 
 
 def gather_market_prices_parallel(product: dict[str, Any]) -> dict[str, Any]:
     """Search each marketplace in parallel and keep multiple seller listings."""
     results: dict[str, Any] = {}
-    # Keep platform fan-out modest; global semaphore already caps OpenAI load.
+    # Modest fan-out; deepen pass runs only when coverage is thin.
     workers = max(1, min(3, len(PLATFORM_KEYS)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="retail-mkt") as pool:
         futures = {
@@ -540,6 +628,21 @@ def analyze_product(
         product_units=units,
     )
     ai_payload["marketPrices"] = market_prices
+    listing_sources = sources_from_market_prices(market_prices)
+    existing_sources = ai_payload.get("sources") if isinstance(ai_payload.get("sources"), list) else []
+    merged_sources: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for source in [*listing_sources, *existing_sources]:
+        if not isinstance(source, dict):
+            continue
+        url = str(source.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        merged_sources.append(
+            {"title": str(source.get("title") or url), "url": url}
+        )
+    ai_payload["sources"] = merged_sources
     scores = _build_scores(product, ai_payload, economics)
     now = datetime.now(timezone.utc)
     row = _upsert_analysis(db, product_id)

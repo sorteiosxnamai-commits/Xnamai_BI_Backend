@@ -106,8 +106,10 @@ def collapse_platform_market_price(
     best = pick_representative_listing(listings)
     if not best:
         notes = None
+        searches = None
         if isinstance(platform_payload, dict):
             notes = platform_payload.get("notes") or platform_payload.get("searchNotes")
+            searches = platform_payload.get("searchesTried")
         return {
             "price": None,
             "units": None,
@@ -119,11 +121,69 @@ def collapse_platform_market_price(
             "packMatch": None,
             "listings": [],
             "sellersCompared": 0,
+            "searchesTried": searches,
             "notes": notes,
         }
     return {
         **best,
         "listings": listings,
         "sellersCompared": len(listings),
+        "searchesTried": (platform_payload or {}).get("searchesTried")
+        if isinstance(platform_payload, dict)
+        else None,
         "notes": (platform_payload or {}).get("notes") if isinstance(platform_payload, dict) else None,
     }
+
+
+def merge_platform_payloads(
+    *payloads: Any,
+    list_price: float | None = None,
+) -> dict[str, Any]:
+    """Merge multiple search rounds for the same platform."""
+    combined_listings: list[dict[str, Any]] = []
+    notes: list[str] = []
+    searches = 0
+    platform = None
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        platform = platform or payload.get("platform")
+        combined_listings.extend(collect_listings(payload, list_price=list_price))
+        note = payload.get("notes") or payload.get("searchNotes")
+        if note:
+            notes.append(str(note))
+        try:
+            searches += int(payload.get("searchesTried") or 0)
+        except (TypeError, ValueError):
+            pass
+    return collapse_platform_market_price(
+        {
+            "platform": platform,
+            "listings": combined_listings,
+            "notes": " | ".join(notes) if notes else None,
+            "searchesTried": searches or None,
+        },
+        list_price=list_price,
+    )
+
+
+def sources_from_market_prices(market_prices: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Build public source list from every listing URL found."""
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for platform, payload in (market_prices or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        listings = payload.get("listings") if isinstance(payload.get("listings"), list) else []
+        rows = listings or ([payload] if payload.get("url") else [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            seller = row.get("seller") or platform
+            title = row.get("title") or f"{platform}: {seller}"
+            out.append({"title": str(title), "url": url})
+    return out
