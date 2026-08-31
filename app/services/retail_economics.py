@@ -1,11 +1,11 @@
-"""Retail B2C economics: cost proxy, marketplace fees, freight and packaging."""
+"""Retail B2C economics: table price as cost, marketplace fees, freight and packaging."""
 
 from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
 
-DEFAULT_CUSTO_PCT = 40.0
+DEFAULT_PACKAGING_COST = 4.0
 
 DEFAULT_PLATFORM_FEES = {
     "mercado_livre": {"label": "Mercado Livre", "feePct": 16.0},
@@ -23,8 +23,6 @@ DEFAULT_SHIPPING = {
     "correios_sedex": {"label": "Correios SEDEX", "avgCost": 32.0},
 }
 
-DEFAULT_PACKAGING_COST = 4.0
-
 PLATFORM_SHIPPING_HINT = {
     "mercado_livre": "mercado_envios",
     "shopee": "shopee_entrega",
@@ -36,13 +34,14 @@ PLATFORM_SHIPPING_HINT = {
 
 def default_economics() -> dict[str, Any]:
     return {
-        "custoPct": DEFAULT_CUSTO_PCT,
+        "costMode": "list_price",
         "packagingCost": DEFAULT_PACKAGING_COST,
         "platforms": deepcopy(DEFAULT_PLATFORM_FEES),
         "shipping": deepcopy(DEFAULT_SHIPPING),
         "notes": (
-            "Custo estimado = preco de tabela x (1 - custoPct/100). "
-            "Taxas e fretes sao defaults BR editaveis; precos de mercado vem da busca publica/IA."
+            "Custo = preco de tabela Mercos (list_price). "
+            "Preco de venda por plataforma = anuncio publico do mesmo produto (busca IA). "
+            "Nao usar preco de tabela como preco de venda."
         ),
     }
 
@@ -51,11 +50,6 @@ def merge_economics(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     base = default_economics()
     if not overrides:
         return base
-    if overrides.get("custoPct") is not None:
-        try:
-            base["custoPct"] = max(0.0, min(90.0, float(overrides["custoPct"])))
-        except (TypeError, ValueError):
-            pass
     if overrides.get("packagingCost") is not None:
         try:
             base["packagingCost"] = max(0.0, float(overrides["packagingCost"]))
@@ -84,10 +78,12 @@ def merge_economics(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     return base
 
 
-def estimated_cost(list_price: float, custo_pct: float) -> float:
-    price = max(0.0, float(list_price or 0))
-    pct = max(0.0, min(90.0, float(custo_pct or 0)))
-    return round(price * (1.0 - pct / 100.0), 2)
+def estimated_cost(list_price: float, *_args, **_kwargs) -> float:
+    """Cost is the Mercos list/table price."""
+    try:
+        return round(max(0.0, float(list_price or 0)), 2)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def channel_margin(
@@ -116,24 +112,36 @@ def channel_margin(
     }
 
 
+def _parse_price(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    return price
+
+
 def evaluate_channels(
     *,
     market_prices: dict[str, Any] | None,
     list_price: float,
     economics: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    """Build channel rows. Retail price only from real listings - never list_price."""
     eco = merge_economics(economics)
-    cost = estimated_cost(list_price, eco["custoPct"])
+    cost = estimated_cost(list_price)
     packaging = float(eco["packagingCost"])
     prices = market_prices or {}
     rows: list[dict[str, Any]] = []
     for key, platform in eco["platforms"].items():
         raw = prices.get(key) if isinstance(prices.get(key), dict) else {}
-        retail_price = raw.get("price")
-        try:
-            retail_price = float(retail_price) if retail_price is not None else float(list_price or 0)
-        except (TypeError, ValueError):
-            retail_price = float(list_price or 0)
+        retail_price = _parse_price(raw.get("price"))
+        # Reject listing that is just a copy of Mercos table price (not a retail sale).
+        if retail_price is not None and cost > 0 and abs(retail_price - cost) < 0.01:
+            retail_price = None
         shipping_key = raw.get("shippingKey") or PLATFORM_SHIPPING_HINT.get(key) or "melhor_envio"
         shipping = eco["shipping"].get(shipping_key) or eco["shipping"]["melhor_envio"]
         freight = raw.get("freight")
@@ -141,6 +149,30 @@ def evaluate_channels(
             freight = float(freight) if freight is not None else float(shipping["avgCost"])
         except (TypeError, ValueError):
             freight = float(shipping["avgCost"])
+
+        if retail_price is None:
+            rows.append(
+                {
+                    "platform": key,
+                    "label": platform["label"],
+                    "feePct": float(platform["feePct"]),
+                    "shippingKey": shipping_key,
+                    "shippingLabel": shipping["label"],
+                    "source": raw.get("source"),
+                    "url": raw.get("url"),
+                    "seller": raw.get("seller"),
+                    "hasPrice": False,
+                    "retailPrice": None,
+                    "cost": cost,
+                    "fee": None,
+                    "freight": freight,
+                    "packaging": packaging,
+                    "netMargin": None,
+                    "marginPct": None,
+                }
+            )
+            continue
+
         margin = channel_margin(
             retail_price=retail_price,
             cost=cost,
@@ -157,8 +189,18 @@ def evaluate_channels(
                 "shippingLabel": shipping["label"],
                 "source": raw.get("source"),
                 "url": raw.get("url"),
+                "seller": raw.get("seller"),
+                "hasPrice": True,
                 **margin,
             }
         )
-    rows.sort(key=lambda row: (-row["marginPct"], -row["netMargin"]))
+
+    rows.sort(
+        key=lambda row: (
+            1 if row.get("hasPrice") else 0,
+            float(row["marginPct"]) if row.get("marginPct") is not None else -9999.0,
+            float(row["netMargin"]) if row.get("netMargin") is not None else -9999.0,
+        ),
+        reverse=True,
+    )
     return rows

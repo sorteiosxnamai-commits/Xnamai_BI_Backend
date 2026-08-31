@@ -19,7 +19,6 @@ from app.models import Product, RetailProductAnalysis
 from app.services.retail import (
     CACHE_HOURS,
     CANDIDATE_POOL_SIZE,
-    PLATFORM_LABELS,
     candidate_pool,
     compose_product_score,
     product_analysis_detail,
@@ -30,7 +29,12 @@ log = logging.getLogger(__name__)
 
 INSTRUCTIONS = (
     "Voce e um analista de varejo B2C no Brasil (XNamai). "
-    "Pesquise precos publicos online do produto (Mercado Livre, Shopee, TikTok Shop, Nuvemshop/sites). "
+    "O preco de tabela Mercos e o CUSTO de compra, NAO o preco de venda ao consumidor. "
+    "Pesquise anuncios PUBLICOS do MESMO produto (mesmo nome/codigo) vendidos por vendedores "
+    "em Mercado Livre, Shopee, TikTok Shop, Nuvemshop e lojas/site proprio. "
+    "Para cada plataforma, informe o preco que o consumidor paga no anuncio, o vendedor/loja e a URL. "
+    "NUNCA copie o preco de tabela Mercos como preco de venda. Se nao achar anuncio, use null. "
+    "Nao invente precos nem URLs. "
     "Responda SOMENTE com JSON valido (sem markdown), neste formato: "
     '{"apelo":"alto|medio|baixo","apeloJustificativa":"texto",'
     '"potencialScore":75,'
@@ -38,19 +42,18 @@ INSTRUCTIONS = (
     '"porquePlataforma":"frase curta",'
     '"melhorEnvio":"mercado_envios|shopee_entrega|melhor_envio|correios_pac|correios_sedex",'
     '"envioJustificativa":"texto",'
-    '"motivoEscolha":"frase curta do porqu? indicar no Top 100 varejo",'
+    '"motivoEscolha":"frase curta do porque indicar no Top 100 varejo",'
     '"razoes":["razao 1","razao 2"],'
     '"risco":"baixo|medio|alto - detalhe",'
     '"marketPrices":{'
-    '"mercado_livre":{"price":99.9,"freight":22,"url":"https://...","source":"Mercado Livre"},'
-    '"shopee":{"price":95.0,"freight":18,"url":null,"source":"Shopee"},'
-    '"tiktok":{"price":null,"freight":null,"url":null,"source":null},'
-    '"nuvemshop":{"price":null,"freight":null,"url":null,"source":null},'
-    '"site_proprio":{"price":110.0,"freight":20,"url":null,"source":"loja similar"}'
+    '"mercado_livre":{"price":99.9,"freight":22,"seller":"Loja X","url":"https://...","source":"Mercado Livre"},'
+    '"shopee":{"price":95.0,"freight":18,"seller":"Seller Y","url":"https://...","source":"Shopee"},'
+    '"tiktok":{"price":null,"freight":null,"seller":null,"url":null,"source":null},'
+    '"nuvemshop":{"price":null,"freight":null,"seller":null,"url":null,"source":null},'
+    '"site_proprio":{"price":null,"freight":null,"seller":null,"url":null,"source":null}'
     "},"
     '"sources":[{"title":"titulo","url":"https://..."}],'
-    '"confidence":"alta|media|baixa"} '
-    "Se nao achar preco, use null. Nao invente URLs. Priorize Brasil."
+    '"confidence":"alta|media|baixa"}'
 )
 
 
@@ -111,15 +114,16 @@ def _build_prompt(product: dict[str, Any]) -> str:
         "id": product.get("id"),
         "name": product.get("name"),
         "code": product.get("code"),
-        "listPrice": product.get("listPrice"),
+        "listPriceAsCost": product.get("listPrice"),
         "stock": product.get("stock"),
         "mercosRevenue90d": product.get("mercosRevenue"),
         "mercosQuantity90d": product.get("mercosQuantity"),
         "mercosOrders90d": product.get("mercosOrders"),
     }
     return (
-        f"Pesquise precos publicos e demanda online para este produto: {hint}.\n"
-        f"Dados internos Mercos (atacado):\n{json.dumps(context, ensure_ascii=False, default=str)}"
+        f"Pesquise anuncios do MESMO produto vendidos por vendedores em cada plataforma: {hint}.\n"
+        f"Custo de compra (preco de tabela Mercos, NAO use como preco de venda): {product.get('listPrice')}.\n"
+        f"Dados internos Mercos:\n{json.dumps(context, ensure_ascii=False, default=str)}"
     )
 
 
@@ -162,58 +166,42 @@ def _call_openai(prompt: str) -> dict:
 
 
 def _heuristic_analysis(product: dict[str, Any], economics: dict[str, Any] | None = None) -> dict:
-    """Fallback when OpenAI is unavailable - still produces usable ranking signals."""
-    list_price = float(product.get("listPrice") or 0)
-    # Assume modest retail markup over wholesale list.
-    retail = round(list_price * 1.35, 2) if list_price else 0.0
-    market_prices = {
-        "mercado_livre": {"price": retail, "freight": 22.0, "source": "heuristica"},
-        "shopee": {"price": round(retail * 0.97, 2), "freight": 18.0, "source": "heuristica"},
-        "tiktok": {"price": round(retail * 0.95, 2), "freight": 20.0, "source": "heuristica"},
-        "nuvemshop": {"price": round(retail * 1.05, 2), "freight": 20.0, "source": "heuristica"},
-        "site_proprio": {"price": round(retail * 1.08, 2), "freight": 20.0, "source": "heuristica"},
-    }
-    channels = evaluate_channels(
-        market_prices=market_prices,
-        list_price=list_price,
-        economics=merge_economics(economics),
-    )
-    best = channels[0] if channels else None
-    platform = (best or {}).get("platform") or "site_proprio"
+    """Fallback without invented retail prices - only Mercos signals."""
+    del economics
     revenue = float(product.get("mercosRevenue") or 0)
     qty = float(product.get("mercosQuantity") or 0)
     potencial = min(100.0, round((revenue / 40_000.0) * 50 + (qty / 400.0) * 40 + 10, 1))
     apelo = "alto" if potencial >= 70 else "medio" if potencial >= 40 else "baixo"
-    margin_pct = (best or {}).get("marginPct")
     return {
         "apelo": apelo,
-        "apeloJustificativa": "Estimativa heuristica com markup padrao sobre preco de tabela",
+        "apeloJustificativa": "Sem busca web: score so com giro Mercos",
         "potencialScore": potencial,
-        "melhorPlataforma": platform,
-        "porquePlataforma": f"Melhor margem estimada em {PLATFORM_LABELS.get(platform, platform)}",
-        "melhorEnvio": (best or {}).get("shippingKey") or "melhor_envio",
-        "envioJustificativa": "Frete medio padrao do canal",
-        "motivoEscolha": (
-            f"Giro atacado R$ {revenue:,.0f} e margem ~{margin_pct:.0f}% no melhor canal"
-            if margin_pct is not None
-            else f"Giro atacado R$ {revenue:,.0f}; analise heuristica"
-        ).replace(",", "."),
+        "melhorPlataforma": "site_proprio",
+        "porquePlataforma": "Sem anuncios reais encontrados ainda",
+        "melhorEnvio": "melhor_envio",
+        "envioJustificativa": "Aguardando precos reais por plataforma",
+        "motivoEscolha": f"Giro atacado R$ {revenue:,.0f}; aguardando precos reais".replace(",", "."),
         "razoes": [
             f"Faturamento Mercos 90d: R$ {revenue:,.0f}".replace(",", "."),
             f"Quantidade vendida: {qty:.0f}",
-            f"Canal sugerido: {PLATFORM_LABELS.get(platform, platform)}",
+            "Preco por plataforma pendente de busca real",
         ],
-        "risco": "medio - precos estimados sem busca web",
-        "marketPrices": market_prices,
+        "risco": "alto - sem precos publicos confirmados",
+        "marketPrices": {},
         "sources": [],
         "confidence": "baixa",
         "heuristic": True,
     }
 
 
-def _normalize_market_prices(raw: Any) -> dict[str, Any]:
+def _normalize_market_prices(raw: Any, *, list_price: float | None = None) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
+    cost = None
+    try:
+        cost = float(list_price) if list_price is not None else None
+    except (TypeError, ValueError):
+        cost = None
     out: dict[str, Any] = {}
     for key, value in raw.items():
         if not isinstance(value, dict):
@@ -224,6 +212,10 @@ def _normalize_market_prices(raw: Any) -> dict[str, Any]:
             price = float(price) if price is not None else None
         except (TypeError, ValueError):
             price = None
+        if price is not None and price <= 0:
+            price = None
+        if price is not None and cost is not None and cost > 0 and abs(price - cost) < 0.01:
+            price = None
         try:
             freight = float(freight) if freight is not None else None
         except (TypeError, ValueError):
@@ -233,19 +225,24 @@ def _normalize_market_prices(raw: Any) -> dict[str, Any]:
             "freight": freight,
             "url": value.get("url"),
             "source": value.get("source"),
+            "seller": value.get("seller"),
             "shippingKey": value.get("shippingKey"),
         }
     return out
 
 
 def _build_scores(product: dict[str, Any], ai_payload: dict, economics: dict | None = None) -> dict:
-    market_prices = _normalize_market_prices(ai_payload.get("marketPrices"))
+    market_prices = _normalize_market_prices(
+        ai_payload.get("marketPrices"),
+        list_price=float(product.get("listPrice") or 0),
+    )
     channels = evaluate_channels(
         market_prices=market_prices,
         list_price=float(product.get("listPrice") or 0),
         economics=merge_economics(economics),
     )
-    best = channels[0] if channels else None
+    priced = [row for row in channels if row.get("hasPrice")]
+    best = priced[0] if priced else None
     platform = ai_payload.get("melhorPlataforma") or (best or {}).get("platform") or "site_proprio"
     shipping = ai_payload.get("melhorEnvio") or (best or {}).get("shippingKey") or "melhor_envio"
     temp = RetailProductAnalysis(
@@ -309,7 +306,7 @@ def analyze_product(
     *,
     refresh: bool = False,
     economics: dict[str, Any] | None = None,
-    allow_heuristic: bool = True,
+    allow_heuristic: bool = False,
 ) -> dict[str, Any]:
     detail = product_analysis_detail(db, product_id, economics=economics)
     row = db.scalar(
@@ -339,7 +336,10 @@ def analyze_product(
         ai_payload = _heuristic_analysis(product, economics)
         used_heuristic = True
 
-    market_prices = _normalize_market_prices(ai_payload.get("marketPrices"))
+    market_prices = _normalize_market_prices(
+        ai_payload.get("marketPrices"),
+        list_price=float(product.get("listPrice") or 0),
+    )
     ai_payload["marketPrices"] = market_prices
     scores = _build_scores(product, ai_payload, economics)
     now = datetime.now(timezone.utc)
@@ -359,18 +359,17 @@ def analyze_product(
 def pending_candidate_ids(
     db: Session,
     *,
-    pool_size: int = CANDIDATE_POOL_SIZE,
+    pool_size: int | None = CANDIDATE_POOL_SIZE,
     refresh_stale: bool = False,
 ) -> list[str]:
     pool = candidate_pool(db, limit=pool_size)
+    product_ids = [item["id"] for item in pool]
     rows = {
         row.product_mercos_id: row
         for row in db.scalars(
-            select(RetailProductAnalysis).where(
-                RetailProductAnalysis.product_mercos_id.in_([item["id"] for item in pool])
-            )
+            select(RetailProductAnalysis).where(RetailProductAnalysis.product_mercos_id.in_(product_ids))
         ).all()
-    }
+    } if product_ids else {}
     pending: list[str] = []
     for item in pool:
         row = rows.get(item["id"])
@@ -385,7 +384,7 @@ def analyze_batch(
     db: Session,
     *,
     limit: int = 10,
-    pool_size: int = CANDIDATE_POOL_SIZE,
+    pool_size: int | None = CANDIDATE_POOL_SIZE,
     refresh: bool = False,
     economics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -400,7 +399,7 @@ def analyze_batch(
                 product_id,
                 refresh=True,
                 economics=economics,
-                allow_heuristic=True,
+                allow_heuristic=False,
             )
             processed.append(
                 {
@@ -415,14 +414,15 @@ def analyze_batch(
             log.exception("Retail batch failed for %s", product_id)
             errors.append({"id": product_id, "error": str(getattr(error, "detail", error))})
 
+    pool = candidate_pool(db, limit=pool_size)
     remaining = pending_candidate_ids(db, pool_size=pool_size)
     return {
         "processed": processed,
         "processedCount": len(processed),
         "errors": errors,
         "pendingCount": len(remaining),
-        "poolSize": pool_size,
-        "analyzedCount": pool_size - len(remaining),
+        "poolSize": len(pool),
+        "analyzedCount": max(0, len(pool) - len(remaining)),
     }
 
 
@@ -435,4 +435,4 @@ def get_or_analyze(
     product = db.scalar(select(Product).where(Product.mercos_id == product_id))
     if not product:
         raise HTTPException(404, "Produto nao encontrado")
-    return analyze_product(db, product_id, refresh=refresh)
+    return analyze_product(db, product_id, refresh=refresh, allow_heuristic=False)

@@ -22,20 +22,18 @@ def get_economics():
 @router.get("/recommended")
 def get_recommended(
     top: int = Query(default=100, ge=1, le=250),
-    poolSize: int = Query(default=250, ge=50, le=500),
     days: int | None = Query(default=90, ge=1, le=365),
     db: Session = Depends(db_session),
 ):
-    return retail_service.recommended_products(db, top=top, pool_size=poolSize, days=days)
+    return retail_service.recommended_products(db, top=top, pool_size=None, days=days)
 
 
 @router.get("/candidates")
 def get_candidates(
-    poolSize: int = Query(default=250, ge=50, le=500),
     days: int | None = Query(default=90, ge=1, le=365),
     db: Session = Depends(db_session),
 ):
-    return retail_service.list_candidates(db, pool_size=poolSize, days=days)
+    return retail_service.list_candidates(db, pool_size=None, days=days)
 
 
 @router.get("/products/{product_id}/analysis")

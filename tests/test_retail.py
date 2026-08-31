@@ -50,6 +50,14 @@ def _seed_products(session: Session):
                 stock=Decimal("5"),
                 active=True,
             ),
+            Product(
+                mercos_id="p-no-sales",
+                code="NS1",
+                name="Produto Sem Venda",
+                list_price=Decimal("30"),
+                stock=Decimal("10"),
+                active=True,
+            ),
             Order(
                 mercos_id="o1",
                 number="1",
@@ -103,35 +111,44 @@ def _seed_products(session: Session):
     session.commit()
 
 
-def test_estimated_cost_and_channel_margin():
-    assert estimated_cost(100, 40) == 60.0
-    margin = channel_margin(
-        retail_price=100,
-        cost=60,
-        fee_pct=16,
-        freight=22,
-        packaging=4,
-    )
-    assert margin["fee"] == 16.0
-    assert margin["netMargin"] == -2.0
-    assert margin["marginPct"] == -2.0
+def test_cost_is_list_price():
+    assert estimated_cost(1000) == 1000.0
+    assert estimated_cost(16.9) == 16.9
 
 
-def test_evaluate_channels_picks_best_margin():
+def test_evaluate_channels_ignores_list_price_as_retail():
     rows = evaluate_channels(
         market_prices={
-            "mercado_livre": {"price": 120},
-            "shopee": {"price": 120},
-            "site_proprio": {"price": 120},
+            "mercado_livre": {"price": 16.9, "seller": "Loja ML"},
+            "shopee": {"price": 16.9, "seller": "Seller SP"},
+            "site_proprio": {"price": 1000},  # same as list -> rejected
+            "nuvemshop": {"price": 1000},
+            "tiktok": {},
         },
-        list_price=100,
-        economics={"custoPct": 40},
+        list_price=1000,
+        economics={},
     )
-    assert rows[0]["platform"] in {"site_proprio", "nuvemshop", "tiktok"}
-    assert rows[0]["marginPct"] >= rows[-1]["marginPct"]
+    priced = [row for row in rows if row["hasPrice"]]
+    assert len(priced) == 2
+    assert priced[0]["cost"] == 1000.0
+    assert all(row["retailPrice"] != 1000 for row in priced)
+    missing = [row for row in rows if not row["hasPrice"]]
+    assert len(missing) == 3
 
 
-def test_recommended_orders_by_recommendation_not_mercos_revenue():
+def test_channel_margin_with_table_cost():
+    margin = channel_margin(
+        retail_price=180,
+        cost=100,
+        fee_pct=3.5,
+        freight=20,
+        packaging=4,
+    )
+    assert margin["cost"] == 100
+    assert margin["netMargin"] == 49.7
+
+
+def test_recommended_uses_full_catalog_and_real_prices():
     session = _session()
     _seed_products(session)
     now = datetime.now(timezone.utc)
@@ -141,52 +158,24 @@ def test_recommended_orders_by_recommendation_not_mercos_revenue():
             ai_payload={
                 "apelo": "alto",
                 "potencialScore": 90,
-                "melhorPlataforma": "site_proprio",
-                "melhorEnvio": "melhor_envio",
-                "motivoEscolha": "Alta margem no site proprio",
-                "razoes": ["Apelo alto", "Margem forte"],
+                "melhorPlataforma": "shopee",
+                "melhorEnvio": "shopee_entrega",
+                "motivoEscolha": "Boa margem no anuncio real",
+                "razoes": ["Apelo alto"],
                 "confidence": "alta",
                 "sources": [],
             },
             market_prices={
-                "site_proprio": {"price": 180, "freight": 15},
-                "mercado_livre": {"price": 160, "freight": 22},
-                "shopee": {"price": 155, "freight": 18},
+                "shopee": {"price": 180, "freight": 18, "seller": "Loja Shopee"},
+                "mercado_livre": {"price": 175, "freight": 22, "seller": "Loja ML"},
+                "site_proprio": {"price": 100},  # equals cost -> ignored
             },
             scores={
                 "potencialScore": 90,
                 "appealScore": 90,
-                "bestPlatform": "site_proprio",
-                "bestShipping": "melhor_envio",
-                "reasonShort": "Alta margem no site proprio",
-                "reasonDetail": ["Apelo alto", "Margem forte"],
-            },
-            generated_at=now,
-            created_at=now,
-            updated_at=now,
-        )
-    )
-    session.add(
-        RetailProductAnalysis(
-            product_mercos_id="p-high-revenue",
-            ai_payload={
-                "apelo": "medio",
-                "potencialScore": 55,
-                "melhorPlataforma": "mercado_livre",
-                "motivoEscolha": "Giro alto mas margem fraca",
-                "razoes": ["Giro alto"],
-                "confidence": "media",
-            },
-            market_prices={
-                "mercado_livre": {"price": 85, "freight": 22},
-                "shopee": {"price": 82, "freight": 18},
-                "site_proprio": {"price": 90, "freight": 20},
-            },
-            scores={
-                "potencialScore": 55,
-                "appealScore": 55,
-                "bestPlatform": "mercado_livre",
-                "reasonShort": "Giro alto mas margem fraca",
+                "bestPlatform": "shopee",
+                "bestShipping": "shopee_entrega",
+                "reasonShort": "Boa margem no anuncio real",
             },
             generated_at=now,
             created_at=now,
@@ -204,19 +193,22 @@ def test_recommended_orders_by_recommendation_not_mercos_revenue():
             response = client.get("/api/v1/retail/recommended?top=10")
             assert response.status_code == 200
             body = response.json()
+            assert body["poolSize"] == 4  # full active catalog including no-sales
             assert body["items"][0]["id"] == "p-high-margin"
-            assert body["items"][0]["melhorPlataforma"] == "site_proprio"
-            assert "motivoCurto" in body["items"][0]
-            assert body["analyzedCount"] == 2
+            assert body["items"][0]["custo"] == 100.0
+            assert body["items"][0]["custoEstimado"] == 100.0
+            priced = [c for c in body["items"][0]["channels"] if c.get("hasPrice")]
+            assert priced
+            assert all(c["retailPrice"] != 100 for c in priced)
             economics = client.get("/api/v1/retail/economics")
             assert economics.status_code == 200
-            assert economics.json()["custoPct"] == 40
+            assert economics.json()["costMode"] == "list_price"
     finally:
         app.dependency_overrides.clear()
         session.close()
 
 
-def test_analyze_batch_uses_heuristic_without_openai(monkeypatch):
+def test_analyze_batch_does_not_invent_prices_without_openai(monkeypatch):
     session = _session()
     _seed_products(session)
 
@@ -225,21 +217,16 @@ def test_analyze_batch_uses_heuristic_without_openai(monkeypatch):
 
     app.dependency_overrides[db_session] = override_db
     try:
-        with patch("app.services.retail_analysis._call_openai") as mocked:
-            mocked.side_effect = Exception("should not call when key missing path uses heuristic")
-            # Force heuristic via HTTPException path inside analyze_product
-            from fastapi import HTTPException
+        from fastapi import HTTPException
 
+        with patch("app.services.retail_analysis._call_openai") as mocked:
             mocked.side_effect = HTTPException(503, "OPENAI_API_KEY nao configurada")
             with TestClient(app) as client:
                 response = client.post("/api/v1/retail/analyze-batch", json={"limit": 2})
                 assert response.status_code == 200
                 body = response.json()
-                assert body["processedCount"] == 2
-                assert all(item.get("heuristic") for item in body["processed"])
-                recommended = client.get("/api/v1/retail/recommended?top=10")
-                assert recommended.status_code == 200
-                assert recommended.json()["analyzedCount"] >= 2
+                assert body["processedCount"] == 0
+                assert len(body["errors"]) == 2
     finally:
         app.dependency_overrides.clear()
         session.close()
