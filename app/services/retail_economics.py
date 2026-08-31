@@ -129,8 +129,11 @@ def evaluate_channels(
     market_prices: dict[str, Any] | None,
     list_price: float,
     economics: dict[str, Any],
+    product_units: int = 1,
 ) -> list[dict[str, Any]]:
     """Build channel rows. Retail price only from real listings - never list_price."""
+    from app.services.retail_pack import normalize_listing_price
+
     eco = merge_economics(economics)
     cost = estimated_cost(list_price)
     packaging = float(eco["packagingCost"])
@@ -138,7 +141,17 @@ def evaluate_channels(
     rows: list[dict[str, Any]] = []
     for key, platform in eco["platforms"].items():
         raw = prices.get(key) if isinstance(prices.get(key), dict) else {}
-        retail_price = _parse_price(raw.get("price"))
+        raw_price = _parse_price(raw.get("price"))
+        listing_units = raw.get("units") or raw.get("packUnits") or raw.get("quantity")
+        try:
+            listing_units = int(listing_units) if listing_units is not None else None
+        except (TypeError, ValueError):
+            listing_units = None
+        retail_price, pack_meta = normalize_listing_price(
+            listing_price=raw_price,
+            listing_units=listing_units,
+            product_units=product_units,
+        )
         # Reject listing that is just a copy of Mercos table price (not a retail sale).
         if retail_price is not None and cost > 0 and abs(retail_price - cost) < 0.01:
             retail_price = None
@@ -163,12 +176,15 @@ def evaluate_channels(
                     "seller": raw.get("seller"),
                     "hasPrice": False,
                     "retailPrice": None,
+                    "rawListingPrice": raw_price,
                     "cost": cost,
                     "fee": None,
                     "freight": freight,
                     "packaging": packaging,
                     "netMargin": None,
                     "marginPct": None,
+                    "pack": pack_meta,
+                    "rejectReason": pack_meta.get("rejectReason") or raw.get("rejectReason"),
                 }
             )
             continue
@@ -191,6 +207,8 @@ def evaluate_channels(
                 "url": raw.get("url"),
                 "seller": raw.get("seller"),
                 "hasPrice": True,
+                "rawListingPrice": raw_price,
+                "pack": pack_meta,
                 **margin,
             }
         )
@@ -198,6 +216,7 @@ def evaluate_channels(
     rows.sort(
         key=lambda row: (
             1 if row.get("hasPrice") else 0,
+            1 if (row.get("pack") or {}).get("packMatch") else 0,
             float(row["marginPct"]) if row.get("marginPct") is not None else -9999.0,
             float(row["netMargin"]) if row.get("netMargin") is not None else -9999.0,
         ),

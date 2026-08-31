@@ -24,37 +24,50 @@ from app.services.retail import (
     product_analysis_detail,
 )
 from app.services.retail_economics import evaluate_channels, merge_economics
+from app.services.retail_pack import detect_pack_units
+from app.cache.redis_cache import invalidate_retail_lists, cache_set, RETAIL_ANALYSIS_PREFIX
 
 log = logging.getLogger(__name__)
 
 INSTRUCTIONS = (
     "Voce e um analista de varejo B2C no Brasil (XNamai). "
     "O preco de tabela Mercos e o CUSTO de compra, NAO o preco de venda ao consumidor. "
-    "Pesquise anuncios PUBLICOS do MESMO produto (mesmo nome/codigo) vendidos por vendedores "
+    "Pesquise anuncios PUBLICOS do MESMO produto vendidos por vendedores "
     "em Mercado Livre, Shopee, TikTok Shop, Nuvemshop e lojas/site proprio. "
-    "Para cada plataforma, informe o preco que o consumidor paga no anuncio, o vendedor/loja e a URL. "
-    "NUNCA copie o preco de tabela Mercos como preco de venda. Se nao achar anuncio, use null. "
+    "COMPARACAO DE QUANTIDADE: se o produto interno for pack/kit (ex.: pacote com 7), "
+    "so aceite anuncios com a MESMA quantidade de unidades. "
+    "Se achar apenas combo maior/menor, informe units do anuncio e price do anuncio; "
+    "nao misture pack de 7 com unidade avulsa como se fossem iguais. "
+    "NUNCA copie o preco de tabela Mercos como preco de venda. Se nao achar, use null. "
     "Nao invente precos nem URLs. "
+    "Explique com clareza POR QUE o canal indicado e melhor (alcance, taxa, margem, frete, demanda). "
     "Responda SOMENTE com JSON valido (sem markdown), neste formato: "
     '{"apelo":"alto|medio|baixo","apeloJustificativa":"texto",'
     '"potencialScore":75,'
     '"melhorPlataforma":"mercado_livre|shopee|tiktok|nuvemshop|site_proprio",'
-    '"porquePlataforma":"frase curta",'
+    '"porquePlataforma":"resumo curto",'
+    '"porqueCanalDetalhe":"paragrafo explicando por que este canal vs alternativas",'
+    '"comparativoCanais":['
+    '{"plataforma":"mercado_livre","pros":["..."],"contras":["..."],"veredito":"melhor|boa|evitar"},'
+    '{"plataforma":"site_proprio","pros":["..."],"contras":["..."],"veredito":"boa"}'
+    "],"
     '"melhorEnvio":"mercado_envios|shopee_entrega|melhor_envio|correios_pac|correios_sedex",'
     '"envioJustificativa":"texto",'
     '"motivoEscolha":"frase curta do porque indicar no Top 100 varejo",'
     '"razoes":["razao 1","razao 2"],'
     '"risco":"baixo|medio|alto - detalhe",'
+    '"productUnits":7,'
     '"marketPrices":{'
-    '"mercado_livre":{"price":99.9,"freight":22,"seller":"Loja X","url":"https://...","source":"Mercado Livre"},'
-    '"shopee":{"price":95.0,"freight":18,"seller":"Seller Y","url":"https://...","source":"Shopee"},'
-    '"tiktok":{"price":null,"freight":null,"seller":null,"url":null,"source":null},'
-    '"nuvemshop":{"price":null,"freight":null,"seller":null,"url":null,"source":null},'
-    '"site_proprio":{"price":null,"freight":null,"seller":null,"url":null,"source":null}'
+    '"mercado_livre":{"price":99.9,"units":7,"freight":22,"seller":"Loja X","url":"https://...","source":"Mercado Livre","packMatch":true},'
+    '"shopee":{"price":95.0,"units":7,"freight":18,"seller":"Seller Y","url":"https://...","source":"Shopee","packMatch":true},'
+    '"tiktok":{"price":null,"units":null,"freight":null,"seller":null,"url":null,"source":null},'
+    '"nuvemshop":{"price":null,"units":null,"freight":null,"seller":null,"url":null,"source":null},'
+    '"site_proprio":{"price":null,"units":null,"freight":null,"seller":null,"url":null,"source":null}'
     "},"
     '"sources":[{"title":"titulo","url":"https://..."}],'
     '"confidence":"alta|media|baixa"}'
 )
+
 
 
 def _iso(value) -> str | None:
@@ -107,6 +120,7 @@ def _parse_analysis(text: str) -> dict:
 
 
 def _build_prompt(product: dict[str, Any]) -> str:
+    units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
     hint = " ".join(
         part for part in [product.get("name"), product.get("code"), "Brasil varejo"] if part
     )
@@ -115,14 +129,17 @@ def _build_prompt(product: dict[str, Any]) -> str:
         "name": product.get("name"),
         "code": product.get("code"),
         "listPriceAsCost": product.get("listPrice"),
+        "packUnits": units,
         "stock": product.get("stock"),
         "mercosRevenue90d": product.get("mercosRevenue"),
         "mercosQuantity90d": product.get("mercosQuantity"),
         "mercosOrders90d": product.get("mercosOrders"),
     }
     return (
-        f"Pesquise anuncios do MESMO produto vendidos por vendedores em cada plataforma: {hint}.\n"
+        f"Pesquise anuncios do MESMO produto e MESMA quantidade ({units} unidade(s)) "
+        f"vendidos por vendedores em cada plataforma: {hint}.\n"
         f"Custo de compra (preco de tabela Mercos, NAO use como preco de venda): {product.get('listPrice')}.\n"
+        f"Se so achar combo com quantidade diferente, preencha units do anuncio e diga que nao e packMatch.\n"
         f"Dados internos Mercos:\n{json.dumps(context, ensure_ascii=False, default=str)}"
     )
 
@@ -194,7 +211,7 @@ def _heuristic_analysis(product: dict[str, Any], economics: dict[str, Any] | Non
     }
 
 
-def _normalize_market_prices(raw: Any, *, list_price: float | None = None) -> dict[str, Any]:
+def _normalize_market_prices(raw: Any, *, list_price: float | None = None, product_units: int = 1) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
     cost = None
@@ -220,26 +237,36 @@ def _normalize_market_prices(raw: Any, *, list_price: float | None = None) -> di
             freight = float(freight) if freight is not None else None
         except (TypeError, ValueError):
             freight = None
+        units = value.get("units") or value.get("packUnits") or value.get("quantity")
+        try:
+            units = int(units) if units is not None else None
+        except (TypeError, ValueError):
+            units = None
         out[str(key)] = {
             "price": price,
+            "units": units,
             "freight": freight,
             "url": value.get("url"),
             "source": value.get("source"),
             "seller": value.get("seller"),
             "shippingKey": value.get("shippingKey"),
+            "packMatch": value.get("packMatch"),
         }
     return out
 
 
 def _build_scores(product: dict[str, Any], ai_payload: dict, economics: dict | None = None) -> dict:
+    units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
     market_prices = _normalize_market_prices(
         ai_payload.get("marketPrices"),
         list_price=float(product.get("listPrice") or 0),
+        product_units=units,
     )
     channels = evaluate_channels(
         market_prices=market_prices,
         list_price=float(product.get("listPrice") or 0),
         economics=merge_economics(economics),
+        product_units=units,
     )
     priced = [row for row in channels if row.get("hasPrice")]
     best = priced[0] if priced else None
@@ -324,6 +351,7 @@ def analyze_product(
         "mercosRevenue": detail["mercosRevenue"],
         "mercosQuantity": detail["mercosQuantity"],
         "mercosOrders": detail["mercosOrders"],
+        "packUnits": detect_pack_units(detail.get("name"), detail.get("code")),
     }
 
     used_heuristic = False
@@ -336,9 +364,11 @@ def analyze_product(
         ai_payload = _heuristic_analysis(product, economics)
         used_heuristic = True
 
+    units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
     market_prices = _normalize_market_prices(
         ai_payload.get("marketPrices"),
         list_price=float(product.get("listPrice") or 0),
+        product_units=units,
     )
     ai_payload["marketPrices"] = market_prices
     scores = _build_scores(product, ai_payload, economics)
@@ -353,6 +383,11 @@ def analyze_product(
     db.commit()
 
     refreshed = product_analysis_detail(db, product_id, economics=economics)
+    try:
+        cache_set(f"{RETAIL_ANALYSIS_PREFIX}{product_id}", refreshed, ttl_seconds=3600)
+        invalidate_retail_lists()
+    except Exception:
+        pass
     return {**refreshed, "cached": False, "heuristic": used_heuristic}
 
 

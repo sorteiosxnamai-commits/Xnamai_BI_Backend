@@ -1,9 +1,10 @@
-"""Async retail analysis jobs with per-product commit, heartbeat and resume."""
+"""Async retail analysis jobs with parallel workers, heartbeat and resume."""
 
 from __future__ import annotations
 
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -12,16 +13,19 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.analytics import _aware
+from app.cache.redis_cache import RETAIL_JOB_KEY, cache_set, invalidate_retail_lists
+from app.config import settings
 from app.database import SessionLocal
 from app.models import RetailAnalysisJob
 from app.services.retail_analysis import analyze_product, pending_candidate_ids
 
 log = logging.getLogger(__name__)
 
-HEARTBEAT_STALE = timedelta(minutes=4)
+HEARTBEAT_STALE = timedelta(minutes=6)
 ACTIVE_STATUSES = ("queued", "running")
 RESUMABLE_STATUSES = ("interrupted", "failed")
 _worker_lock = threading.Lock()
+_job_db_lock = threading.Lock()
 _running_job_ids: set[int] = set()
 
 
@@ -34,6 +38,13 @@ def _iso(value) -> str | None:
     return aware.isoformat() if aware else None
 
 
+def _concurrency(job: RetailAnalysisJob | None = None) -> int:
+    configured = int(getattr(settings(), "retail_concurrency", 5) or 5)
+    batch = int((job.batch_size if job else 5) or 5)
+    # batch_size doubles as preferred parallelism hint (capped).
+    return max(1, min(12, configured, max(batch, 3)))
+
+
 def job_payload(job: RetailAnalysisJob, *, catalog_pending: int | None = None) -> dict[str, Any]:
     total = len(job.product_ids or [])
     cursor = int(job.cursor or 0)
@@ -43,6 +54,7 @@ def job_payload(job: RetailAnalysisJob, *, catalog_pending: int | None = None) -
         "status": job.status,
         "mode": job.mode,
         "batchSize": job.batch_size,
+        "concurrency": _concurrency(job),
         "total": total,
         "cursor": cursor,
         "processed": job.processed,
@@ -65,7 +77,6 @@ def job_payload(job: RetailAnalysisJob, *, catalog_pending: int | None = None) -
 
 
 def reclaim_stale_jobs(db: Session) -> int:
-    """Mark running/queued jobs without fresh heartbeat as interrupted."""
     now = _now()
     changed = 0
     rows = list(
@@ -75,7 +86,6 @@ def reclaim_stale_jobs(db: Session) -> int:
         heartbeat = _aware(job.heartbeat_at) or _aware(job.updated_at) or _aware(job.started_at)
         if heartbeat and (now - heartbeat) < HEARTBEAT_STALE:
             continue
-        # Still claimed by this process worker?
         if job.id in _running_job_ids and heartbeat and (now - heartbeat) < HEARTBEAT_STALE:
             continue
         job.status = "interrupted"
@@ -87,6 +97,7 @@ def reclaim_stale_jobs(db: Session) -> int:
         changed += 1
     if changed:
         db.commit()
+        invalidate_retail_lists()
     return changed
 
 
@@ -129,7 +140,6 @@ def start_job(
     batch_size: int = 10,
     resume: bool = True,
 ) -> tuple[RetailAnalysisJob, bool]:
-    """Create or resume a job. Returns (job, created_new)."""
     mode = mode if mode in {"batch", "all"} else "batch"
     batch_size = max(1, min(50, int(batch_size)))
     reclaim_stale_jobs(db)
@@ -154,6 +164,7 @@ def start_job(
                 last_error=None,
                 current_product_id=None,
             )
+            invalidate_retail_lists()
             return resumable, False
 
     pending = pending_candidate_ids(db, pool_size=None)
@@ -183,6 +194,7 @@ def start_job(
     db.add(job)
     db.commit()
     db.refresh(job)
+    invalidate_retail_lists()
     return job, True
 
 
@@ -198,6 +210,7 @@ def cancel_job(db: Session, job_id: int) -> RetailAnalysisJob:
         current_product_id=None,
         last_error="Cancelado pelo usuario",
     )
+    invalidate_retail_lists()
     return job
 
 
@@ -208,8 +221,53 @@ def _append_error(job: RetailAnalysisJob, product_id: str, message: str) -> None
     job.last_error = message[:500]
 
 
+def _claim_next(job_id: int) -> str | None:
+    """Atomically claim next product id for parallel workers."""
+    with _job_db_lock:
+        with SessionLocal() as db:
+            job = db.scalar(select(RetailAnalysisJob).where(RetailAnalysisJob.id == job_id))
+            if not job or job.status == "cancelled":
+                return None
+            ids = list(job.product_ids or [])
+            cursor = int(job.cursor or 0)
+            if cursor >= len(ids):
+                return None
+            product_id = ids[cursor]
+            job.cursor = cursor + 1
+            job.current_product_id = product_id
+            job.status = "running"
+            job.heartbeat_at = _now()
+            job.updated_at = _now()
+            db.add(job)
+            db.commit()
+            return product_id
+
+
+def _record_result(job_id: int, product_id: str, *, ok: bool, error: str | None = None) -> None:
+    with _job_db_lock:
+        with SessionLocal() as db:
+            job = db.scalar(select(RetailAnalysisJob).where(RetailAnalysisJob.id == job_id))
+            if not job:
+                return
+            if ok:
+                job.processed = int(job.processed or 0) + 1
+            else:
+                job.failed = int(job.failed or 0) + 1
+                _append_error(job, product_id, error or "erro")
+            job.heartbeat_at = _now()
+            job.updated_at = _now()
+            db.add(job)
+            db.commit()
+    invalidate_retail_lists()
+
+
+def _analyze_one(product_id: str) -> None:
+    with SessionLocal() as db:
+        analyze_product(db, product_id, refresh=False, allow_heuristic=False)
+
+
 def run_job_worker(job_id: int) -> None:
-    """Process one product at a time with commit + heartbeat (safe to resume)."""
+    """Process products in parallel with per-item commit and resume-safe cursor."""
     with _worker_lock:
         if job_id in _running_job_ids:
             return
@@ -223,10 +281,9 @@ def run_job_worker(job_id: int) -> None:
             if job.status == "cancelled":
                 return
             if job.status not in ACTIVE_STATUSES and job.status not in RESUMABLE_STATUSES:
-                # Allow queued/running only; interrupted needs start_job resume first
                 if job.status != "queued":
                     return
-
+            workers = _concurrency(job)
             _touch(
                 db,
                 job,
@@ -235,40 +292,39 @@ def run_job_worker(job_id: int) -> None:
                 finished_at=None,
             )
 
-            ids = list(job.product_ids or [])
+        def worker_loop() -> None:
             while True:
-                db.refresh(job)
-                if job.status == "cancelled":
-                    break
-                cursor = int(job.cursor or 0)
-                if cursor >= len(ids):
-                    break
-
-                product_id = ids[cursor]
-                _touch(db, job, current_product_id=product_id, status="running")
-
+                with SessionLocal() as db:
+                    job = db.scalar(select(RetailAnalysisJob).where(RetailAnalysisJob.id == job_id))
+                    if not job or job.status == "cancelled":
+                        return
+                product_id = _claim_next(job_id)
+                if not product_id:
+                    return
                 try:
-                    analyze_product(
-                        db,
-                        product_id,
-                        refresh=False,
-                        allow_heuristic=False,
-                    )
-                    job.processed = int(job.processed or 0) + 1
+                    _analyze_one(product_id)
+                    _record_result(job_id, product_id, ok=True)
                 except Exception as error:  # noqa: BLE001
-                    message = str(getattr(error, "detail", error))
                     log.exception("Retail job %s failed on %s", job_id, product_id)
-                    job.failed = int(job.failed or 0) + 1
-                    _append_error(job, product_id, message)
+                    _record_result(
+                        job_id,
+                        product_id,
+                        ok=False,
+                        error=str(getattr(error, "detail", error)),
+                    )
 
-                job.cursor = cursor + 1
-                job.current_product_id = None
-                job.heartbeat_at = _now()
-                job.updated_at = _now()
-                db.add(job)
-                db.commit()
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"retail-{job_id}") as pool:
+            futures = [pool.submit(worker_loop) for _ in range(workers)]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:  # noqa: BLE001
+                    log.exception("Retail worker crashed for job %s", job_id)
 
-            db.refresh(job)
+        with SessionLocal() as db:
+            job = db.scalar(select(RetailAnalysisJob).where(RetailAnalysisJob.id == job_id))
+            if not job:
+                return
             if job.status != "cancelled":
                 _touch(
                     db,
@@ -277,26 +333,29 @@ def run_job_worker(job_id: int) -> None:
                     finished_at=_now(),
                     current_product_id=None,
                 )
-
-            # Auto-chain next batch when mode=all still has catalog pending
-            if job.mode == "all" and job.status == "completed":
+            # Auto-chain remaining catalog in all-mode
+            if job.mode == "all" and job.status == "completed" and int(job.processed or 0) > 0:
                 remaining = pending_candidate_ids(db, pool_size=None)
                 if remaining:
-                    next_job, _ = start_job(db, mode="all", batch_size=job.batch_size or 10, resume=False)
-                    # Recursion via new background thread to avoid deep stack
+                    next_job, _ = start_job(
+                        db,
+                        mode="all",
+                        batch_size=job.batch_size or 10,
+                        resume=False,
+                    )
                     threading.Thread(
                         target=run_job_worker,
                         args=(next_job.id,),
                         daemon=True,
                         name=f"retail-job-{next_job.id}",
                     ).start()
+        invalidate_retail_lists()
     finally:
         with _worker_lock:
             _running_job_ids.discard(job_id)
 
 
 def enqueue_job_worker(job_id: int) -> None:
-    """Start worker in a daemon thread (survives HTTP response)."""
     thread = threading.Thread(
         target=run_job_worker,
         args=(job_id,),
@@ -311,13 +370,15 @@ def status_snapshot(db: Session, job: RetailAnalysisJob | None = None) -> dict[s
     job = job or get_active_job(db) or latest_job(db)
     pending = len(pending_candidate_ids(db, pool_size=None))
     if not job:
-        return {
-            "job": None,
+        payload = {"job": None, "catalogPending": pending, "hasActiveJob": False}
+    else:
+        payload = {
+            "job": job_payload(job, catalog_pending=pending),
             "catalogPending": pending,
-            "hasActiveJob": False,
+            "hasActiveJob": job.status in ACTIVE_STATUSES,
         }
-    return {
-        "job": job_payload(job, catalog_pending=pending),
-        "catalogPending": pending,
-        "hasActiveJob": job.status in ACTIVE_STATUSES,
-    }
+    try:
+        cache_set(RETAIL_JOB_KEY, payload, ttl_seconds=15)
+    except Exception:
+        pass
+    return payload
