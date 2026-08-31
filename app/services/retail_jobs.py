@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.analytics import _aware
@@ -57,16 +57,47 @@ def _concurrency(job: RetailAnalysisJob | None = None) -> int:
     return _concurrency_hint(batch)
 
 
+def _job_done_count(job: RetailAnalysisJob) -> int:
+    return int(job.processed or 0) + int(job.failed or 0) + int(job.skipped or 0)
+
+
 def job_payload(
     job: RetailAnalysisJob,
     *,
     catalog_pending: int | None = None,
     catalog_analyzed: int | None = None,
     catalog_pool: int | None = None,
+    batch_number: int | None = None,
+    estimated_batches_remaining: int | None = None,
 ) -> dict[str, Any]:
     total = len(job.product_ids or [])
     cursor = int(job.cursor or 0)
-    remaining_in_job = max(0, total - cursor)
+    done = _job_done_count(job)
+    remaining_in_job = max(0, total - done)
+    claimed_remaining = max(0, total - cursor)
+    # Progress by finished items (not only claimed cursor) so 200/200 claimed != 100% done.
+    progress_pct = round((done / total) * 100, 1) if total else 100.0
+    claim_pct = round((cursor / total) * 100, 1) if total else 100.0
+
+    if job.status == "queued":
+        phase = "queued"
+        phase_label = "Lote na fila"
+    elif job.status in ACTIVE_STATUSES and cursor >= total > 0 and done < total:
+        phase = "finishing"
+        phase_label = "Finalizando buscas do lote (aguardando IA)"
+    elif job.status in ACTIVE_STATUSES:
+        phase = "running"
+        phase_label = "Analisando lote atual"
+    elif job.status == "completed":
+        phase = "completed"
+        phase_label = "Lote concluido"
+    elif job.status in RESUMABLE_STATUSES:
+        phase = "interrupted"
+        phase_label = "Lote interrompido (retomavel)"
+    else:
+        phase = job.status
+        phase_label = str(job.status)
+
     return {
         "id": job.id,
         "status": job.status,
@@ -75,11 +106,18 @@ def job_payload(
         "concurrency": _concurrency(job),
         "total": total,
         "cursor": cursor,
+        "done": done,
         "processed": job.processed,
         "failed": job.failed,
         "skipped": job.skipped,
         "remainingInJob": remaining_in_job,
-        "progressPct": round((cursor / total) * 100, 1) if total else 100.0,
+        "claimedRemaining": claimed_remaining,
+        "progressPct": progress_pct,
+        "claimPct": claim_pct,
+        "phase": phase,
+        "phaseLabel": phase_label,
+        "batchNumber": batch_number,
+        "estimatedBatchesRemaining": estimated_batches_remaining,
         "currentProductId": job.current_product_id,
         "lastError": job.last_error,
         "errors": (job.errors or [])[-10:],
@@ -91,9 +129,49 @@ def job_payload(
         "finishedAt": _iso(job.finished_at),
         "createdAt": _iso(job.created_at),
         "updatedAt": _iso(job.updated_at),
-        "resumable": job.status in RESUMABLE_STATUSES and remaining_in_job > 0,
+        "resumable": job.status in RESUMABLE_STATUSES and cursor < total,
         "running": job.status in ACTIVE_STATUSES,
     }
+
+
+def _batch_number(db: Session, job: RetailAnalysisJob) -> int:
+    prior = int(
+        db.scalar(
+            select(func.count())
+            .select_from(RetailAnalysisJob)
+            .where(
+                RetailAnalysisJob.mode == "all",
+                RetailAnalysisJob.id <= job.id,
+            )
+        )
+        or 0
+    )
+    return max(1, prior)
+
+
+def _recent_batches(db: Session, *, limit: int = 5) -> list[dict[str, Any]]:
+    rows = list(
+        db.scalars(select(RetailAnalysisJob).order_by(RetailAnalysisJob.id.desc()).limit(limit))
+    )
+    out: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        total = len(row.product_ids or [])
+        done = _job_done_count(row)
+        out.append(
+            {
+                "id": row.id,
+                "status": row.status,
+                "mode": row.mode,
+                "total": total,
+                "done": done,
+                "processed": int(row.processed or 0),
+                "failed": int(row.failed or 0),
+                "progressPct": round((done / total) * 100, 1) if total else 100.0,
+                "finishedAt": _iso(row.finished_at),
+                "startedAt": _iso(row.started_at),
+            }
+        )
+    return out
 
 
 def reclaim_stale_jobs(db: Session) -> int:
@@ -356,7 +434,7 @@ def run_job_worker(job_id: int) -> None:
                     current_product_id=None,
                 )
             # Auto-chain next chunk while catalog still has pending items.
-            if job.mode == "all" and job.status == "completed" and int(job.processed or 0) > 0:
+            if job.mode == "all" and job.status == "completed":
                 progress = catalog_progress(db)
                 if progress["pendingCount"] > 0:
                     next_job, created = start_job(
@@ -390,29 +468,74 @@ def status_snapshot(db: Session, job: RetailAnalysisJob | None = None) -> dict[s
     pending = progress["pendingCount"]
     analyzed = progress["analyzedCount"]
     pool = progress["poolSize"]
-    if not job:
-        payload = {
-            "job": None,
-            "catalogPending": pending,
-            "catalogAnalyzed": analyzed,
-            "catalogPoolSize": pool,
-            "hasActiveJob": False,
-        }
+    catalog_pct = round((analyzed / pool) * 100, 1) if pool else 0.0
+    recent = _recent_batches(db, limit=6)
+
+    chaining = False
+    phase = "idle"
+    phase_label = "Aguardando inicio"
+    batch_number = None
+    estimated_remaining = None
+    chunk = JOB_CHUNK_MAX
+    if job:
+        chunk = max(1, len(job.product_ids or []) or _job_chunk_size(int(job.batch_size or 10)))
+        batch_number = _batch_number(db, job)
+        estimated_remaining = int((pending + chunk - 1) // chunk) if pending else 0
+        job_body = job_payload(
+            job,
+            catalog_pending=pending,
+            catalog_analyzed=analyzed,
+            catalog_pool=pool,
+            batch_number=batch_number,
+            estimated_batches_remaining=estimated_remaining,
+        )
+        phase = job_body["phase"]
+        phase_label = job_body["phaseLabel"]
+        # Between lots: completed all-mode job with catalog still pending and no active worker yet.
+        if (
+            job.mode == "all"
+            and job.status == "completed"
+            and pending > 0
+            and get_active_job(db) is None
+        ):
+            chaining = True
+            phase = "chaining"
+            phase_label = "Preparando proximo lote..."
+            job_body = {
+                **job_body,
+                "phase": phase,
+                "phaseLabel": phase_label,
+            }
+        elif job.status in ACTIVE_STATUSES:
+            chaining = False
     else:
-        payload = {
-            "job": job_payload(
-                job,
-                catalog_pending=pending,
-                catalog_analyzed=analyzed,
-                catalog_pool=pool,
-            ),
-            "catalogPending": pending,
-            "catalogAnalyzed": analyzed,
-            "catalogPoolSize": pool,
-            "hasActiveJob": job.status in ACTIVE_STATUSES,
-        }
+        job_body = None
+
+    payload = {
+        "job": job_body,
+        "catalogPending": pending,
+        "catalogAnalyzed": analyzed,
+        "catalogPoolSize": pool,
+        "catalogPct": catalog_pct,
+        "hasActiveJob": bool(job and job.status in ACTIVE_STATUSES),
+        "chainingNextBatch": chaining,
+        "pipeline": {
+            "phase": phase,
+            "phaseLabel": phase_label,
+            "batchNumber": batch_number,
+            "estimatedBatchesRemaining": estimated_remaining,
+            "chunkSize": chunk,
+            "recentBatches": recent,
+            "catalog": {
+                "analyzed": analyzed,
+                "pending": pending,
+                "poolSize": pool,
+                "pct": catalog_pct,
+            },
+        },
+    }
     try:
-        cache_set(RETAIL_JOB_KEY, payload, ttl_seconds=15)
+        cache_set(RETAIL_JOB_KEY, payload, ttl_seconds=8)
     except Exception:
         pass
     return payload
