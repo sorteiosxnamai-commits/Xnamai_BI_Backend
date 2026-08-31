@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -24,23 +25,67 @@ from app.services.retail import (
     product_analysis_detail,
 )
 from app.services.retail_economics import evaluate_channels, merge_economics
+from app.services.retail_listings import collapse_platform_market_price
 from app.services.retail_pack import detect_pack_units
 from app.cache.redis_cache import invalidate_retail_lists, cache_set, RETAIL_ANALYSIS_PREFIX
 
 log = logging.getLogger(__name__)
 
-INSTRUCTIONS = (
+PLATFORM_KEYS = (
+    "mercado_livre",
+    "shopee",
+    "tiktok",
+    "nuvemshop",
+    "site_proprio",
+)
+
+PLATFORM_SEARCH_HINTS = {
+    "mercado_livre": {
+        "label": "Mercado Livre",
+        "sites": "mercadolivre.com.br OR mercadolivre.com",
+        "queryHint": "site:mercadolivre.com.br",
+    },
+    "shopee": {
+        "label": "Shopee",
+        "sites": "shopee.com.br",
+        "queryHint": "site:shopee.com.br",
+    },
+    "tiktok": {
+        "label": "TikTok Shop",
+        "sites": "shop.tiktok.com OR tiktok.com",
+        "queryHint": "TikTok Shop Brasil",
+    },
+    "nuvemshop": {
+        "label": "Nuvemshop",
+        "sites": "nuvemshop.com.br OR lojaintegrada.com.br",
+        "queryHint": "Nuvemshop Brasil",
+    },
+    "site_proprio": {
+        "label": "Site proprio / loja oficial",
+        "sites": "loja oficial OR site da marca",
+        "queryHint": "loja oficial Brasil",
+    },
+}
+
+PLATFORM_SEARCH_INSTRUCTIONS = (
+    "Voce e um pesquisador de precos de varejo B2C no Brasil. "
+    "Use web_search. Foque SOMENTE na plataforma pedida. "
+    "Encontre no minimo 2 e de preferencia 3 anuncios/vendedores DIFERENTES do MESMO produto. "
+    "Compare modelo, marca e quantidade (pack/kit). "
+    "NUNCA copie o preco de tabela Mercos como preco de venda. "
+    "Nao invente precos, vendedores ou URLs. Se nao achar apos varias buscas, price null. "
+    "Responda SOMENTE JSON valido (sem markdown): "
+    '{"platform":"shopee","listings":['
+    '{"price":799.0,"units":1,"freight":18,"seller":"Loja A","url":"https://...","source":"Shopee","packMatch":true,"title":"..."},'
+    '{"price":820.0,"units":1,"freight":15,"seller":"Loja B","url":"https://...","source":"Shopee","packMatch":true,"title":"..."}'
+    '],"notes":"resumo da busca","searchesTried":3}'
+)
+
+SYNTHESIS_INSTRUCTIONS = (
     "Voce e um analista de varejo B2C no Brasil (XNamai). "
-    "O preco de tabela Mercos e o CUSTO de compra, NAO o preco de venda ao consumidor. "
-    "Pesquise anuncios PUBLICOS do MESMO produto vendidos por vendedores "
-    "em Mercado Livre, Shopee, TikTok Shop, Nuvemshop e lojas/site proprio. "
-    "COMPARACAO DE QUANTIDADE: se o produto interno for pack/kit (ex.: pacote com 7), "
-    "so aceite anuncios com a MESMA quantidade de unidades. "
-    "Se achar apenas combo maior/menor, informe units do anuncio e price do anuncio; "
-    "nao misture pack de 7 com unidade avulsa como se fossem iguais. "
-    "NUNCA copie o preco de tabela Mercos como preco de venda. Se nao achar, use null. "
-    "Nao invente precos nem URLs. "
-    "Explique com clareza POR QUE o canal indicado e melhor (alcance, taxa, margem, frete, demanda). "
+    "Com base nos precos reais ja coletados por plataforma (multiplos vendedores), "
+    "escolha o melhor canal e explique o porque (alcance, taxa, margem, frete, demanda). "
+    "Nao invente novos precos. "
     "Responda SOMENTE com JSON valido (sem markdown), neste formato: "
     '{"apelo":"alto|medio|baixo","apeloJustificativa":"texto",'
     '"potencialScore":75,'
@@ -49,6 +94,7 @@ INSTRUCTIONS = (
     '"porqueCanalDetalhe":"paragrafo explicando por que este canal vs alternativas",'
     '"comparativoCanais":['
     '{"plataforma":"mercado_livre","pros":["..."],"contras":["..."],"veredito":"melhor|boa|evitar"},'
+    '{"plataforma":"shopee","pros":["..."],"contras":["..."],"veredito":"boa"},'
     '{"plataforma":"site_proprio","pros":["..."],"contras":["..."],"veredito":"boa"}'
     "],"
     '"melhorEnvio":"mercado_envios|shopee_entrega|melhor_envio|correios_pac|correios_sedex",'
@@ -56,17 +102,11 @@ INSTRUCTIONS = (
     '"motivoEscolha":"frase curta do porque indicar no Top 100 varejo",'
     '"razoes":["razao 1","razao 2"],'
     '"risco":"baixo|medio|alto - detalhe",'
-    '"productUnits":7,'
-    '"marketPrices":{'
-    '"mercado_livre":{"price":99.9,"units":7,"freight":22,"seller":"Loja X","url":"https://...","source":"Mercado Livre","packMatch":true},'
-    '"shopee":{"price":95.0,"units":7,"freight":18,"seller":"Seller Y","url":"https://...","source":"Shopee","packMatch":true},'
-    '"tiktok":{"price":null,"units":null,"freight":null,"seller":null,"url":null,"source":null},'
-    '"nuvemshop":{"price":null,"units":null,"freight":null,"seller":null,"url":null,"source":null},'
-    '"site_proprio":{"price":null,"units":null,"freight":null,"seller":null,"url":null,"source":null}'
-    "},"
+    '"productUnits":1,'
     '"sources":[{"title":"titulo","url":"https://..."}],'
     '"confidence":"alta|media|baixa"}'
 )
+
 
 
 
@@ -119,11 +159,31 @@ def _parse_analysis(text: str) -> dict:
     return parsed
 
 
-def _build_prompt(product: dict[str, Any]) -> str:
+def _build_platform_prompt(product: dict[str, Any], platform_key: str) -> str:
     units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
-    hint = " ".join(
-        part for part in [product.get("name"), product.get("code"), "Brasil varejo"] if part
+    hint = PLATFORM_SEARCH_HINTS.get(platform_key) or {"label": platform_key, "queryHint": platform_key}
+    name = product.get("name") or ""
+    code = product.get("code") or ""
+    # Short searchable tokens help marketplaces (model codes like PGT-HY320).
+    tokens = [part for part in re.split(r"[\s\-_/]+", f"{name} {code}") if len(part) >= 3][:8]
+    return (
+        f"Plataforma alvo: {hint['label']} ({platform_key}).\n"
+        f"Buscas obrigatorias (faca varias): "
+        f"\"{name}\" {hint.get('queryHint')}; "
+        f"{' '.join(tokens[:4])} {hint.get('queryHint')}; "
+        f"{code} {hint['label']} Brasil.\n"
+        f"Produto: {name}\n"
+        f"Codigo interno: {code}\n"
+        f"Quantidade do SKU: {units} unidade(s). So aceite anuncios com a mesma quantidade "
+        f"(ou informe units diferentes e packMatch=false).\n"
+        f"Custo Mercos (NAO e preco de venda): {product.get('listPrice')}.\n"
+        f"Retorne pelo menos 2-3 vendedores/anuncios diferentes com price, seller e url. "
+        f"Se achar so 1, ainda assim retorne; null so se realmente nao existir."
     )
+
+
+def _build_synthesis_prompt(product: dict[str, Any], market_prices: dict[str, Any]) -> str:
+    units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
     context = {
         "id": product.get("id"),
         "name": product.get("name"),
@@ -133,34 +193,39 @@ def _build_prompt(product: dict[str, Any]) -> str:
         "stock": product.get("stock"),
         "mercosRevenue90d": product.get("mercosRevenue"),
         "mercosQuantity90d": product.get("mercosQuantity"),
-        "mercosOrders90d": product.get("mercosOrders"),
+        "marketPrices": market_prices,
     }
     return (
-        f"Pesquise anuncios do MESMO produto e MESMA quantidade ({units} unidade(s)) "
-        f"vendidos por vendedores em cada plataforma: {hint}.\n"
-        f"Custo de compra (preco de tabela Mercos, NAO use como preco de venda): {product.get('listPrice')}.\n"
-        f"Se so achar combo com quantidade diferente, preencha units do anuncio e diga que nao e packMatch.\n"
-        f"Dados internos Mercos:\n{json.dumps(context, ensure_ascii=False, default=str)}"
+        "Com os precos reais abaixo (ja pesquisados em paralelo por plataforma, "
+        "com multiplos vendedores quando disponiveis), monte a recomendacao B2C.\n"
+        f"{json.dumps(context, ensure_ascii=False, default=str)}"
     )
 
 
-def _call_openai(prompt: str) -> dict:
+def _call_openai(
+    prompt: str,
+    *,
+    instructions: str,
+    use_web_search: bool = True,
+    timeout_seconds: float = 90.0,
+) -> dict:
     cfg = settings()
     if not cfg.openai_api_key:
         raise HTTPException(503, "OPENAI_API_KEY nao configurada")
-    body = {
+    body: dict[str, Any] = {
         "model": cfg.openai_model,
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions,
         "input": prompt,
-        "tools": [
+    }
+    if use_web_search:
+        body["tools"] = [
             {
                 "type": "web_search",
                 "user_location": {"type": "approximate", "country": "BR"},
             }
-        ],
-        "include": ["web_search_call.action.sources"],
-    }
-    with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+        ]
+        body["include"] = ["web_search_call.action.sources"]
+    with httpx.Client(timeout=httpx.Timeout(timeout_seconds, connect=15.0)) as client:
         response = client.post(
             "https://api.openai.com/v1/responses",
             headers={
@@ -177,9 +242,79 @@ def _call_openai(prompt: str) -> dict:
     if not text:
         raise HTTPException(502, "IA nao retornou analise")
     analysis = _parse_analysis(text)
-    if not analysis.get("sources"):
+    if use_web_search and not analysis.get("sources"):
         analysis["sources"] = _extract_sources(payload)
     return analysis
+
+
+def _search_platform_listings(product: dict[str, Any], platform_key: str) -> dict[str, Any]:
+    try:
+        raw = _call_openai(
+            _build_platform_prompt(product, platform_key),
+            instructions=PLATFORM_SEARCH_INSTRUCTIONS,
+            use_web_search=True,
+            timeout_seconds=100.0,
+        )
+    except Exception as error:  # noqa: BLE001 - one platform must not kill the batch
+        log.warning("Platform search failed for %s/%s: %s", product.get("id"), platform_key, error)
+        return {"platform": platform_key, "listings": [], "notes": f"busca falhou: {error}"}
+    if not isinstance(raw, dict):
+        return {"platform": platform_key, "listings": [], "notes": "resposta invalida"}
+    raw["platform"] = platform_key
+    return raw
+
+
+def gather_market_prices_parallel(product: dict[str, Any]) -> dict[str, Any]:
+    """Search each marketplace in parallel and keep multiple seller listings."""
+    results: dict[str, Any] = {}
+    workers = max(1, min(len(PLATFORM_KEYS), int(getattr(settings(), "retail_concurrency", 5) or 5)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="retail-mkt") as pool:
+        futures = {
+            pool.submit(_search_platform_listings, product, key): key for key in PLATFORM_KEYS
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as error:  # noqa: BLE001
+                log.exception("Platform future failed for %s", key)
+                results[key] = {"platform": key, "listings": [], "notes": str(error)}
+    list_price = float(product.get("listPrice") or 0)
+    return {
+        key: collapse_platform_market_price(results.get(key), list_price=list_price)
+        for key in PLATFORM_KEYS
+    }
+
+
+def _synthesize_recommendation(product: dict[str, Any], market_prices: dict[str, Any]) -> dict:
+    try:
+        return _call_openai(
+            _build_synthesis_prompt(product, market_prices),
+            instructions=SYNTHESIS_INSTRUCTIONS,
+            use_web_search=False,
+            timeout_seconds=60.0,
+        )
+    except HTTPException:
+        priced = [
+            key for key, value in market_prices.items() if isinstance(value, dict) and value.get("price")
+        ]
+        best = priced[0] if priced else "site_proprio"
+        return {
+            "apelo": "medio",
+            "apeloJustificativa": "Sintese automatica apos busca de precos",
+            "potencialScore": 60,
+            "melhorPlataforma": best,
+            "porquePlataforma": "Melhor canal entre os que retornaram anuncio real",
+            "porqueCanalDetalhe": "Recomendacao derivada dos precos coletados em paralelo.",
+            "comparativoCanais": [],
+            "melhorEnvio": "melhor_envio",
+            "envioJustificativa": "Padrao",
+            "motivoEscolha": "Precos reais coletados por plataforma",
+            "razoes": ["Busca paralela multi-vendedor"],
+            "risco": "medio",
+            "confidence": "media",
+            "sources": [],
+        }
 
 
 def _heuristic_analysis(product: dict[str, Any], economics: dict[str, Any] | None = None) -> dict:
@@ -212,46 +347,17 @@ def _heuristic_analysis(product: dict[str, Any], economics: dict[str, Any] | Non
 
 
 def _normalize_market_prices(raw: Any, *, list_price: float | None = None, product_units: int = 1) -> dict[str, Any]:
+    del product_units  # pack matching applied later in evaluate_channels
     if not isinstance(raw, dict):
         return {}
-    cost = None
-    try:
-        cost = float(list_price) if list_price is not None else None
-    except (TypeError, ValueError):
-        cost = None
     out: dict[str, Any] = {}
+    for key in PLATFORM_KEYS:
+        if key in raw:
+            out[key] = collapse_platform_market_price(raw.get(key), list_price=list_price)
     for key, value in raw.items():
-        if not isinstance(value, dict):
+        if key in out or not isinstance(value, dict):
             continue
-        price = value.get("price")
-        freight = value.get("freight")
-        try:
-            price = float(price) if price is not None else None
-        except (TypeError, ValueError):
-            price = None
-        if price is not None and price <= 0:
-            price = None
-        if price is not None and cost is not None and cost > 0 and abs(price - cost) < 0.01:
-            price = None
-        try:
-            freight = float(freight) if freight is not None else None
-        except (TypeError, ValueError):
-            freight = None
-        units = value.get("units") or value.get("packUnits") or value.get("quantity")
-        try:
-            units = int(units) if units is not None else None
-        except (TypeError, ValueError):
-            units = None
-        out[str(key)] = {
-            "price": price,
-            "units": units,
-            "freight": freight,
-            "url": value.get("url"),
-            "source": value.get("source"),
-            "seller": value.get("seller"),
-            "shippingKey": value.get("shippingKey"),
-            "packMatch": value.get("packMatch"),
-        }
+        out[str(key)] = collapse_platform_market_price(value, list_price=list_price)
     return out
 
 
@@ -356,17 +462,24 @@ def analyze_product(
 
     used_heuristic = False
     try:
-        ai_payload = _call_openai(_build_prompt(product))
+        market_prices = gather_market_prices_parallel(product)
+        ai_payload = _synthesize_recommendation(product, market_prices)
+        ai_payload["marketPrices"] = market_prices
     except HTTPException as error:
         if not allow_heuristic or error.status_code not in {502, 503}:
             raise
         log.warning("Retail AI fallback to heuristic for %s: %s", product_id, error.detail)
         ai_payload = _heuristic_analysis(product, economics)
         used_heuristic = True
+        market_prices = _normalize_market_prices(
+            ai_payload.get("marketPrices"),
+            list_price=float(product.get("listPrice") or 0),
+            product_units=int(product.get("packUnits") or 1),
+        )
 
     units = int(product.get("packUnits") or detect_pack_units(product.get("name"), product.get("code")))
     market_prices = _normalize_market_prices(
-        ai_payload.get("marketPrices"),
+        ai_payload.get("marketPrices") or market_prices,
         list_price=float(product.get("listPrice") or 0),
         product_units=units,
     )
