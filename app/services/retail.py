@@ -17,6 +17,7 @@ from app.services.retail_economics import (
     estimated_cost,
     evaluate_channels,
     merge_economics,
+    select_recommended_channel,
 )
 from app.services.retail_pack import detect_pack_units
 from app.cache.redis_cache import (
@@ -272,7 +273,8 @@ def compose_product_score(
         product_units=pack_units,
     )
     priced = [row for row in channels if row.get("hasPrice")]
-    best = priced[0] if priced else None
+    # Economics + competitive market price — do not let AI pick Shopee while margin uses R$200 Nuvemshop.
+    best = select_recommended_channel(channels)
     appeal = _appeal_score(ai_payload, cached_scores)
     sell = _sell_potential(candidate, ai_payload, cached_scores)
     margin_pct = float(best["marginPct"]) if best and best.get("marginPct") is not None else None
@@ -292,11 +294,22 @@ def compose_product_score(
         generated = _aware(analysis.generated_at)
         stale = not generated or (datetime.now(timezone.utc) - generated) >= timedelta(hours=CACHE_HOURS)
 
-    platform = (cached_scores or {}).get("bestPlatform") or (best or {}).get("platform") or "site_proprio"
-    if ai_payload and ai_payload.get("melhorPlataforma"):
-        platform = ai_payload["melhorPlataforma"]
-    shipping = (cached_scores or {}).get("bestShipping") or (best or {}).get("shippingKey") or "melhor_envio"
-    if ai_payload and ai_payload.get("melhorEnvio"):
+    platform = (best or {}).get("platform") or (cached_scores or {}).get("bestPlatform") or "site_proprio"
+    # AI may suggest a channel only if that channel has a real competitive price.
+    ai_platform = (ai_payload or {}).get("melhorPlataforma")
+    if ai_platform:
+        ai_row = next((row for row in priced if row.get("platform") == ai_platform), None)
+        if ai_row and best and ai_row.get("platform") == best.get("platform"):
+            platform = ai_platform
+        elif ai_row and best:
+            # Keep economics winner; AI text can still explain demand on other channels.
+            platform = best["platform"]
+        elif ai_row:
+            platform = ai_platform
+    shipping = (best or {}).get("shippingKey") or (cached_scores or {}).get("bestShipping") or "melhor_envio"
+    if ai_payload and ai_payload.get("melhorEnvio") and platform == (
+        (ai_payload or {}).get("melhorPlataforma") or platform
+    ):
         shipping = ai_payload["melhorEnvio"]
 
     reasons: list[str] = []
@@ -340,14 +353,15 @@ def compose_product_score(
             )
 
     porque_detalhe = None
-    if ai_payload:
+    if ai_payload and platform == (ai_payload or {}).get("melhorPlataforma"):
         porque_detalhe = ai_payload.get("porqueCanalDetalhe") or ai_payload.get("porquePlataforma")
     if not porque_detalhe and best:
         porque_detalhe = (
-            f"{PLATFORM_LABELS.get(str(platform), platform)} foi indicado por margem "
-            f"{best.get('marginPct')}% apos taxa {best.get('feePct')}% e frete, "
-            f"com preco anunciado de R$ {best.get('retailPrice')} "
-            f"(custo tabela R$ {estimated_cost(float(candidate.get('listPrice') or 0))})."
+            f"{PLATFORM_LABELS.get(str(platform), platform)} foi indicado pelo preco competitivo "
+            f"de R$ {best.get('retailPrice')} (mediana dos anuncios reais do canal), "
+            f"com margem liquida {best.get('marginPct')}% apos taxa {best.get('feePct')}% e frete "
+            f"(custo tabela R$ {estimated_cost(float(candidate.get('listPrice') or 0))}). "
+            f"Precos de site/Nuvemshop bem acima do mercado marketplace nao entram como referencia."
         )
 
     cost = estimated_cost(float(candidate.get("listPrice") or 0))

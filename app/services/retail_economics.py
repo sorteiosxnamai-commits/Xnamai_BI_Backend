@@ -124,6 +124,56 @@ def _parse_price(value: Any) -> float | None:
     return price
 
 
+def select_recommended_channel(channels: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick sell channel using competitive market prices — not inflated own-store outliers.
+
+    Site/Nuvemshop ads far above marketplace medians look like high margin but are not
+    a realistic sell price when Shopee/ML/TikTok already clear the product cheaper.
+    """
+    from statistics import median
+
+    MARKETPLACE_KEYS = {"mercado_livre", "shopee", "tiktok"}
+    OWN_STORE_KEYS = {"nuvemshop", "site_proprio"}
+
+    priced = [
+        row
+        for row in channels
+        if row.get("hasPrice") and row.get("retailPrice") is not None
+    ]
+    if not priced:
+        return None
+
+    marketplace_prices = [
+        float(row["retailPrice"])
+        for row in priced
+        if row.get("platform") in MARKETPLACE_KEYS
+    ]
+    anchor = float(median(marketplace_prices)) if marketplace_prices else None
+
+    def competitive(row: dict[str, Any]) -> bool:
+        if anchor is None:
+            return True
+        price = float(row["retailPrice"])
+        platform = str(row.get("platform") or "")
+        # Own-store prices well above the marketplace cluster are not competitive.
+        if platform in OWN_STORE_KEYS and price > anchor * 1.35:
+            return False
+        return True
+
+    pool = [row for row in priced if competitive(row)] or priced
+    pool.sort(
+        key=lambda row: (
+            1 if float(row.get("marginPct") or -9999) >= 0 else 0,
+            float(row.get("marginPct") or -9999.0),
+            float(row.get("netMargin") or -9999.0),
+            int(row.get("sellersCompared") or 0),
+            1 if (row.get("pack") or {}).get("packMatch") else 0,
+        ),
+        reverse=True,
+    )
+    return pool[0]
+
+
 def evaluate_channels(
     *,
     market_prices: dict[str, Any] | None,

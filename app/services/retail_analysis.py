@@ -96,13 +96,19 @@ PLATFORM_SEARCH_INSTRUCTIONS = (
     "Nao pare no primeiro resultado. Compare precos entre lojas. "
     "NUNCA copie o preco de tabela Mercos como preco de venda. "
     "Nao invente precos, vendedores ou URLs. "
+    "PROIBIDO usar nomes ficticios (Loja A, Loja B, Loja C, Seller A, etc). "
+    "Use o nome REAL do vendedor/loja do anuncio. "
+    "URL deve ser o link HTTPS completo e real do anuncio na plataforma pedida "
+    "(ex: mercadolivre.com.br, shopee.com.br). Nunca use https://... nem placeholders. "
+    "Se nao tiver URL real, omita o campo url. "
     "Se achar menos de 3, continue buscando com queries alternativas "
     "(modelo, marca, sinonimos, 'comprar', 'preco', 'oferta'). "
     "Responda SOMENTE JSON valido (sem markdown): "
     '{"platform":"shopee","listings":['
-    '{"price":260.1,"units":1,"freight":18,"seller":"Loja A","url":"https://...","source":"Shopee","packMatch":true,"title":"..."},'
-    '{"price":249.9,"units":1,"freight":15,"seller":"Loja B","url":"https://...","source":"Shopee","packMatch":true,"title":"..."},'
-    '{"price":275.0,"units":1,"freight":12,"seller":"Loja C","url":"https://...","source":"Shopee","packMatch":true,"title":"..."}'
+    '{"price":260.1,"units":1,"freight":18,"seller":"<nome real do vendedor>",'
+    '"url":"https://shopee.com.br/...","source":"Shopee","packMatch":true,"title":"<titulo real>"},'
+    '{"price":249.9,"units":1,"freight":15,"seller":"<outro vendedor real>",'
+    '"url":"https://shopee.com.br/...","source":"Shopee","packMatch":true,"title":"<titulo real>"}'
     '],"notes":"resumo da busca","searchesTried":5}'
 )
 
@@ -111,8 +117,13 @@ MIN_SELLERS_TARGET = 3
 SYNTHESIS_INSTRUCTIONS = (
     "Voce e um analista de varejo B2C no Brasil (XNamai). "
     "Com base nos precos reais ja coletados por plataforma (multiplos vendedores), "
-    "escolha o melhor canal e explique o porque (alcance, taxa, margem, frete, demanda). "
+    "escolha o melhor canal para VENDER no preco COMPETITIVO daquele canal "
+    "(mediana dos anuncios reais), nao no preco mais alto de outro canal. "
     "Nao invente novos precos. "
+    "Nao indique um marketplace so porque o preco de la e o mais baixo se a margem "
+    "liquida nesse preco for negativa e existir outro canal competitivo com margem melhor. "
+    "Ignore precos de site proprio/Nuvemshop muito acima da mediana dos marketplaces "
+    "(nao sao referencia de venda competitiva). "
     "Responda SOMENTE com JSON valido (sem markdown), neste formato: "
     '{"apelo":"alto|medio|baixo","apeloJustificativa":"texto",'
     '"potencialScore":75,'
@@ -419,7 +430,11 @@ def gather_market_prices_parallel(product: dict[str, Any]) -> dict[str, Any]:
                 results[key] = {"platform": key, "listings": [], "notes": str(error)}
     list_price = float(product.get("listPrice") or 0)
     return {
-        key: collapse_platform_market_price(results.get(key), list_price=list_price)
+        key: collapse_platform_market_price(
+            results.get(key),
+            list_price=list_price,
+            platform=key,
+        )
         for key in PLATFORM_KEYS
     }
 
@@ -497,11 +512,19 @@ def _normalize_market_prices(raw: Any, *, list_price: float | None = None, produ
     out: dict[str, Any] = {}
     for key in PLATFORM_KEYS:
         if key in raw:
-            out[key] = collapse_platform_market_price(raw.get(key), list_price=list_price)
+            out[key] = collapse_platform_market_price(
+                raw.get(key),
+                list_price=list_price,
+                platform=key,
+            )
     for key, value in raw.items():
         if key in out or not isinstance(value, dict):
             continue
-        out[str(key)] = collapse_platform_market_price(value, list_price=list_price)
+        out[str(key)] = collapse_platform_market_price(
+            value,
+            list_price=list_price,
+            platform=str(key),
+        )
     return out
 
 
@@ -520,16 +543,19 @@ def _build_scores(product: dict[str, Any], ai_payload: dict, economics: dict | N
     )
     priced = [row for row in channels if row.get("hasPrice")]
     best = priced[0] if priced else None
-    platform = ai_payload.get("melhorPlataforma") or (best or {}).get("platform") or "site_proprio"
-    shipping = ai_payload.get("melhorEnvio") or (best or {}).get("shippingKey") or "melhor_envio"
+    # Platform/margin come from compose_product_score (competitive channel), not raw AI.
     temp = RetailProductAnalysis(
         product_mercos_id=product["id"],
         ai_payload=ai_payload,
         market_prices=market_prices,
         scores={
             "potencialScore": ai_payload.get("potencialScore"),
-            "bestPlatform": platform,
-            "bestShipping": shipping,
+            "bestPlatform": ai_payload.get("melhorPlataforma")
+            or (best or {}).get("platform")
+            or "site_proprio",
+            "bestShipping": ai_payload.get("melhorEnvio")
+            or (best or {}).get("shippingKey")
+            or "melhor_envio",
             "reasonShort": ai_payload.get("motivoEscolha"),
             "reasonDetail": ai_payload.get("razoes") or [],
         },
@@ -538,6 +564,8 @@ def _build_scores(product: dict[str, Any], ai_payload: dict, economics: dict | N
         updated_at=datetime.now(timezone.utc),
     )
     composed = compose_product_score(product, temp, economics=economics)
+    platform = composed.get("melhorPlataforma") or (best or {}).get("platform") or "site_proprio"
+    shipping = composed.get("melhorEnvio") or (best or {}).get("shippingKey") or "melhor_envio"
     return {
         "recomendacaoScore": composed["recomendacaoScore"],
         "appealScore": composed["appealScore"],
