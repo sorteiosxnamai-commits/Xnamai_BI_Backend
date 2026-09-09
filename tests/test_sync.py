@@ -173,6 +173,67 @@ async def test_order_sync_uses_items_from_v2_list_without_detail(
         assert run.details["itemsPersisted"] == 2
 
 
+class ListWithEmptyItemsAdaptor:
+    def __init__(self):
+        self.detail_calls: list[str] = []
+
+    async def list(self, resource: str, cursor: str | None):
+        assert resource == "orders"
+        return {
+            "data": [
+                {
+                    "id": 30,
+                    "numero": 300,
+                    "status": 2,
+                    "total": "25,00",
+                    "ultima_alteracao": "2026-08-14T14:00:00+00:00",
+                    "itens": [],
+                }
+            ],
+            "pageCursor": "2026-08-14T14:00:00+00:00",
+            "nextCursor": None,
+        }
+
+    async def detail(self, resource: str, mercos_id: str):
+        assert resource == "orders"
+        self.detail_calls.append(mercos_id)
+        return {
+            "id": 30,
+            "numero": 300,
+            "status": 2,
+            "total": "25,00",
+            "itens": [
+                {
+                    "id": 701,
+                    "produto_id": 1,
+                    "quantidade": 1,
+                    "preco_liquido": "25,00",
+                    "subtotal": "25,00",
+                }
+            ],
+        }
+
+
+@pytest.mark.asyncio
+async def test_order_sync_hydrates_detail_when_list_items_are_empty(
+    sync_db,
+    monkeypatch,
+):
+    fake = ListWithEmptyItemsAdaptor()
+    monkeypatch.setattr(sync, "adaptor", fake)
+
+    result = await sync.sync_resource("orders", full=False)
+
+    assert result["status"] == "success"
+    assert fake.detail_calls == ["30"]
+    with sync_db() as db:
+        order = db.scalar(select(Order))
+        assert order.item_count == 1
+        assert db.scalar(select(func.count(OrderItem.id))) == 1
+        run = db.scalar(select(SyncRun))
+        assert run.details["detailsConsulted"] == 1
+
+
 @pytest.mark.asyncio
 async def test_active_lease_prevents_duplicate_resource_sync(sync_db, monkeypatch):
     with sync_db() as db:

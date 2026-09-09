@@ -249,7 +249,7 @@ def test_inventory_ignores_placeholder_list_price() -> None:
         assert result["summary"]["stockValueAtListPrice"] == Decimal("0")
 
 
-def test_placeholder_list_price_does_not_inflate_revenue() -> None:
+def test_placeholder_catalog_price_does_not_change_mercos_header_revenue() -> None:
     with make_session() as db:
         seed_orders(db)
         db.add(
@@ -292,8 +292,9 @@ def test_placeholder_list_price_does_not_inflate_revenue() -> None:
             order="desc",
         )
 
-        assert result["kpis"]["netRevenue"]["value"] == Decimal("160.00")
-        assert all(row["id"] != "placeholder" or row["revenue"] == 0 for row in products["items"])
+        assert result["kpis"]["netRevenue"]["value"] == Decimal("100.00")
+        placeholder = next(row for row in products["items"] if row["id"] == "placeholder")
+        assert placeholder["revenue"] == Decimal("5000")
 
 
 def test_revenue_reconciles_with_equivalent_sql() -> None:
@@ -305,17 +306,10 @@ def test_revenue_reconciles_with_equivalent_sql() -> None:
         sql_revenue = db.scalar(
             select(
                 func.coalesce(
-                    func.sum(OrderItem.quantity * Product.list_price),
+                    func.sum(func.coalesce(Order.net_total, Order.total)),
                     0,
                 )
-            )
-            .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
-            .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
-            .where(
-                Order.status.in_(VALID_SALE_STATUSES),
-                OrderItem.excluded.is_(False),
-                Product.list_price != Decimal("1000"),
-            )
+            ).where(Order.status.in_(VALID_SALE_STATUSES))
         )
         product_rows = products_page(
             db,
@@ -329,7 +323,7 @@ def test_revenue_reconciles_with_equivalent_sql() -> None:
         item_revenue = db.scalar(
             select(
                 func.coalesce(
-                    func.sum(OrderItem.quantity * Product.list_price),
+                    func.sum(OrderItem.total),
                     0,
                 )
             )
@@ -338,7 +332,6 @@ def test_revenue_reconciles_with_equivalent_sql() -> None:
             .where(
                 Order.status.in_(VALID_SALE_STATUSES),
                 OrderItem.excluded.is_(False),
-                Product.list_price != Decimal("1000"),
             )
         )
 
@@ -371,28 +364,29 @@ def test_overview_separates_sales_and_cancellations_with_comparison() -> None:
 
         result = overview(db, filters)
 
-        assert result["kpis"]["grossRevenue"]["value"] == Decimal("160.00")
-        assert result["kpis"]["netRevenue"]["value"] == Decimal("160.00")
+        assert result["kpis"]["grossRevenue"]["value"] == Decimal("110.00")
+        assert result["kpis"]["netRevenue"]["value"] == Decimal("100.00")
         assert result["kpis"]["orders"]["value"] == Decimal("1")
-        assert result["kpis"]["averageTicket"]["value"] == Decimal("160.00")
+        assert result["kpis"]["averageTicket"]["value"] == Decimal("100.00")
         assert result["kpis"]["cancellations"]["value"] == Decimal("1")
-        assert result["kpis"]["cancelledValue"]["value"] == Decimal("0.00")
-        assert result["kpis"]["netRevenue"]["previousValue"] == Decimal("0.00")
-        assert result["kpis"]["netRevenue"]["percentageChange"] is None
+        assert result["kpis"]["cancelledValue"]["value"] == Decimal("20.00")
+        assert result["kpis"]["discountTotal"]["value"] == Decimal("10.00")
+        assert result["kpis"]["netRevenue"]["previousValue"] == Decimal("50.00")
+        assert result["kpis"]["netRevenue"]["percentageChange"] == 100.0
         assert result["kpis"]["newBuyers"]["value"] == Decimal("0")
         assert result["kpis"]["recurringBuyers"]["value"] == Decimal("1")
         series = timeseries(db, filters)
         assert len(series["items"]) == len(series["previousItems"])
         assert next(
             point for point in series["items"] if point["period"] == "2026-08-10"
-        )["revenue"] == Decimal("160.00")
+        )["revenue"] == Decimal("100.00")
         assert sum(
             (point["revenue"] for point in series["previousItems"]),
             Decimal("0"),
-        ) == Decimal("0.00")
+        ) == Decimal("50.00")
 
 
-def test_overview_requires_items_with_valid_current_list_price() -> None:
+def test_overview_uses_mercos_order_total_without_items() -> None:
     with make_session() as db:
         db.add(
             Order(
@@ -416,7 +410,8 @@ def test_overview_requires_items_with_valid_current_list_price() -> None:
             ),
         )
 
-        assert result["kpis"]["netRevenue"]["value"] == Decimal("0.00")
+        assert result["kpis"]["netRevenue"]["value"] == Decimal("750000.00")
+        assert result["kpis"]["orders"]["value"] == Decimal("1")
 
 
 def test_all_history_buyer_mix_uses_purchase_frequency() -> None:
@@ -462,17 +457,16 @@ def test_orders_pagination_sort_and_status_filter_are_server_side() -> None:
         assert first["totalPages"] == 2
         assert first["items"][0]["id"] == "current-cancelled"
         assert first["summary"]["validOrders"] == 1
-        assert first["summary"]["largestOrderValue"] == Decimal("160.00")
+        assert first["summary"]["largestOrderValue"] == Decimal("100.00")
         assert sales_only["totalItems"] == 1
         assert sales_only["items"][0]["id"] == "current-sale"
         detail = order_detail(db, "current-sale", filters)
         assert detail["order"]["number"] == "100"
+        assert detail["order"]["total"] == Decimal("100.00")
         assert len(detail["items"]) == 2
-        assert detail["items"][0]["unitPrice"] == Decimal("60")
-        assert detail["items"][0]["total"] == Decimal("120")
-        assert detail["items"][0]["sourceUnitPrice"] == Decimal("0")
-        assert detail["items"][0]["sourceTotal"] == Decimal("100")
-        assert detail["items"][0]["priceSource"] == "catalog"
+        assert detail["items"][0]["unitPrice"] == Decimal("50")
+        assert detail["items"][0]["total"] == Decimal("100")
+        assert detail["items"][0]["priceSource"] == "mercos"
         product_filtered = overview(
             db,
             filters.model_copy(update={"productIds": ["p2"]}),
@@ -535,7 +529,7 @@ def test_paginated_entities_and_advanced_analytics_execute() -> None:
         assert products["totalItems"] == 2
         assert products["items"][0]["id"] == "p1"
         assert products["items"][0]["quantitySold"] == Decimal("2")
-        assert products["items"][0]["revenue"] == Decimal("120")
+        assert products["items"][0]["revenue"] == Decimal("100")
         assert [item["id"] for item in products_by_price["items"]] == ["p2", "p1"]
         assert customers["items"][0]["id"] == "c1"
         assert sellers["items"][0]["id"] == "s1"
@@ -705,7 +699,7 @@ def test_excluded_customers_leave_the_totals_and_the_list() -> None:
         )
 
         assert "c1" in [item["id"] for item in included["items"]]
-        assert included["summary"]["totalRevenue"] == Decimal("160")
+        assert included["summary"]["totalRevenue"] == Decimal("150")
         assert "c1" not in [item["id"] for item in excluded["items"]]
         assert excluded["summary"]["totalRevenue"] == Decimal("0")
         assert excluded["summary"]["top5"]["members"] == []

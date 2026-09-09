@@ -68,8 +68,27 @@ def _valid_list_price_expression():
     )
 
 
-def _current_item_value_expression():
-    return OrderItem.quantity * _valid_list_price_expression()
+def _mercos_item_value_expression():
+    return func.coalesce(
+        OrderItem.total,
+        OrderItem.quantity * OrderItem.unit_price,
+    )
+
+
+def _product_scoped(filters: AnalyticsFilters) -> bool:
+    return bool(filters.productIds or filters.categoryIds)
+
+
+def _header_revenue_expression():
+    return func.coalesce(Order.net_total, Order.total)
+
+
+def _header_gross_expression():
+    return func.coalesce(Order.gross_total, Order.net_total, Order.total)
+
+
+def _header_discount_expression():
+    return func.coalesce(Order.discount_value, Order.discount, 0)
 
 
 def _current_order_values(
@@ -80,27 +99,23 @@ def _current_order_values(
     conditions = [
         *order_conditions(filters, bounds=bounds),
         OrderItem.excluded.is_(False),
-        _valid_list_price_expression().is_not(None),
+        _mercos_item_value_expression().is_not(None),
     ]
     if statuses is not None:
         conditions.append(status_sql_in(Order.status, statuses))
-    if filters.productIds:
-        conditions.append(Product.mercos_id.in_(filters.productIds))
-    if filters.categoryIds:
-        conditions.append(
-            or_(
-                Product.category_mercos_id.in_(filters.categoryIds),
-                Product.category_id.in_(filters.categoryIds),
-            )
-        )
-    return (
+    query = (
         select(
             Order.mercos_id.label("order_id"),
             Order.customer_mercos_id.label("customer_id"),
             Order.seller_mercos_id.label("seller_id"),
             Order.issued_at.label("issued_at"),
             Order.status.label("status"),
-            func.sum(_current_item_value_expression()).label("current_total"),
+            func.sum(_mercos_item_value_expression()).label("current_total"),
+            func.coalesce(
+                func.sum(OrderItem.quantity * OrderItem.list_unit_price),
+                func.sum(_mercos_item_value_expression()),
+            ).label("gross_total"),
+            func.coalesce(func.sum(OrderItem.discount), 0).label("discount_total"),
             func.sum(OrderItem.quantity).label("item_count"),
             func.count(func.distinct(OrderItem.product_mercos_id)).label(
                 "sku_count"
@@ -108,8 +123,20 @@ def _current_order_values(
         )
         .select_from(Order)
         .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
-        .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
-        .where(*conditions)
+    )
+    if _product_scoped(filters):
+        query = query.join(Product, Product.mercos_id == OrderItem.product_mercos_id)
+        if filters.productIds:
+            conditions.append(Product.mercos_id.in_(filters.productIds))
+        if filters.categoryIds:
+            conditions.append(
+                or_(
+                    Product.category_mercos_id.in_(filters.categoryIds),
+                    Product.category_id.in_(filters.categoryIds),
+                )
+            )
+    return (
+        query.where(*conditions)
         .group_by(
             Order.mercos_id,
             Order.customer_mercos_id,
@@ -119,10 +146,6 @@ def _current_order_values(
         )
         .subquery()
     )
-
-
-def _header_revenue_expression():
-    return func.coalesce(Order.net_total, Order.total)
 
 
 def _header_order_values(
@@ -141,12 +164,24 @@ def _header_order_values(
             Order.issued_at.label("issued_at"),
             Order.status.label("status"),
             _header_revenue_expression().label("current_total"),
+            _header_gross_expression().label("gross_total"),
+            _header_discount_expression().label("discount_total"),
             func.coalesce(Order.item_count, 0).label("item_count"),
             func.coalesce(Order.sku_count, 0).label("sku_count"),
         )
         .where(*conditions)
         .subquery()
     )
+
+
+def _analytic_order_values(
+    filters: AnalyticsFilters,
+    bounds: tuple[datetime | None, datetime | None] | None = None,
+    statuses: frozenset[str] | set[str] | None = None,
+):
+    if _product_scoped(filters):
+        return _current_order_values(filters, bounds, statuses)
+    return _header_order_values(filters, bounds, statuses)
 
 
 def _trend(current: Decimal | int, previous: Decimal | int) -> str:
@@ -248,7 +283,7 @@ def _summary_for_bounds(
     bounds: tuple[datetime | None, datetime | None],
 ) -> dict[str, Any]:
     common = order_conditions(filters, bounds=bounds)
-    valid_values = _current_order_values(
+    valid_values = _analytic_order_values(
         filters,
         bounds,
         VALID_SALE_STATUSES,
@@ -256,15 +291,15 @@ def _summary_for_bounds(
     row = db.execute(
         select(
             func.count(valid_values.c.order_id),
+            func.coalesce(func.sum(valid_values.c.gross_total), 0),
             func.coalesce(func.sum(valid_values.c.current_total), 0),
-            func.coalesce(func.sum(valid_values.c.current_total), 0),
-            literal(ZERO),
+            func.coalesce(func.sum(valid_values.c.discount_total), 0),
             func.count(func.distinct(valid_values.c.customer_id)),
             func.coalesce(func.sum(valid_values.c.item_count), 0),
             func.coalesce(func.sum(valid_values.c.sku_count), 0),
         ).select_from(valid_values)
     ).one()
-    cancelled_values = _current_order_values(
+    cancelled_values = _analytic_order_values(
         filters,
         bounds,
         CANCELLED_ORDER_STATUSES,
@@ -407,26 +442,26 @@ def overview(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
     )
     definitions = {
         "grossRevenue": (
-            "Soma de quantidade × preço de tabela atual dos itens válidos. "
-            "Itens excluídos e preços sentinela de R$ 1.000,00 não entram."
+            "Soma do total bruto dos pedidos válidos na Mercos. "
+            "Se o bruto não vier, usa o total líquido do pedido."
         ),
         "netRevenue": (
-            "Mesma base do faturamento a preço de tabela atual. O valor "
-            "histórico do pedido fica só para auditoria."
+            "Soma do total líquido dos pedidos válidos na Mercos "
+            "(total_liquido/total do pedido)."
         ),
         "orders": "Quantidade de pedidos classificados como venda válida.",
-        "averageTicket": "Faturamento a preço de tabela dividido pelos pedidos válidos.",
+        "averageTicket": "Faturamento Mercos dividido pelos pedidos válidos.",
         "customers": "Clientes distintos com venda válida no período.",
         "newBuyers": "Clientes cuja primeira venda válida ocorreu no período.",
         "recurringBuyers": "Clientes do período cuja primeira venda válida ocorreu antes dele.",
         "cancellations": "Pedidos com status cancelado no período.",
         "cancellationRate": "Cancelamentos divididos por todos os pedidos filtrados.",
-        "cancelledValue": "Soma a preço de tabela atual dos pedidos cancelados.",
+        "cancelledValue": "Soma do total Mercos dos pedidos cancelados.",
         "discountTotal": (
-            "Desconto analítico fica zerado porque o faturamento usa o preço "
-            "de tabela atual, não o valor histórico do pedido."
+            "Soma do desconto informado pela Mercos no pedido "
+            "(valor_desconto/desconto)."
         ),
-        "averageDiscountPct": "Desconto total dividido pelo faturamento a preço de tabela.",
+        "averageDiscountPct": "Desconto total dividido pelo faturamento Mercos.",
         "items": "Quantidade de linhas de item informada nos pedidos válidos.",
         "skus": "Soma dos SKUs distintos registrados por pedido válido.",
         "itemsPerOrder": "Quantidade de itens dividida pelos pedidos válidos.",
@@ -597,31 +632,54 @@ def _timeseries_items(
                 Product.category_id.in_(filters.categoryIds),
             )
         )
-    rows = db.execute(
-        select(
-            bucket,
-            func.count(func.distinct(Order.id)).label("orders"),
-            func.coalesce(
-                func.sum(_current_item_value_expression()),
-                0,
-            ).label("revenue"),
-            func.count(func.distinct(Order.customer_mercos_id)).label("customers"),
-            func.coalesce(func.sum(OrderItem.quantity), 0).label("items"),
-            literal(ZERO).label("discounts"),
+    if _product_scoped(filters):
+        query = (
+            select(
+                bucket,
+                func.count(func.distinct(Order.id)).label("orders"),
+                func.coalesce(func.sum(_mercos_item_value_expression()), 0).label(
+                    "revenue"
+                ),
+                func.count(func.distinct(Order.customer_mercos_id)).label("customers"),
+                func.coalesce(func.sum(OrderItem.quantity), 0).label("items"),
+                func.coalesce(func.sum(OrderItem.discount), 0).label("discounts"),
+            )
+            .select_from(Order)
+            .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
+            .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
+            .where(
+                *common,
+                *product_conditions,
+                status_sql_in(Order.status, VALID_SALE_STATUSES),
+                OrderItem.excluded.is_(False),
+            )
+            .group_by(bucket)
+            .order_by(bucket)
         )
-        .select_from(Order)
-        .join(OrderItem, OrderItem.order_mercos_id == Order.mercos_id)
-        .join(Product, Product.mercos_id == OrderItem.product_mercos_id)
-        .where(
-            *common,
-            *product_conditions,
-            status_sql_in(Order.status, VALID_SALE_STATUSES),
-            OrderItem.excluded.is_(False),
-            _valid_list_price_expression().is_not(None),
+    else:
+        query = (
+            select(
+                bucket,
+                func.count(Order.id).label("orders"),
+                func.coalesce(func.sum(_header_revenue_expression()), 0).label(
+                    "revenue"
+                ),
+                func.count(func.distinct(Order.customer_mercos_id)).label("customers"),
+                func.coalesce(func.sum(func.coalesce(Order.item_count, 0)), 0).label(
+                    "items"
+                ),
+                func.coalesce(func.sum(_header_discount_expression()), 0).label(
+                    "discounts"
+                ),
+            )
+            .where(
+                *common,
+                status_sql_in(Order.status, VALID_SALE_STATUSES),
+            )
+            .group_by(bucket)
+            .order_by(bucket)
         )
-        .group_by(bucket)
-        .order_by(bucket)
-    ).all()
+    rows = db.execute(query).all()
     cancellations = {
         _bucket_key(row.bucket, filters.granularity): int(row.cancellations)
         for row in db.execute(
@@ -704,7 +762,7 @@ def orders_page(
     order: str,
 ) -> dict[str, Any]:
     conditions = order_conditions(filters)
-    order_values = _current_order_values(filters)
+    order_values = _analytic_order_values(filters)
     if search:
         pattern = f"%{search.strip()}%"
         conditions.append(
@@ -815,11 +873,17 @@ def orders_page(
                 "sellerId": row.Order.seller_mercos_id,
                 "sellerName": row.seller_name,
                 "status": row.Order.status,
-                "grossTotal": _decimal(row.current_total),
+                "grossTotal": _decimal(
+                    row.Order.gross_total if row.Order.gross_total is not None else row.current_total
+                ),
                 "netTotal": _decimal(row.current_total),
                 "total": _decimal(row.current_total),
-                "discount": ZERO,
-                "discountPercent": ZERO,
+                "discount": _decimal(
+                    row.Order.discount_value
+                    if row.Order.discount_value is not None
+                    else row.Order.discount
+                ),
+                "discountPercent": _decimal(row.Order.discount_percent),
                 "itemCount": row.Order.item_count,
                 "skuCount": row.Order.sku_count,
                 "city": row.city,
@@ -899,11 +963,11 @@ def order_detail(
             or _decimal(product.list_price) in PLACEHOLDER_LIST_PRICES
             else product.list_price
         )
-        source_unit_price = _decimal(item.unit_price)
-        current_unit_price = (
-            _decimal(catalog_price) if catalog_price is not None else None
-        )
         quantity = _decimal(item.quantity)
+        source_total = _decimal(item.total)
+        source_unit_price = _decimal(item.unit_price)
+        if source_unit_price == 0 and quantity:
+            source_unit_price = source_total / quantity
         return {
             "id": item.mercos_item_id,
             "position": item.position,
@@ -911,29 +975,17 @@ def order_detail(
             "code": item.code,
             "name": item.name or (product.name if product is not None else ""),
             "quantity": quantity,
-            "unitPrice": current_unit_price,
-            "total": (
-                quantity * current_unit_price
-                if current_unit_price is not None
-                else None
-            ),
+            "unitPrice": source_unit_price or None,
+            "total": source_total or None,
             "sourceUnitPrice": source_unit_price,
             "sourceTotal": item.total,
-            "priceSource": (
-                "catalog" if catalog_price is not None else "unavailable"
-            ),
+            "catalogUnitPrice": catalog_price,
+            "priceSource": "mercos",
             "discount": item.discount,
         }
 
     detail_items = [detail_item(item) for item in item_rows]
-    current_total = sum(
-        (
-            item["total"]
-            for item in detail_items
-            if item["total"] is not None
-        ),
-        ZERO,
-    )
+    mercos_total = _decimal(order.net_total if order.net_total is not None else order.total)
     return {
         "order": {
             "id": order.mercos_id,
@@ -946,11 +998,15 @@ def order_detail(
             "sellerName": row.seller_name,
             "city": row.city,
             "state": row.state,
-            "grossTotal": current_total,
-            "netTotal": current_total,
-            "total": current_total,
-            "discount": ZERO,
-            "discountPercent": ZERO,
+            "grossTotal": _decimal(
+                order.gross_total if order.gross_total is not None else mercos_total
+            ),
+            "netTotal": mercos_total,
+            "total": mercos_total,
+            "discount": _decimal(
+                order.discount_value if order.discount_value is not None else order.discount
+            ),
+            "discountPercent": _decimal(order.discount_percent),
             "itemCount": order.item_count,
             "skuCount": order.sku_count,
             "orderTypeId": order.order_type_mercos_id,
@@ -992,11 +1048,11 @@ def _product_aggregate(db: Session, filters: AnalyticsFilters):
             func.coalesce(func.sum(OrderItem.quantity), 0).label("quantity_sold"),
             func.count(func.distinct(Order.mercos_id)).label("order_count"),
             func.coalesce(
-                func.sum(_current_item_value_expression()),
+                func.sum(_mercos_item_value_expression()),
                 0,
             ).label("revenue"),
             (
-                func.coalesce(func.sum(_current_item_value_expression()), 0)
+                func.coalesce(func.sum(_mercos_item_value_expression()), 0)
                 / func.nullif(func.sum(OrderItem.quantity), 0)
             ).label("average_price"),
             func.max(Order.issued_at).label("last_sale_at"),
@@ -1008,7 +1064,6 @@ def _product_aggregate(db: Session, filters: AnalyticsFilters):
             *conditions,
             *product_conditions,
             OrderItem.excluded.is_(False),
-            _valid_list_price_expression().is_not(None),
         )
         .group_by(OrderItem.product_mercos_id)
         .subquery()
@@ -1245,7 +1300,7 @@ def products_page(
 
 
 def _customer_aggregate(filters: AnalyticsFilters):
-    order_values = _current_order_values(
+    order_values = _analytic_order_values(
         filters,
         statuses=VALID_SALE_STATUSES,
     )
@@ -1682,7 +1737,7 @@ def sellers_page(
     order: str,
 ) -> dict[str, Any]:
     common = order_conditions(filters)
-    order_values = _current_order_values(
+    order_values = _analytic_order_values(
         filters,
         statuses=VALID_SALE_STATUSES,
     )
@@ -1697,7 +1752,10 @@ def sellers_page(
             func.count(func.distinct(order_values.c.customer_id)).label(
                 "customers"
             ),
-            literal(ZERO).label("discount_total"),
+            func.coalesce(
+                func.sum(order_values.c.discount_total),
+                0,
+            ).label("discount_total"),
         )
         .select_from(order_values)
         .group_by(order_values.c.seller_id)
@@ -2540,10 +2598,9 @@ def _ranking_products(
     conditions = [
         *_sale_conditions(filters),
         OrderItem.excluded.is_(False),
-        _valid_list_price_expression().is_not(None),
     ]
     revenue_expr = func.coalesce(
-        func.sum(_current_item_value_expression()),
+        func.sum(_mercos_item_value_expression()),
         0,
     ).label("revenue")
     rows = db.execute(
@@ -2674,7 +2731,7 @@ def rankings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
 
 
 def geography(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
-    order_values = _current_order_values(
+    order_values = _analytic_order_values(
         filters,
         statuses=VALID_SALE_STATUSES,
     )

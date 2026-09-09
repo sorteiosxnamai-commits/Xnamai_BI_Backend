@@ -5,10 +5,11 @@ from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 
 from app.adaptor import adaptor
 from app.database import SessionLocal
+from app.domain.order_status import VALID_SALE_STATUSES, status_sql_in
 from app.models import (
     Carrier,
     Category,
@@ -33,6 +34,8 @@ MAX_PAGES = 5000
 ORDER_DETAIL_CONCURRENCY = 2
 RESOURCE_PAUSE_SECONDS = 2
 RATE_LIMIT_PAUSE_SECONDS = 20
+MISSING_DETAIL_BATCH = 10
+MISSING_DETAIL_MAX_BATCHES = 40
 SYNC_LEASE_TTL = timedelta(minutes=15)
 DIMENSION_MODELS = {
     "categories": Category,
@@ -115,12 +118,23 @@ def optional_decimal(row: dict, *keys: str) -> Decimal | None:
     return None
 
 
+def _order_line_items(row: dict) -> list | None:
+    if "itens" in row:
+        items = row.get("itens")
+    elif "items" in row:
+        items = row.get("items")
+    else:
+        return None
+    return items if isinstance(items, list) else None
+
+
 async def _hydrate_order_details(rows: list[dict]) -> list[dict]:
-    """Fetch details only when the v2 list payload omits the items field."""
+    """Fetch details when the v2 list payload omits items or returns them empty."""
     semaphore = asyncio.Semaphore(ORDER_DETAIL_CONCURRENCY)
 
     async def fetch(row: dict):
-        if "itens" in row or "items" in row:
+        items = _order_line_items(row)
+        if items:
             return row
         mercos_id = str(row.get("id") or "")
         if not mercos_id:
@@ -139,6 +153,47 @@ async def _hydrate_order_details(rows: list[dict]) -> list[dict]:
     if failures:
         raise OrderDetailBatchError(len(failures), failures[0])
     return [result for result in results if isinstance(result, dict)]
+
+
+def _orders_missing_items(limit: int) -> list[str]:
+    with SessionLocal() as db:
+        return [
+            str(mercos_id)
+            for mercos_id in db.scalars(
+                select(Order.mercos_id)
+                .where(
+                    func.coalesce(Order.item_count, 0) == 0,
+                    status_sql_in(Order.status, VALID_SALE_STATUSES),
+                )
+                .order_by(Order.issued_at.desc())
+                .limit(limit)
+            ).all()
+        ]
+
+
+def _persist_order_detail_rows(rows: list[dict]) -> int:
+    with SessionLocal() as db:
+        result = _upsert_rows(db, "orders", rows)
+        db.commit()
+        return int(result["persisted"])
+
+
+async def _backfill_missing_order_details() -> int:
+    repaired = 0
+    for _ in range(MISSING_DETAIL_MAX_BATCHES):
+        ids = await asyncio.to_thread(_orders_missing_items, MISSING_DETAIL_BATCH)
+        if not ids:
+            break
+        try:
+            rows = await _hydrate_order_details([{"id": mercos_id} for mercos_id in ids])
+        except OrderDetailBatchError as exc:
+            log.warning("Backfill de itens Mercos interrompido: %s", exc)
+            break
+        persisted = await asyncio.to_thread(_persist_order_detail_rows, rows)
+        repaired += persisted
+    if repaired:
+        log.info("Backfill de itens Mercos: %s pedidos atualizados", repaired)
+    return repaired
 
 
 def _upsert_rows(db, resource: str, rows: list):
@@ -580,11 +635,7 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
                 break
             received += len(rows)
             if resource == "orders":
-                details_needed = sum(
-                    1
-                    for row in rows
-                    if "itens" not in row and "items" not in row
-                )
+                details_needed = sum(1 for row in rows if not _order_line_items(row))
                 try:
                     rows = await _hydrate_order_details(rows)
                     details_consulted += details_needed
@@ -636,6 +687,9 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             )
             log.warning("Sync %s partial after %s pages (%s records)", resource, MAX_PAGES, persisted)
             return {**snapshot, "records": persisted, "status": "partial"}
+
+        if resource == "orders":
+            details_consulted += await _backfill_missing_order_details()
 
         snapshot = await asyncio.to_thread(
             _finish_sync_run,
