@@ -42,6 +42,7 @@ from app.models import (
 from app.schemas.analytics import AnalyticsFilters
 from app.services.analytics_filters import (
     applied_filters,
+    comparison_period,
     date_bounds,
     order_conditions,
     previous_bounds,
@@ -500,6 +501,7 @@ def overview(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
             if key in definitions
         },
         "appliedFilters": applied_filters(filters),
+        "comparison": comparison_period(filters),
         "metadata": analytics_metadata(db),
     }
 
@@ -736,6 +738,7 @@ def timeseries(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         "previousItems": previous_items,
         "granularity": filters.granularity,
         "appliedFilters": applied_filters(filters),
+        "comparison": comparison_period(filters),
         "metadata": analytics_metadata(db),
     }
 

@@ -1,3 +1,4 @@
+import calendar
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -91,6 +92,24 @@ def date_bounds(
     return start, end
 
 
+def _shift_calendar_months(dt: datetime, months: int) -> datetime:
+    local = dt.astimezone(BR_TZ)
+    month_index = local.month - 1 + months
+    year = local.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(local.day, calendar.monthrange(year, month)[1])
+    shifted = local.replace(year=year, month=month, day=day)
+    return shifted.astimezone(timezone.utc)
+
+
+def _comparison_month_delta(filters: AnalyticsFilters) -> int:
+    if filters.dateFrom or filters.dateTo:
+        return -1
+    if filters.period in {"ytd", "365d"}:
+        return -12
+    return -1
+
+
 def previous_bounds(
     filters: AnalyticsFilters,
     *,
@@ -100,8 +119,37 @@ def previous_bounds(
     if start is None:
         return None, None
     effective_end = end or now or datetime.now(timezone.utc)
-    duration = effective_end - start
-    return start - duration, start
+    if effective_end.tzinfo is None:
+        effective_end = effective_end.replace(tzinfo=timezone.utc)
+    months = _comparison_month_delta(filters)
+    return (
+        _shift_calendar_months(start, months),
+        _shift_calendar_months(effective_end, months),
+    )
+
+
+def _inclusive_end_date(end: datetime) -> date:
+    return (end.astimezone(BR_TZ) - timedelta(microseconds=1)).date()
+
+
+def comparison_period(
+    filters: AnalyticsFilters,
+    *,
+    now: datetime | None = None,
+) -> dict[str, str] | None:
+    start, end = date_bounds(filters, now=now)
+    prev_start, prev_end = previous_bounds(filters, now=now)
+    if start is None or prev_start is None or prev_end is None:
+        return None
+    effective_end = end or now or datetime.now(timezone.utc)
+    if effective_end.tzinfo is None:
+        effective_end = effective_end.replace(tzinfo=timezone.utc)
+    return {
+        "currentFrom": start.astimezone(BR_TZ).date().isoformat(),
+        "currentTo": _inclusive_end_date(effective_end).isoformat(),
+        "previousFrom": prev_start.astimezone(BR_TZ).date().isoformat(),
+        "previousTo": _inclusive_end_date(prev_end).isoformat(),
+    }
 
 
 def order_conditions(

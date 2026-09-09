@@ -106,7 +106,7 @@ def seed_orders(db: Session) -> None:
                 customer_mercos_id="c1",
                 seller_mercos_id="s1",
                 status="2",
-                issued_at=datetime(2026, 7, 25, 12, tzinfo=timezone.utc),
+                issued_at=datetime(2026, 7, 10, 12, tzinfo=timezone.utc),
                 total=Decimal("50.00"),
                 item_count=1,
                 sku_count=1,
@@ -373,6 +373,12 @@ def test_overview_separates_sales_and_cancellations_with_comparison() -> None:
         assert result["kpis"]["discountTotal"]["value"] == Decimal("10.00")
         assert result["kpis"]["netRevenue"]["previousValue"] == Decimal("50.00")
         assert result["kpis"]["netRevenue"]["percentageChange"] == 100.0
+        assert result["comparison"] == {
+            "currentFrom": "2026-08-01",
+            "currentTo": "2026-08-12",
+            "previousFrom": "2026-07-01",
+            "previousTo": "2026-07-12",
+        }
         assert result["kpis"]["newBuyers"]["value"] == Decimal("0")
         assert result["kpis"]["recurringBuyers"]["value"] == Decimal("1")
         series = timeseries(db, filters)
