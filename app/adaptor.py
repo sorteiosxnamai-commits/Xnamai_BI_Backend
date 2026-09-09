@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from urllib.parse import quote
 
 import httpx
@@ -12,6 +13,11 @@ log = logging.getLogger("uvicorn.error")
 TRANSIENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError)
 DEFAULT_RETRIES = 10
 WARMUP_RETRIES = 6
+RETRYABLE_STATUS = {429, 502, 503, 504}
+MAX_RETRY_WAIT = 120.0
+
+_request_lock = asyncio.Lock()
+_not_before = 0.0
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -20,6 +26,38 @@ def _response_detail(response: httpx.Response) -> str:
     if "text/html" in content_type or text.lower().startswith(("<!doctype", "<html")):
         return "resposta HTML temporária do provedor"
     return text or response.reason_phrase
+
+
+def _retry_wait(response: httpx.Response, attempt: int) -> float:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("tempo_ate_permitir_novamente") is not None:
+            wait = float(payload["tempo_ate_permitir_novamente"])
+            if wait > 0:
+                return min(wait + 0.5, MAX_RETRY_WAIT)
+    except (ValueError, TypeError):
+        pass
+    header = response.headers.get("Retry-After")
+    if header:
+        try:
+            return min(max(float(header), 1.0), MAX_RETRY_WAIT)
+        except ValueError:
+            pass
+    if response.status_code == 429:
+        return min(30 * (2 ** attempt), MAX_RETRY_WAIT)
+    return min(2 ** attempt, 30)
+
+
+def _extend_cooldown(wait: float) -> None:
+    global _not_before
+    _not_before = max(_not_before, time.monotonic() + max(wait, 0))
+
+
+async def _respect_cooldown() -> None:
+    delay = _not_before - time.monotonic()
+    if delay > 0.05:
+        log.warning("Adaptor cooldown %.1ss before next Mercos call", delay)
+        await asyncio.sleep(delay)
 
 
 class Adaptor:
@@ -58,12 +96,15 @@ class Adaptor:
 
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
-                    r = await client.get(
-                        url,
-                        params=params,
-                        headers={"X-API-Key": cfg.mercos_adaptor_api_key},
-                    )
+                async with _request_lock:
+                    if attempt == 0:
+                        await _respect_cooldown()
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+                        r = await client.get(
+                            url,
+                            params=params,
+                            headers={"X-API-Key": cfg.mercos_adaptor_api_key},
+                        )
             except TRANSIENT as exc:
                 last_exc = exc
                 if attempt + 1 >= retries:
@@ -82,18 +123,20 @@ class Adaptor:
             except httpx.RequestError as exc:
                 raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
 
-            if r.status_code in {502, 503, 504} and attempt + 1 < retries:
-                wait = min(2 ** attempt, 30)
-                log.warning(
-                    "Adaptor %s HTTP %s attempt %s/%s; retry in %ss",
-                    resource,
-                    r.status_code,
-                    attempt + 1,
-                    retries,
-                    wait,
-                )
-                await asyncio.sleep(wait)
-                continue
+            if r.status_code in RETRYABLE_STATUS:
+                wait = _retry_wait(r, attempt)
+                _extend_cooldown(wait)
+                if attempt + 1 < retries:
+                    log.warning(
+                        "Adaptor %s HTTP %s attempt %s/%s; retry in %ss",
+                        resource,
+                        r.status_code,
+                        attempt + 1,
+                        retries,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
 
             if r.is_error:
                 detail = _response_detail(r)
@@ -124,11 +167,14 @@ class Adaptor:
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
-                    response = await client.get(
-                        url,
-                        headers={"X-API-Key": cfg.mercos_adaptor_api_key},
-                    )
+                async with _request_lock:
+                    if attempt == 0:
+                        await _respect_cooldown()
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+                        response = await client.get(
+                            url,
+                            headers={"X-API-Key": cfg.mercos_adaptor_api_key},
+                        )
             except TRANSIENT as exc:
                 last_exc = exc
                 if attempt + 1 < retries:
@@ -138,14 +184,21 @@ class Adaptor:
             except httpx.RequestError as exc:
                 raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
 
-            if response.status_code in {429, 502, 503, 504} and attempt + 1 < retries:
-                retry_after = response.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else min(2 ** attempt, 30)
-                except ValueError:
-                    wait = min(2 ** attempt, 30)
-                await asyncio.sleep(max(0, wait))
-                continue
+            if response.status_code in RETRYABLE_STATUS:
+                wait = _retry_wait(response, attempt)
+                _extend_cooldown(wait)
+                if attempt + 1 < retries:
+                    log.warning(
+                        "Adaptor %s/%s HTTP %s attempt %s/%s; retry in %ss",
+                        resource,
+                        mercos_id,
+                        response.status_code,
+                        attempt + 1,
+                        retries,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
             if response.is_error:
                 detail = _response_detail(response)
                 raise HTTPException(

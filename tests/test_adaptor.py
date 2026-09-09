@@ -8,6 +8,13 @@ import pytest
 from app import adaptor as adaptor_module
 
 
+@pytest.fixture(autouse=True)
+def reset_adaptor_cooldown():
+    adaptor_module._not_before = 0.0
+    yield
+    adaptor_module._not_before = 0.0
+
+
 class FakeClient:
     def __init__(self, responses: list[httpx.Response], *, health_ok: bool = True):
         self.responses = responses
@@ -41,11 +48,14 @@ class FakeClient:
         return response
 
 
-def response(status: int, *, text: str = "") -> httpx.Response:
+def response(status: int, *, text: str = "", headers: dict | None = None) -> httpx.Response:
     request = httpx.Request(
         "GET",
         "https://mercosadaptor.onrender.com/v1/orders",
     )
+    merged = {"content-type": "text/html"}
+    if headers:
+        merged.update(headers)
     if status == 200:
         return httpx.Response(
             status,
@@ -55,7 +65,7 @@ def response(status: int, *, text: str = "") -> httpx.Response:
     return httpx.Response(
         status,
         text=text,
-        headers={"content-type": "text/html"},
+        headers=merged,
         request=request,
     )
 
@@ -91,6 +101,59 @@ async def test_list_wakes_adaptor_before_orders(monkeypatch):
     assert fake.calls == 6
     assert fake.urls[0].endswith("/health")
     assert [call.args[0] for call in sleep.await_args_list] == [1, 2, 4, 8, 16]
+
+
+@pytest.mark.asyncio
+async def test_list_retries_429_then_succeeds(monkeypatch):
+    fake = FakeClient(
+        [
+            response(429, text="Too Many Requests", headers={"Retry-After": "7"}),
+            response(200),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
+    monkeypatch.setattr(adaptor_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        adaptor_module,
+        "settings",
+        lambda: SimpleNamespace(
+            mercos_adaptor_url="https://mercosadaptor.onrender.com",
+            mercos_adaptor_api_key="test-key",
+        ),
+    )
+
+    result = await adaptor_module.Adaptor().list("customers")
+
+    assert result == {"data": [], "nextCursor": None}
+    assert fake.calls == 2
+    assert sleep.await_args_list[0].args[0] == 7
+
+
+@pytest.mark.asyncio
+async def test_list_uses_default_429_backoff_without_retry_after(monkeypatch):
+    fake = FakeClient(
+        [
+            response(429, text="Too Many Requests"),
+            response(200),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
+    monkeypatch.setattr(adaptor_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        adaptor_module,
+        "settings",
+        lambda: SimpleNamespace(
+            mercos_adaptor_url="https://mercosadaptor.onrender.com",
+            mercos_adaptor_api_key="test-key",
+        ),
+    )
+
+    result = await adaptor_module.Adaptor().list("products")
+
+    assert result == {"data": [], "nextCursor": None}
+    assert sleep.await_args_list[0].args[0] == 30
 
 
 @pytest.mark.asyncio

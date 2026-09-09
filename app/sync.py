@@ -30,7 +30,9 @@ from app.models import (
 log = logging.getLogger("uvicorn.error")
 
 MAX_PAGES = 5000
-ORDER_DETAIL_CONCURRENCY = 5
+ORDER_DETAIL_CONCURRENCY = 2
+RESOURCE_PAUSE_SECONDS = 2
+RATE_LIMIT_PAUSE_SECONDS = 20
 SYNC_LEASE_TTL = timedelta(minutes=15)
 DIMENSION_MODELS = {
     "categories": Category,
@@ -724,10 +726,27 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         return {"resource": resource, "status": status, "error": str(detail)}
 
 
+async def _pause_after_resource(result: dict, *, last: bool) -> None:
+    if last:
+        return
+    if result.get("status") == "interrupted":
+        log.warning(
+            "Sync %s interrupted; waiting %ss before the next resource",
+            result.get("resource"),
+            RATE_LIMIT_PAUSE_SECONDS,
+        )
+        await asyncio.sleep(RATE_LIMIT_PAUSE_SECONDS)
+        return
+    await asyncio.sleep(RESOURCE_PAUSE_SECONDS)
+
+
 async def sync_all(full=False, *, raise_http=True):
     results = []
-    for resource in SYNC_RESOURCES:
-        results.append(await sync_resource(resource, full, raise_http=False))
+    total = len(SYNC_RESOURCES)
+    for index, resource in enumerate(SYNC_RESOURCES):
+        result = await sync_resource(resource, full, raise_http=False)
+        results.append(result)
+        await _pause_after_resource(result, last=index + 1 == total)
     if raise_http and results and all(r.get("status") == "error" for r in results):
         raise HTTPException(502, {"message": "Sync falhou", "results": results})
     return results
@@ -738,5 +757,7 @@ async def sync_orders_job():
 
 
 async def sync_catalog_job():
-    for resource in CATALOG_RESOURCES:
-        await sync_resource(resource, full=False, raise_http=False)
+    total = len(CATALOG_RESOURCES)
+    for index, resource in enumerate(CATALOG_RESOURCES):
+        result = await sync_resource(resource, full=False, raise_http=False)
+        await _pause_after_resource(result, last=index + 1 == total)
