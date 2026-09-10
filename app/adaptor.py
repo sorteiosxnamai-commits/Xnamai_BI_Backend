@@ -11,10 +11,10 @@ from app.config import settings
 log = logging.getLogger("uvicorn.error")
 
 TRANSIENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError)
-DEFAULT_RETRIES = 10
+DEFAULT_RETRIES = 20
 WARMUP_RETRIES = 6
 RETRYABLE_STATUS = {429, 502, 503, 504}
-MAX_RETRY_WAIT = 120.0
+MAX_RETRY_WAIT = 300.0
 
 _request_lock = asyncio.Lock()
 _not_before = 0.0
@@ -94,57 +94,55 @@ class Adaptor:
         url = f"{cfg.mercos_adaptor_url.rstrip('/')}/v1/{resource}"
         last_exc: Exception | None = None
 
-        for attempt in range(retries):
-            try:
-                async with _request_lock:
-                    if attempt == 0:
-                        await _respect_cooldown()
+        async with _request_lock:
+            for attempt in range(retries):
+                try:
+                    await _respect_cooldown()
                     async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
                         r = await client.get(
                             url,
                             params=params,
                             headers={"X-API-Key": cfg.mercos_adaptor_api_key},
                         )
-            except TRANSIENT as exc:
-                last_exc = exc
-                if attempt + 1 >= retries:
-                    break
-                wait = min(2 ** attempt, 30)
-                log.warning(
-                    "Adaptor %s attempt %s/%s failed (%s); retry in %ss",
-                    resource,
-                    attempt + 1,
-                    retries,
-                    type(exc).__name__,
-                    wait,
-                )
-                await asyncio.sleep(wait)
-                continue
-            except httpx.RequestError as exc:
-                raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
-
-            if r.status_code in RETRYABLE_STATUS:
-                wait = _retry_wait(r, attempt)
-                _extend_cooldown(wait)
-                if attempt + 1 < retries:
+                except TRANSIENT as exc:
+                    last_exc = exc
+                    if attempt + 1 >= retries:
+                        break
+                    wait = min(2 ** attempt, 30)
+                    _extend_cooldown(wait)
                     log.warning(
-                        "Adaptor %s HTTP %s attempt %s/%s; retry in %ss",
+                        "Adaptor %s attempt %s/%s failed (%s); retry in %ss",
                         resource,
-                        r.status_code,
                         attempt + 1,
                         retries,
+                        type(exc).__name__,
                         wait,
                     )
-                    await asyncio.sleep(wait)
                     continue
+                except httpx.RequestError as exc:
+                    raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
 
-            if r.is_error:
-                detail = _response_detail(r)
-                raise HTTPException(
-                    status_code=502 if r.status_code >= 500 else r.status_code,
-                    detail=f"Adaptor {r.status_code} em /v1/{resource}: {detail}",
-                )
-            return r.json()
+                if r.status_code in RETRYABLE_STATUS:
+                    wait = _retry_wait(r, attempt)
+                    _extend_cooldown(wait)
+                    if attempt + 1 < retries:
+                        log.warning(
+                            "Adaptor %s HTTP %s attempt %s/%s; retry in %ss",
+                            resource,
+                            r.status_code,
+                            attempt + 1,
+                            retries,
+                            wait,
+                        )
+                        continue
+
+                if r.is_error:
+                    detail = _response_detail(r)
+                    raise HTTPException(
+                        status_code=502 if r.status_code >= 500 else r.status_code,
+                        detail=f"Adaptor {r.status_code} em /v1/{resource}: {detail}",
+                    )
+                return r.json()
 
         raise HTTPException(
             502,
@@ -165,50 +163,48 @@ class Adaptor:
         safe_id = quote(str(mercos_id), safe="")
         url = f"{cfg.mercos_adaptor_url.rstrip('/')}/v1/{resource}/{safe_id}"
         last_exc: Exception | None = None
-        for attempt in range(retries):
-            try:
-                async with _request_lock:
-                    if attempt == 0:
-                        await _respect_cooldown()
+        async with _request_lock:
+            for attempt in range(retries):
+                try:
+                    await _respect_cooldown()
                     async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
                         response = await client.get(
                             url,
                             headers={"X-API-Key": cfg.mercos_adaptor_api_key},
                         )
-            except TRANSIENT as exc:
-                last_exc = exc
-                if attempt + 1 < retries:
-                    await asyncio.sleep(min(2 ** attempt, 30))
-                    continue
-                break
-            except httpx.RequestError as exc:
-                raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
+                except TRANSIENT as exc:
+                    last_exc = exc
+                    if attempt + 1 < retries:
+                        _extend_cooldown(min(2 ** attempt, 30))
+                        continue
+                    break
+                except httpx.RequestError as exc:
+                    raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
 
-            if response.status_code in RETRYABLE_STATUS:
-                wait = _retry_wait(response, attempt)
-                _extend_cooldown(wait)
-                if attempt + 1 < retries:
-                    log.warning(
-                        "Adaptor %s/%s HTTP %s attempt %s/%s; retry in %ss",
-                        resource,
-                        mercos_id,
-                        response.status_code,
-                        attempt + 1,
-                        retries,
-                        wait,
+                if response.status_code in RETRYABLE_STATUS:
+                    wait = _retry_wait(response, attempt)
+                    _extend_cooldown(wait)
+                    if attempt + 1 < retries:
+                        log.warning(
+                            "Adaptor %s/%s HTTP %s attempt %s/%s; retry in %ss",
+                            resource,
+                            mercos_id,
+                            response.status_code,
+                            attempt + 1,
+                            retries,
+                            wait,
+                        )
+                        continue
+                if response.is_error:
+                    detail = _response_detail(response)
+                    raise HTTPException(
+                        status_code=502 if response.status_code >= 500 else response.status_code,
+                        detail=f"Adaptor {response.status_code} em detalhe de {resource}: {detail}",
                     )
-                    await asyncio.sleep(wait)
-                    continue
-            if response.is_error:
-                detail = _response_detail(response)
-                raise HTTPException(
-                    status_code=502 if response.status_code >= 500 else response.status_code,
-                    detail=f"Adaptor {response.status_code} em detalhe de {resource}: {detail}",
-                )
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise HTTPException(502, f"Detalhe de {resource} retornou formato inválido")
-            return payload
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise HTTPException(502, f"Detalhe de {resource} retornou formato inválido")
+                return payload
 
         raise HTTPException(
             502,

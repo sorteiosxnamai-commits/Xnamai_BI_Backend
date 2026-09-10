@@ -100,7 +100,9 @@ async def test_list_wakes_adaptor_before_orders(monkeypatch):
     assert fake.health_calls == 1
     assert fake.calls == 6
     assert fake.urls[0].endswith("/health")
-    assert [call.args[0] for call in sleep.await_args_list] == [1, 2, 4, 8, 16]
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
+        [1, 2, 4, 8, 16], abs=0.05
+    )
 
 
 @pytest.mark.asyncio
@@ -127,7 +129,7 @@ async def test_list_retries_429_then_succeeds(monkeypatch):
 
     assert result == {"data": [], "nextCursor": None}
     assert fake.calls == 2
-    assert sleep.await_args_list[0].args[0] == 7
+    assert sleep.await_args_list[0].args[0] == pytest.approx(7, abs=0.05)
 
 
 @pytest.mark.asyncio
@@ -153,7 +155,7 @@ async def test_list_uses_default_429_backoff_without_retry_after(monkeypatch):
     result = await adaptor_module.Adaptor().list("products")
 
     assert result == {"data": [], "nextCursor": None}
-    assert sleep.await_args_list[0].args[0] == 30
+    assert sleep.await_args_list[0].args[0] == pytest.approx(30, abs=0.05)
 
 
 @pytest.mark.asyncio

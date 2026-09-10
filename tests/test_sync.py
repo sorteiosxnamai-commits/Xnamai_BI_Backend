@@ -257,6 +257,49 @@ async def test_active_lease_prevents_duplicate_resource_sync(sync_db, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_claim_blocks_other_resources_while_one_is_running(sync_db, monkeypatch):
+    with sync_db() as db:
+        db.add(
+            SyncState(
+                resource="orders",
+                status="running",
+                lease_token="active-token",
+                heartbeat_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+    class UnexpectedAdaptor:
+        async def list(self, resource: str, cursor: str | None):
+            raise AssertionError("Mercos must stay idle while another resource is syncing")
+
+    monkeypatch.setattr(sync, "adaptor", UnexpectedAdaptor())
+    result = await sync.sync_resource("categories")
+    assert result["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_sync_all_stops_after_rate_limit(sync_db, monkeypatch):
+    called: list[str] = []
+
+    class RateLimitedAdaptor:
+        async def list(self, resource: str, cursor: str | None):
+            called.append(resource)
+            raise HTTPException(429, "Too Many Requests")
+
+    monkeypatch.setattr(sync, "adaptor", RateLimitedAdaptor())
+    monkeypatch.setattr(sync, "SYNC_RESOURCES", ("categories", "orders"))
+    monkeypatch.setattr(sync, "RESOURCE_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(sync, "RATE_LIMIT_PAUSE_SECONDS", 0)
+
+    results = await sync.sync_all(full=False, raise_http=False)
+
+    assert called == ["categories"]
+    assert results[0]["status"] == "interrupted"
+    assert len(results) == 1
+
+
+@pytest.mark.asyncio
 async def test_page_persistence_does_not_block_event_loop(sync_db, monkeypatch):
     monkeypatch.setattr(sync, "adaptor", ListWithItemsAdaptor())
     original = sync._persist_sync_page

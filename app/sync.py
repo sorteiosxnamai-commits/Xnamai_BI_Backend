@@ -31,11 +31,11 @@ from app.models import (
 log = logging.getLogger("uvicorn.error")
 
 MAX_PAGES = 5000
-ORDER_DETAIL_CONCURRENCY = 2
-RESOURCE_PAUSE_SECONDS = 2
-RATE_LIMIT_PAUSE_SECONDS = 20
-MISSING_DETAIL_BATCH = 10
-MISSING_DETAIL_MAX_BATCHES = 40
+ORDER_DETAIL_CONCURRENCY = 1
+RESOURCE_PAUSE_SECONDS = 5
+RATE_LIMIT_PAUSE_SECONDS = 180
+MISSING_DETAIL_BATCH = 5
+MISSING_DETAIL_MAX_BATCHES = 20
 SYNC_LEASE_TTL = timedelta(minutes=15)
 DIMENSION_MODELS = {
     "categories": Category,
@@ -437,6 +437,17 @@ def _upsert_rows(db, resource: str, rows: list):
     return {"persisted": persisted, "itemsPersisted": items_persisted}
 
 
+def _lease_is_active(state, now: datetime) -> bool:
+    if state is None or state.status != "running":
+        return False
+    heartbeat = state.heartbeat_at
+    if heartbeat is None:
+        return False
+    if heartbeat.tzinfo is None:
+        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+    return heartbeat >= now - SYNC_LEASE_TTL
+
+
 def _claim_sync(resource: str, full: bool, started_at: datetime):
     """Atomically claim a resource across workers and service instances."""
     now = datetime.now(timezone.utc)
@@ -444,8 +455,14 @@ def _claim_sync(resource: str, full: bool, started_at: datetime):
         if db.bind is not None and db.bind.dialect.name == "postgresql":
             db.execute(
                 text("SELECT pg_advisory_xact_lock(hashtext(:resource))"),
-                {"resource": f"xnamai_sync_{resource}"},
+                {"resource": "xnamai_sync_mercos"},
             )
+        busy = db.scalars(select(SyncState)).all()
+        for other in busy:
+            if other.resource == resource:
+                continue
+            if _lease_is_active(other, now):
+                return None
         state = db.scalar(
             select(SyncState)
             .where(SyncState.resource == resource)
@@ -615,7 +632,7 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         return {
             "resource": resource,
             "status": "running",
-            "message": "Sincronização deste recurso já está em andamento",
+            "message": "Sincronização Mercos já está em andamento",
         }
     run_id, lease_token, cursor_before = claim
     cursor = None if full else cursor_before
@@ -800,6 +817,13 @@ async def sync_all(full=False, *, raise_http=True):
     for index, resource in enumerate(SYNC_RESOURCES):
         result = await sync_resource(resource, full, raise_http=False)
         results.append(result)
+        if result.get("status") in {"running", "interrupted"}:
+            log.warning(
+                "Stopping Mercos pipeline after %s on %s",
+                result.get("status"),
+                resource,
+            )
+            break
         await _pause_after_resource(result, last=index + 1 == total)
     if raise_http and results and all(r.get("status") == "error" for r in results):
         raise HTTPException(502, {"message": "Sync falhou", "results": results})
@@ -814,4 +838,11 @@ async def sync_catalog_job():
     total = len(CATALOG_RESOURCES)
     for index, resource in enumerate(CATALOG_RESOURCES):
         result = await sync_resource(resource, full=False, raise_http=False)
+        if result.get("status") in {"running", "interrupted"}:
+            log.warning(
+                "Stopping catalog job after %s on %s",
+                result.get("status"),
+                resource,
+            )
+            break
         await _pause_after_resource(result, last=index + 1 == total)
