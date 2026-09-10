@@ -11,8 +11,10 @@ from app import adaptor as adaptor_module
 @pytest.fixture(autouse=True)
 def reset_adaptor_cooldown():
     adaptor_module._not_before = 0.0
+    adaptor_module.clear_cancel()
     yield
     adaptor_module._not_before = 0.0
+    adaptor_module.clear_cancel()
 
 
 class FakeClient:

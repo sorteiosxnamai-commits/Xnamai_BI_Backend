@@ -448,6 +448,29 @@ def _lease_is_active(state, now: datetime) -> bool:
     return heartbeat >= now - SYNC_LEASE_TTL
 
 
+def interrupt_running_syncs(reason: str = "Sincronização interrompida") -> int:
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        states = list(
+            db.scalars(select(SyncState).where(SyncState.status == "running"))
+        )
+        runs = list(
+            db.scalars(select(SyncRun).where(SyncRun.status == "running"))
+        )
+        for state in states:
+            state.status = "interrupted"
+            state.error = reason
+            state.lease_token = None
+            db.add(state)
+        for run in runs:
+            run.status = "interrupted"
+            run.finished_at = now
+            run.error = reason
+            db.add(run)
+        db.commit()
+        return len(states)
+
+
 def _claim_sync(resource: str, full: bool, started_at: datetime):
     """Atomically claim a resource across workers and service instances."""
     now = datetime.now(timezone.utc)
@@ -769,7 +792,7 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             }
         transient = isinstance(source_exc, HTTPException) and (
             "inacessível" in str(source_exc.detail).lower()
-            or source_exc.status_code in {429, 502, 503}
+            or source_exc.status_code in {409, 429, 502, 503}
         )
         status = "interrupted" if transient else "error"
         failed = max(failed, received - persisted)
@@ -789,7 +812,10 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             started_at=started_at,
             error=str(detail)[:1000],
         )
-        log.exception("Sync failed for %s", resource)
+        if isinstance(source_exc, HTTPException) and source_exc.status_code == 409:
+            log.warning("Sync %s cancelled by operator", resource)
+        else:
+            log.exception("Sync failed for %s", resource)
         if raise_http:
             if isinstance(exc, HTTPException):
                 raise

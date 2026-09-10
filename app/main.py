@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -32,10 +33,11 @@ from app.routers.exports import router as exports_router
 from app.routers.retail import router as retail_router
 from app.schemas.data_quality import DataQualityResponse
 from app.services.data_quality import build_data_quality_report
-from app.adaptor import keep_adaptor_warm
+from app.adaptor import clear_cancel, keep_adaptor_warm, request_cancel
 from app.sync import (
     SYNC_LEASE_TTL,
     SYNC_RESOURCES,
+    interrupt_running_syncs,
     sync_all,
     sync_catalog_job,
     sync_orders_job,
@@ -389,6 +391,22 @@ def sync_runs(
     }
 
 
+@app.post("/api/v1/sync/cancel", dependencies=[Depends(require_admin)])
+async def cancel_sync():
+    global _sync_busy
+    request_cancel()
+    _sync_busy = False
+    released = await asyncio.to_thread(
+        interrupt_running_syncs,
+        "Interrompida pelo operador",
+    )
+    return {
+        "status": "interrupted",
+        "message": "Sincronização liberada. Já pode iniciar de novo.",
+        "released": released,
+    }
+
+
 @app.post("/api/v1/sync/{resource}", dependencies=[Depends(require_admin)])
 async def run_sync(resource: str, background_tasks: BackgroundTasks, full: bool = False):
     global _sync_busy
@@ -404,6 +422,7 @@ async def run_sync(resource: str, background_tasks: BackgroundTasks, full: bool 
         )
 
     _sync_busy = True
+    clear_cancel()
 
     async def _job():
         global _sync_busy
@@ -414,6 +433,7 @@ async def run_sync(resource: str, background_tasks: BackgroundTasks, full: bool 
                 await sync_resource(resource, full, raise_http=False)
         finally:
             _sync_busy = False
+            clear_cancel()
 
     background_tasks.add_task(_job)
     return JSONResponse(

@@ -15,9 +15,19 @@ DEFAULT_RETRIES = 20
 WARMUP_RETRIES = 6
 RETRYABLE_STATUS = {429, 502, 503, 504}
 MAX_RETRY_WAIT = 300.0
+RATE_LIMIT_BUDGET = 90.0
 
 _request_lock = asyncio.Lock()
 _not_before = 0.0
+_cancel = asyncio.Event()
+
+
+def request_cancel() -> None:
+    _cancel.set()
+
+
+def clear_cancel() -> None:
+    _cancel.clear()
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -53,11 +63,32 @@ def _extend_cooldown(wait: float) -> None:
     _not_before = max(_not_before, time.monotonic() + max(wait, 0))
 
 
+async def _raise_if_cancelled() -> None:
+    if _cancel.is_set():
+        raise HTTPException(409, "Sincronização interrompida pelo operador")
+
+
 async def _respect_cooldown() -> None:
+    await _raise_if_cancelled()
     delay = _not_before - time.monotonic()
-    if delay > 0.05:
-        log.warning("Adaptor cooldown %.1ss before next Mercos call", delay)
-        await asyncio.sleep(delay)
+    if delay <= 0.05:
+        return
+    log.warning("Adaptor cooldown %.1ss before next Mercos call", delay)
+    waiter = asyncio.create_task(_cancel.wait())
+    sleeper = asyncio.create_task(asyncio.sleep(delay))
+    done, pending = await asyncio.wait(
+        {waiter, sleeper},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    if waiter in done and _cancel.is_set():
+        raise HTTPException(409, "Sincronização interrompida pelo operador")
 
 
 class Adaptor:
@@ -93,6 +124,7 @@ class Adaptor:
         params = {"alterado_apos": cursor} if cursor else {}
         url = f"{cfg.mercos_adaptor_url.rstrip('/')}/v1/{resource}"
         last_exc: Exception | None = None
+        rate_limit_waited = 0.0
 
         async with _request_lock:
             for attempt in range(retries):
@@ -125,7 +157,11 @@ class Adaptor:
                 if r.status_code in RETRYABLE_STATUS:
                     wait = _retry_wait(r, attempt)
                     _extend_cooldown(wait)
-                    if attempt + 1 < retries:
+                    rate_limit_waited += wait
+                    if (
+                        attempt + 1 < retries
+                        and rate_limit_waited < RATE_LIMIT_BUDGET
+                    ):
                         log.warning(
                             "Adaptor %s HTTP %s attempt %s/%s; retry in %ss",
                             resource,
@@ -163,6 +199,7 @@ class Adaptor:
         safe_id = quote(str(mercos_id), safe="")
         url = f"{cfg.mercos_adaptor_url.rstrip('/')}/v1/{resource}/{safe_id}"
         last_exc: Exception | None = None
+        rate_limit_waited = 0.0
         async with _request_lock:
             for attempt in range(retries):
                 try:
@@ -184,7 +221,11 @@ class Adaptor:
                 if response.status_code in RETRYABLE_STATUS:
                     wait = _retry_wait(response, attempt)
                     _extend_cooldown(wait)
-                    if attempt + 1 < retries:
+                    rate_limit_waited += wait
+                    if (
+                        attempt + 1 < retries
+                        and rate_limit_waited < RATE_LIMIT_BUDGET
+                    ):
                         log.warning(
                             "Adaptor %s/%s HTTP %s attempt %s/%s; retry in %ss",
                             resource,

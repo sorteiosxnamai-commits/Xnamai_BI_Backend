@@ -257,6 +257,38 @@ async def test_active_lease_prevents_duplicate_resource_sync(sync_db, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_interrupt_running_syncs_releases_stuck_lease(sync_db):
+    with sync_db() as db:
+        db.add(
+            SyncState(
+                resource="orders",
+                status="running",
+                lease_token="stuck-token",
+                heartbeat_at=datetime.now(timezone.utc),
+                error=None,
+            )
+        )
+        db.add(
+            SyncRun(
+                resource="orders",
+                mode="incremental",
+                status="running",
+                started_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+    released = sync.interrupt_running_syncs("Interrompida pelo operador")
+    assert released == 1
+    with sync_db() as db:
+        state = db.scalar(select(SyncState).where(SyncState.resource == "orders"))
+        run = db.scalar(select(SyncRun))
+        assert state.status == "interrupted"
+        assert state.lease_token is None
+        assert run.status == "interrupted"
+
+
+@pytest.mark.asyncio
 async def test_claim_blocks_other_resources_while_one_is_running(sync_db, monkeypatch):
     with sync_db() as db:
         db.add(
