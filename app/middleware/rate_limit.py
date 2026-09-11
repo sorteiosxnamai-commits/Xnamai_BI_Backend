@@ -16,7 +16,7 @@ class ApiRateLimitMiddleware(BaseHTTPMiddleware):
         self.lock = asyncio.Lock()
 
     async def dispatch(self, request, call_next):
-        if not request.url.path.startswith("/api/v1"):
+        if request.method == "OPTIONS" or not request.url.path.startswith("/api/v1"):
             return await call_next(request)
         client = request.client.host if request.client else "unknown"
         now = datetime.now(timezone.utc)

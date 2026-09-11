@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import case, func, select
+from sqlalchemy.orm import Session, defer
 
 from app.models import Customer, Order, OrderItem
 from app.schemas.analytics import AnalyticsFilters
@@ -76,12 +76,17 @@ class _ProductAgg:
     quantity: Decimal = ZERO
     value: Decimal = ZERO
     orders: set[str] = field(default_factory=set)
+    order_count: int = 0
 
     @property
     def average_unit(self) -> Decimal:
         if self.quantity <= 0:
             return ZERO
         return (self.value / self.quantity).quantize(Decimal("0.01"))
+
+    @property
+    def n_orders(self) -> int:
+        return self.order_count or len(self.orders)
 
 
 def _pct(part: Decimal, whole: Decimal) -> float | None:
@@ -121,6 +126,13 @@ def _item_line_total(item: OrderItem) -> Decimal:
     return (_decimal(item.quantity) * _item_unit_price(item)).quantize(Decimal("0.01"))
 
 
+def _item_line_total_sql():
+    return case(
+        (OrderItem.total > 0, OrderItem.total),
+        else_=func.coalesce(OrderItem.quantity * OrderItem.unit_price, 0),
+    )
+
+
 def _load_orders(
     db: Session,
     filters: AnalyticsFilters,
@@ -129,6 +141,7 @@ def _load_orders(
     return list(
         db.execute(
             select(Order, Customer.name)
+            .options(defer(Order.raw))
             .outerjoin(Customer, Customer.mercos_id == Order.customer_mercos_id)
             .where(*_sale_conditions(filters, bounds))
             .order_by(Order.issued_at.desc(), Order.number.desc())
@@ -136,19 +149,63 @@ def _load_orders(
     )
 
 
-def _load_items(db: Session, order_ids: list[str]) -> dict[str, list[OrderItem]]:
+def _load_items(
+    db: Session,
+    filters: AnalyticsFilters,
+    bounds: tuple[datetime | None, datetime | None],
+) -> dict[str, list[OrderItem]]:
     grouped: dict[str, list[OrderItem]] = defaultdict(list)
-    if not order_ids:
-        return grouped
     items = db.scalars(
-        select(OrderItem).where(
-            OrderItem.order_mercos_id.in_(order_ids),
+        select(OrderItem)
+        .options(defer(OrderItem.raw))
+        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .where(
+            *_sale_conditions(filters, bounds),
             OrderItem.excluded.is_(False),
         )
+        .execution_options(yield_per=1000)
     ).all()
     for item in items:
         grouped[item.order_mercos_id].append(item)
     return grouped
+
+
+def _product_agg_from_db(
+    db: Session,
+    filters: AnalyticsFilters,
+    bounds: tuple[datetime | None, datetime | None],
+) -> dict[str, _ProductAgg]:
+    aggregated: dict[str, _ProductAgg] = {}
+    rows = db.execute(
+        select(
+            OrderItem.product_mercos_id,
+            func.max(OrderItem.name),
+            func.max(OrderItem.code),
+            func.coalesce(func.sum(OrderItem.quantity), 0),
+            func.coalesce(func.sum(_item_line_total_sql()), 0),
+            func.count(func.distinct(OrderItem.order_mercos_id)),
+        )
+        .select_from(OrderItem)
+        .join(Order, Order.mercos_id == OrderItem.order_mercos_id)
+        .where(
+            *_sale_conditions(filters, bounds),
+            OrderItem.excluded.is_(False),
+            OrderItem.product_mercos_id.isnot(None),
+            OrderItem.quantity > 0,
+        )
+        .group_by(OrderItem.product_mercos_id)
+    ).all()
+    for product_id, name, code, quantity, value, order_count in rows:
+        if not product_id:
+            continue
+        aggregated[str(product_id)] = _ProductAgg(
+            name=name or str(product_id),
+            code=code,
+            quantity=_decimal(quantity),
+            value=_decimal(value),
+            order_count=int(order_count or 0),
+        )
+    return aggregated
 
 
 def _aggregate_lines(items: list[OrderItem]) -> list[_Line]:
@@ -279,19 +336,14 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
     current_rows = _load_orders(db, filters, current_bounds)
     if prior_bounds[0] is None:
         warnings.append(NO_COMPARISON_WARNING)
-        previous_rows: list[tuple[Order, str | None]] = []
+        previous_products: dict[str, _ProductAgg] = {}
     else:
-        previous_rows = _load_orders(db, filters, prior_bounds)
+        previous_products = _product_agg_from_db(db, filters, prior_bounds)
     metadata = {**metadata, "warnings": warnings}
 
-    order_ids = [order.mercos_id for order, _ in current_rows] + [
-        order.mercos_id for order, _ in previous_rows
-    ]
-    items_by_order = _load_items(db, order_ids)
+    items_by_order = _load_items(db, filters, current_bounds)
     current_baskets = _baskets(current_rows, items_by_order)
-    previous_baskets = _baskets(previous_rows, items_by_order)
     current_products = _product_agg(current_baskets)
-    previous_products = _product_agg(previous_baskets)
 
     dropped_products: list[dict[str, Any]] = []
     product_savings = ZERO
@@ -332,8 +384,8 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
                 "quantitySold": current_stats.quantity,
                 "currentRevenue": current_stats.value.quantize(Decimal("0.01")),
                 "savings": savings,
-                "currentOrders": len(current_stats.orders),
-                "previousOrders": len(previous_stats.orders),
+                "currentOrders": current_stats.n_orders,
+                "previousOrders": previous_stats.n_orders,
             }
         )
 

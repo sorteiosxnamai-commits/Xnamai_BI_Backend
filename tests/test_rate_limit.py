@@ -19,3 +19,18 @@ def test_api_rate_limit_returns_retry_after():
 
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "60"
+
+
+def test_api_rate_limit_skips_options_preflight():
+    test_app = FastAPI()
+    test_app.add_middleware(ApiRateLimitMiddleware, requests_per_minute=1)
+
+    @test_app.get("/api/v1/ping")
+    def ping():
+        return {"ok": True}
+
+    with TestClient(test_app) as client:
+        assert client.get("/api/v1/ping").status_code == 200
+        assert client.options("/api/v1/ping").status_code != 429
+        assert client.options("/api/v1/ping").status_code != 429
+        assert client.get("/api/v1/ping").status_code == 429
