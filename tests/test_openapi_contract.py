@@ -21,6 +21,7 @@ def test_required_bi_contract_is_published():
         "/api/v1/analytics/geography",
         "/api/v1/analytics/cohorts",
         "/api/v1/analytics/associations",
+        "/api/v1/analytics/custom-views/price-savings",
         "/api/v1/analytics/filter-options",
         "/api/v1/data-quality",
         "/api/v1/sync/runs",
@@ -98,6 +99,7 @@ def test_required_bi_contract_is_published():
         "/api/v1/analytics/customers",
         "/api/v1/analytics/sellers",
         "/api/v1/analytics/inventory",
+        "/api/v1/analytics/custom-views/price-savings",
     ):
         parameters = {
             parameter["name"]

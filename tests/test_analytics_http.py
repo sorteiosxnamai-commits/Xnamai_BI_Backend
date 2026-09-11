@@ -103,6 +103,13 @@ def test_analytics_http_contracts_cover_pages_charts_and_drilldowns(http_client)
         "/api/v1/analytics/geography": {"states", "cities", "metadata"},
         "/api/v1/analytics/cohorts": {"cohorts", "metadata"},
         "/api/v1/analytics/associations": {"items", "metadata"},
+        "/api/v1/analytics/custom-views/price-savings": {
+            "summary",
+            "products",
+            "matchedOrders",
+            "customers",
+            "metadata",
+        },
     }
     for path, expected in expected_shapes.items():
         response = http_client.get(path + query)

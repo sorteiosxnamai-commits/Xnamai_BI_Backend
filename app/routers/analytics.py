@@ -26,6 +26,7 @@ from app.services.analytics_v2 import (
     sellers_page,
     timeseries,
 )
+from app.services.price_savings import price_savings
 
 
 router = APIRouter(prefix="/api/v1/analytics", tags=["analytics"])
@@ -299,6 +300,14 @@ def get_associations(
     db: Session = Depends(db_session),
 ):
     return associations(db, filters, limit=limit)
+
+
+@router.get("/custom-views/price-savings")
+def get_price_savings(
+    filters: AnalyticsFilters = Depends(analytics_filters),
+    db: Session = Depends(db_session),
+):
+    return price_savings(db, filters)
 
 
 @router.get("/filter-options")
