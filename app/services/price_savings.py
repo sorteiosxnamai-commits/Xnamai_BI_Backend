@@ -18,6 +18,7 @@ from app.services.analytics_filters import (
     previous_bounds,
 )
 from app.services.analytics_v2 import (
+    PLACEHOLDER_LIST_PRICES,
     ZERO,
     _decimal,
     _sale_conditions,
@@ -28,6 +29,7 @@ from app.services.analytics_v2 import (
 PRODUCT_LIMIT = 50
 ORDER_LIMIT = 200
 CUSTOMER_LIMIT = 100
+MAX_DROP_PCT = Decimal("40")
 NO_COMPARISON_WARNING = (
     "Selecione um período ou datas para comparar com o mesmo recorte do mês anterior."
 )
@@ -217,17 +219,32 @@ def _product_agg(baskets: list[_Basket]) -> dict[str, _ProductAgg]:
     return aggregated
 
 
+def _is_placeholder_unit(unit: Decimal) -> bool:
+    return unit.quantize(Decimal("0.01")) in PLACEHOLDER_LIST_PRICES
+
+
+def _plausible_before(before: Decimal, net: Decimal) -> Decimal:
+    if before <= 0 or net <= 0 or before <= net:
+        return ZERO
+    if _is_placeholder_unit(before):
+        return ZERO
+    drop_pct = (before - net) / before * 100
+    if drop_pct > MAX_DROP_PCT:
+        return ZERO
+    return before
+
+
 def _before_unit(
     line: _Line,
     previous_products: dict[str, _ProductAgg],
 ) -> Decimal:
     net = line.unit_price
     previous = previous_products.get(line.product_id)
-    if previous is not None and previous.average_unit > net:
-        return previous.average_unit
-    if line.list_unit_price > net:
-        return line.list_unit_price
-    return ZERO
+    if previous is not None:
+        usable = _plausible_before(previous.average_unit, net)
+        if usable > 0:
+            return usable
+    return _plausible_before(line.list_unit_price, net)
 
 
 def _line_savings(
@@ -238,8 +255,10 @@ def _line_savings(
     before = _before_unit(line, previous_products)
     if before > net and line.quantity > 0:
         return (line.quantity * (before - net)).quantize(Decimal("0.01"))
-    if line.discount > 0:
-        return line.discount.quantize(Decimal("0.01"))
+    if line.discount > 0 and line.total > 0:
+        discount_pct = line.discount / line.total * 100
+        if discount_pct <= MAX_DROP_PCT:
+            return line.discount.quantize(Decimal("0.01"))
     return ZERO
 
 
@@ -279,6 +298,11 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         if previous_stats is None or previous_stats.average_unit <= 0:
             continue
         if current_stats.average_unit >= previous_stats.average_unit:
+            continue
+        if _plausible_before(
+            previous_stats.average_unit,
+            current_stats.average_unit,
+        ) <= 0:
             continue
         unit_drop = previous_stats.average_unit - current_stats.average_unit
         savings = (current_stats.quantity * unit_drop).quantize(Decimal("0.01"))

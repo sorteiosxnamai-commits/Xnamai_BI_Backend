@@ -201,3 +201,38 @@ def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
         }
         customer_ids = {row["id"] for row in result["customers"]}
         assert customer_ids == {"c1", "c2", "c3"}
+
+
+def test_placeholder_list_price_does_not_inflate_club_savings() -> None:
+    with make_session() as db:
+        seed_price_drop(db)
+        db.add(
+            OrderItem(
+                order_mercos_id="curr-c2",
+                position=1,
+                mercos_item_id="fake",
+                product_mercos_id="p2",
+                code="P2",
+                name="Produto 2",
+                quantity=Decimal("54"),
+                list_unit_price=Decimal("1000.00"),
+                unit_price=Decimal("9.60"),
+                discount=Decimal("53500.00"),
+                total=Decimal("518.40"),
+            )
+        )
+        db.commit()
+        result = price_savings(
+            db,
+            AnalyticsFilters(
+                dateFrom=date(2026, 9, 1),
+                dateTo=date(2026, 9, 9),
+                period="30d",
+            ),
+        )
+
+        orders = {row["currentNumber"]: row for row in result["matchedOrders"]}
+        assert orders["111"]["savings"] == Decimal("10.00")
+        assert orders["111"]["currentTotal"] == Decimal("40.00")
+        assert result["summary"]["matchedSavings"] == Decimal("50.00")
+
