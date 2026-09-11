@@ -26,8 +26,8 @@ from app.services.analytics_v2 import (
 
 
 PRODUCT_LIMIT = 50
-PAIR_LIMIT = 100
-CUSTOMER_LIMIT = 50
+ORDER_LIMIT = 200
+CUSTOMER_LIMIT = 100
 NO_COMPARISON_WARNING = (
     "Selecione um período ou datas para comparar com o mesmo recorte do mês anterior."
 )
@@ -40,6 +40,9 @@ class _Line:
     code: str | None
     quantity: Decimal
     total: Decimal
+    list_quantity: Decimal = ZERO
+    list_value: Decimal = ZERO
+    discount: Decimal = ZERO
 
     @property
     def unit_price(self) -> Decimal:
@@ -47,13 +50,18 @@ class _Line:
             return ZERO
         return (self.total / self.quantity).quantize(Decimal("0.0001"))
 
+    @property
+    def list_unit_price(self) -> Decimal:
+        if self.list_quantity <= 0:
+            return ZERO
+        return (self.list_value / self.list_quantity).quantize(Decimal("0.0001"))
+
 
 @dataclass
 class _Basket:
     order: Order
     customer_id: str
     customer_name: str
-    signature: str
     total: Decimal
     lines: list[_Line]
 
@@ -110,33 +118,6 @@ def _item_line_total(item: OrderItem) -> Decimal:
     return (_decimal(item.quantity) * _item_unit_price(item)).quantize(Decimal("0.01"))
 
 
-def _qty_token(quantity: Decimal) -> str:
-    quantized = _decimal(quantity).quantize(Decimal("0.0001")).normalize()
-    return format(quantized, "f")
-
-
-def _signature(lines: list[_Line]) -> str:
-    parts = [
-        f"{line.product_id}:{_qty_token(line.quantity)}"
-        for line in sorted(lines, key=lambda item: item.product_id)
-        if line.product_id and line.quantity > 0
-    ]
-    return "|".join(parts)
-
-
-def _empty_summary() -> dict[str, Any]:
-    return {
-        "droppedProductCount": 0,
-        "currentOrdersWithDroppedProducts": 0,
-        "productSavings": ZERO,
-        "productSavingsPct": None,
-        "matchedPairCount": 0,
-        "matchedSavings": ZERO,
-        "matchedSavingsPct": None,
-        "customersWithSavings": 0,
-    }
-
-
 def _load_orders(
     db: Session,
     filters: AnalyticsFilters,
@@ -177,21 +158,28 @@ def _aggregate_lines(items: list[OrderItem]) -> list[_Line]:
         if quantity <= 0:
             continue
         current = buckets.get(product_id)
+        list_unit = _decimal(item.list_unit_price)
         if current is None:
-            buckets[product_id] = _Line(
+            current = _Line(
                 product_id=product_id,
                 name=item.name or product_id,
                 code=item.code,
                 quantity=quantity,
                 total=_item_line_total(item),
+                discount=_decimal(item.discount),
             )
-            continue
-        current.quantity += quantity
-        current.total += _item_line_total(item)
-        if item.name and not current.name:
-            current.name = item.name
-        if item.code and not current.code:
-            current.code = item.code
+            buckets[product_id] = current
+        else:
+            current.quantity += quantity
+            current.total += _item_line_total(item)
+            current.discount += _decimal(item.discount)
+            if item.name and not current.name:
+                current.name = item.name
+            if item.code and not current.code:
+                current.code = item.code
+        if list_unit > 0:
+            current.list_quantity += quantity
+            current.list_value += list_unit * quantity
     return list(buckets.values())
 
 
@@ -202,15 +190,13 @@ def _baskets(
     baskets: list[_Basket] = []
     for order, customer_name in rows:
         lines = _aggregate_lines(items_by_order.get(order.mercos_id, []))
-        signature = _signature(lines)
-        if not signature or not order.customer_mercos_id:
+        if not lines:
             continue
         baskets.append(
             _Basket(
                 order=order,
-                customer_id=order.customer_mercos_id,
-                customer_name=customer_name or order.customer_mercos_id,
-                signature=signature,
+                customer_id=order.customer_mercos_id or "",
+                customer_name=customer_name or order.customer_mercos_id or order.number,
                 total=_order_total(order),
                 lines=lines,
             )
@@ -231,45 +217,30 @@ def _product_agg(baskets: list[_Basket]) -> dict[str, _ProductAgg]:
     return aggregated
 
 
-def _pair_baskets(
-    current: list[_Basket],
-    previous: list[_Basket],
-) -> list[tuple[_Basket, _Basket]]:
-    previous_by_key: dict[tuple[str, str], list[_Basket]] = defaultdict(list)
-    for basket in previous:
-        previous_by_key[(basket.customer_id, basket.signature)].append(basket)
-    for group in previous_by_key.values():
-        group.sort(
-            key=lambda item: (
-                item.order.issued_at or datetime.min.replace(tzinfo=timezone.utc),
-                item.order.number,
-            ),
-            reverse=True,
-        )
+def _before_unit(
+    line: _Line,
+    previous_products: dict[str, _ProductAgg],
+) -> Decimal:
+    net = line.unit_price
+    previous = previous_products.get(line.product_id)
+    if previous is not None and previous.average_unit > net:
+        return previous.average_unit
+    if line.list_unit_price > net:
+        return line.list_unit_price
+    return ZERO
 
-    current_by_key: dict[tuple[str, str], list[_Basket]] = defaultdict(list)
-    for basket in current:
-        current_by_key[(basket.customer_id, basket.signature)].append(basket)
 
-    pairs: list[tuple[_Basket, _Basket]] = []
-    for key, current_group in current_by_key.items():
-        previous_group = previous_by_key.get(key, [])
-        if not previous_group:
-            continue
-        current_group.sort(
-            key=lambda item: (
-                item.order.issued_at or datetime.min.replace(tzinfo=timezone.utc),
-                item.order.number,
-            ),
-            reverse=True,
-        )
-        for current_basket, previous_basket in zip(current_group, previous_group):
-            pairs.append((current_basket, previous_basket))
-    pairs.sort(
-        key=lambda item: item[1].total - item[0].total,
-        reverse=True,
-    )
-    return pairs
+def _line_savings(
+    line: _Line,
+    previous_products: dict[str, _ProductAgg],
+) -> Decimal:
+    net = line.unit_price
+    before = _before_unit(line, previous_products)
+    if before > net and line.quantity > 0:
+        return (line.quantity * (before - net)).quantize(Decimal("0.01"))
+    if line.discount > 0:
+        return line.discount.quantize(Decimal("0.01"))
+    return ZERO
 
 
 def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
@@ -277,23 +248,16 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
     comparison = comparison_period(filters)
     current_bounds = date_bounds(filters)
     prior_bounds = previous_bounds(filters)
-
-    if prior_bounds[0] is None:
-        warnings = list(metadata["warnings"])
-        warnings.append(NO_COMPARISON_WARNING)
-        metadata = {**metadata, "warnings": warnings}
-        return {
-            "summary": _empty_summary(),
-            "products": [],
-            "matchedOrders": [],
-            "customers": [],
-            "comparison": comparison,
-            "appliedFilters": applied_filters(filters),
-            "metadata": metadata,
-        }
+    warnings = list(metadata["warnings"])
 
     current_rows = _load_orders(db, filters, current_bounds)
-    previous_rows = _load_orders(db, filters, prior_bounds)
+    if prior_bounds[0] is None:
+        warnings.append(NO_COMPARISON_WARNING)
+        previous_rows: list[tuple[Order, str | None]] = []
+    else:
+        previous_rows = _load_orders(db, filters, prior_bounds)
+    metadata = {**metadata, "warnings": warnings}
+
     order_ids = [order.mercos_id for order, _ in current_rows] + [
         order.mercos_id for order, _ in previous_rows
     ]
@@ -350,54 +314,50 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
             orders_with_drop.add(basket.order.mercos_id)
             customers_with_savings.add(basket.customer_id)
 
-    matched_orders: list[dict[str, Any]] = []
-    matched_savings = ZERO
-    previous_matched_total = ZERO
+    discounted_orders: list[dict[str, Any]] = []
+    club_savings = ZERO
+    before_club_total = ZERO
+    club_order_count = 0
     customer_rollups: dict[str, dict[str, Any]] = {}
 
-    for current_basket, previous_basket in _pair_baskets(
-        current_baskets,
-        previous_baskets,
-    ):
-        savings = (previous_basket.total - current_basket.total).quantize(
-            Decimal("0.01")
-        )
-        if savings <= 0:
-            continue
-        matched_savings += savings
-        previous_matched_total += previous_basket.total
-        customers_with_savings.add(current_basket.customer_id)
+    for basket in current_baskets:
         item_savings = ZERO
-        for line in current_basket.lines:
-            previous_avg = previous_products.get(line.product_id)
-            if previous_avg is None or previous_avg.average_unit <= line.unit_price:
+        discounted_skus = 0
+        for line in basket.lines:
+            savings = _line_savings(line, previous_products)
+            if savings <= 0:
                 continue
-            item_savings += (
-                line.quantity * (previous_avg.average_unit - line.unit_price)
-            ).quantize(Decimal("0.01"))
-        matched_orders.append(
+            item_savings += savings
+            discounted_skus += 1
+        if item_savings <= 0:
+            continue
+        after_total = basket.total
+        before_total = (after_total + item_savings).quantize(Decimal("0.01"))
+        club_savings += item_savings
+        before_club_total += before_total
+        if basket.customer_id:
+            customers_with_savings.add(basket.customer_id)
+        club_order_count += 1
+        discounted_orders.append(
             {
-                "customerId": current_basket.customer_id,
-                "customerName": current_basket.customer_name,
-                "currentOrderId": current_basket.order.mercos_id,
-                "currentNumber": current_basket.order.number,
-                "currentIssuedAt": _iso(current_basket.order.issued_at),
-                "currentTotal": current_basket.total,
-                "previousOrderId": previous_basket.order.mercos_id,
-                "previousNumber": previous_basket.order.number,
-                "previousIssuedAt": _iso(previous_basket.order.issued_at),
-                "previousTotal": previous_basket.total,
-                "savings": savings,
-                "savingsPct": _pct(savings, previous_basket.total),
+                "customerId": basket.customer_id,
+                "customerName": basket.customer_name,
+                "currentOrderId": basket.order.mercos_id,
+                "currentNumber": basket.order.number,
+                "currentIssuedAt": _iso(basket.order.issued_at),
+                "currentTotal": after_total,
+                "previousTotal": before_total,
+                "savings": item_savings,
+                "savingsPct": _pct(item_savings, before_total),
                 "itemSavings": item_savings,
-                "skuCount": len(current_basket.lines),
+                "skuCount": discounted_skus,
             }
         )
         rollup = customer_rollups.setdefault(
-            current_basket.customer_id,
+            basket.customer_id or basket.order.mercos_id,
             {
-                "id": current_basket.customer_id,
-                "name": current_basket.customer_name,
+                "id": basket.customer_id,
+                "name": basket.customer_name,
                 "matchedOrders": 0,
                 "previousTotal": ZERO,
                 "currentTotal": ZERO,
@@ -405,11 +365,12 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
             },
         )
         rollup["matchedOrders"] += 1
-        rollup["previousTotal"] += previous_basket.total
-        rollup["currentTotal"] += current_basket.total
-        rollup["savings"] += savings
+        rollup["previousTotal"] += before_total
+        rollup["currentTotal"] += after_total
+        rollup["savings"] += item_savings
 
-    matched_orders = matched_orders[:PAIR_LIMIT]
+    discounted_orders.sort(key=lambda row: row["savings"], reverse=True)
+    discounted_orders = discounted_orders[:ORDER_LIMIT]
     customers = []
     for rollup in customer_rollups.values():
         customers.append(
@@ -429,15 +390,15 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         "currentOrdersWithDroppedProducts": len(orders_with_drop),
         "productSavings": product_savings,
         "productSavingsPct": _pct(product_savings, previous_implied),
-        "matchedPairCount": len(matched_orders),
-        "matchedSavings": matched_savings,
-        "matchedSavingsPct": _pct(matched_savings, previous_matched_total),
+        "matchedPairCount": club_order_count,
+        "matchedSavings": club_savings,
+        "matchedSavingsPct": _pct(club_savings, before_club_total),
         "customersWithSavings": len(customers_with_savings),
     }
     return {
         "summary": summary,
         "products": dropped_products,
-        "matchedOrders": matched_orders,
+        "matchedOrders": discounted_orders,
         "customers": customers,
         "comparison": comparison,
         "appliedFilters": applied_filters(filters),
