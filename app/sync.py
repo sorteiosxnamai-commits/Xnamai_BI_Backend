@@ -820,7 +820,29 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(502, f"Sync {resource}: {detail}") from exc
-        return {"resource": resource, "status": status, "error": str(detail)}
+        return {
+            "resource": resource,
+            "status": status,
+            "error": str(detail),
+            "statusCode": (
+                source_exc.status_code
+                if isinstance(source_exc, HTTPException)
+                else None
+            ),
+        }
+
+
+def _operator_cancelled(result: dict) -> bool:
+    if result.get("statusCode") == 409:
+        return True
+    error = str(result.get("error") or "").lower()
+    return "interrompida pelo operador" in error
+
+
+def _should_stop_pipeline(result: dict) -> bool:
+    if result.get("status") == "running":
+        return True
+    return result.get("status") == "interrupted" and _operator_cancelled(result)
 
 
 async def _pause_after_resource(result: dict, *, last: bool) -> None:
@@ -837,13 +859,13 @@ async def _pause_after_resource(result: dict, *, last: bool) -> None:
     await asyncio.sleep(RESOURCE_PAUSE_SECONDS)
 
 
-async def sync_all(full=False, *, raise_http=True):
+async def _run_resource_sequence(resources: tuple[str, ...], full: bool) -> list[dict]:
     results = []
-    total = len(SYNC_RESOURCES)
-    for index, resource in enumerate(SYNC_RESOURCES):
+    total = len(resources)
+    for index, resource in enumerate(resources):
         result = await sync_resource(resource, full, raise_http=False)
         results.append(result)
-        if result.get("status") in {"running", "interrupted"}:
+        if _should_stop_pipeline(result):
             log.warning(
                 "Stopping Mercos pipeline after %s on %s",
                 result.get("status"),
@@ -851,6 +873,11 @@ async def sync_all(full=False, *, raise_http=True):
             )
             break
         await _pause_after_resource(result, last=index + 1 == total)
+    return results
+
+
+async def sync_all(full=False, *, raise_http=True):
+    results = await _run_resource_sequence(SYNC_RESOURCES, full)
     if raise_http and results and all(r.get("status") == "error" for r in results):
         raise HTTPException(502, {"message": "Sync falhou", "results": results})
     return results
@@ -861,14 +888,4 @@ async def sync_orders_job():
 
 
 async def sync_catalog_job():
-    total = len(CATALOG_RESOURCES)
-    for index, resource in enumerate(CATALOG_RESOURCES):
-        result = await sync_resource(resource, full=False, raise_http=False)
-        if result.get("status") in {"running", "interrupted"}:
-            log.warning(
-                "Stopping catalog job after %s on %s",
-                result.get("status"),
-                resource,
-            )
-            break
-        await _pause_after_resource(result, last=index + 1 == total)
+    await _run_resource_sequence(CATALOG_RESOURCES, False)

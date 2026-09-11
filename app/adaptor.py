@@ -15,7 +15,8 @@ DEFAULT_RETRIES = 20
 WARMUP_RETRIES = 6
 RETRYABLE_STATUS = {429, 502, 503, 504}
 MAX_RETRY_WAIT = 300.0
-RATE_LIMIT_BUDGET = 90.0
+RATE_LIMIT_BUDGET = 600.0
+DEFAULT_429_WAIT = 30.0
 
 _request_lock = asyncio.Lock()
 _not_before = 0.0
@@ -54,8 +55,23 @@ def _retry_wait(response: httpx.Response, attempt: int) -> float:
         except ValueError:
             pass
     if response.status_code == 429:
-        return min(30 * (2 ** attempt), MAX_RETRY_WAIT)
+        return DEFAULT_429_WAIT
     return min(2 ** attempt, 30)
+
+
+def _should_retry_status(
+    response: httpx.Response,
+    *,
+    attempt: int,
+    retries: int,
+    waited: float,
+) -> tuple[bool, float]:
+    if response.status_code not in RETRYABLE_STATUS:
+        return False, 0.0
+    wait = _retry_wait(response, attempt)
+    if attempt + 1 >= retries or waited >= RATE_LIMIT_BUDGET:
+        return False, wait
+    return True, wait
 
 
 def _extend_cooldown(wait: float) -> None:
@@ -155,13 +171,15 @@ class Adaptor:
                     raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
 
                 if r.status_code in RETRYABLE_STATUS:
-                    wait = _retry_wait(r, attempt)
-                    _extend_cooldown(wait)
-                    rate_limit_waited += wait
-                    if (
-                        attempt + 1 < retries
-                        and rate_limit_waited < RATE_LIMIT_BUDGET
-                    ):
+                    retry, wait = _should_retry_status(
+                        r,
+                        attempt=attempt,
+                        retries=retries,
+                        waited=rate_limit_waited,
+                    )
+                    if retry:
+                        _extend_cooldown(wait)
+                        rate_limit_waited += wait
                         log.warning(
                             "Adaptor %s HTTP %s attempt %s/%s; retry in %ss",
                             resource,
@@ -219,13 +237,15 @@ class Adaptor:
                     raise HTTPException(502, f"Adaptor inacessível: {type(exc).__name__}") from exc
 
                 if response.status_code in RETRYABLE_STATUS:
-                    wait = _retry_wait(response, attempt)
-                    _extend_cooldown(wait)
-                    rate_limit_waited += wait
-                    if (
-                        attempt + 1 < retries
-                        and rate_limit_waited < RATE_LIMIT_BUDGET
-                    ):
+                    retry, wait = _should_retry_status(
+                        response,
+                        attempt=attempt,
+                        retries=retries,
+                        waited=rate_limit_waited,
+                    )
+                    if retry:
+                        _extend_cooldown(wait)
+                        rate_limit_waited += wait
                         log.warning(
                             "Adaptor %s/%s HTTP %s attempt %s/%s; retry in %ss",
                             resource,

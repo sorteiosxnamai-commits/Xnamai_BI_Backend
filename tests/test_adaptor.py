@@ -161,6 +161,65 @@ async def test_list_uses_default_429_backoff_without_retry_after(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_retries_two_429s_then_succeeds(monkeypatch):
+    fake = FakeClient(
+        [
+            response(429, text="Too Many Requests"),
+            response(429, text="Too Many Requests"),
+            response(200),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
+    monkeypatch.setattr(adaptor_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        adaptor_module,
+        "settings",
+        lambda: SimpleNamespace(
+            mercos_adaptor_url="https://mercosadaptor.onrender.com",
+            mercos_adaptor_api_key="test-key",
+        ),
+    )
+
+    result = await adaptor_module.Adaptor().list("categories")
+
+    assert result == {"data": [], "nextCursor": None}
+    assert fake.calls == 3
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
+        [30, 30], abs=0.05
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_stops_retrying_429_after_wait_budget(monkeypatch):
+    fake = FakeClient(
+        [
+            response(429, text="Too Many Requests", headers={"Retry-After": "40"}),
+            response(429, text="Too Many Requests", headers={"Retry-After": "40"}),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
+    monkeypatch.setattr(adaptor_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(adaptor_module, "RATE_LIMIT_BUDGET", 30.0)
+    monkeypatch.setattr(
+        adaptor_module,
+        "settings",
+        lambda: SimpleNamespace(
+            mercos_adaptor_url="https://mercosadaptor.onrender.com",
+            mercos_adaptor_api_key="test-key",
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await adaptor_module.Adaptor().list("categories")
+
+    assert exc_info.value.status_code == 429
+    assert fake.calls == 2
+    assert sleep.await_args_list[0].args[0] == pytest.approx(40, abs=0.05)
+
+
+@pytest.mark.asyncio
 async def test_list_does_not_persist_provider_html(monkeypatch):
     fake = FakeClient([response(502, text="<!DOCTYPE html><title>502</title>")])
     monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)

@@ -311,15 +311,39 @@ async def test_claim_blocks_other_resources_while_one_is_running(sync_db, monkey
 
 
 @pytest.mark.asyncio
-async def test_sync_all_stops_after_rate_limit(sync_db, monkeypatch):
+async def test_sync_all_continues_after_rate_limit(sync_db, monkeypatch):
     called: list[str] = []
 
-    class RateLimitedAdaptor:
+    class RateLimitedThenOkAdaptor:
         async def list(self, resource: str, cursor: str | None):
             called.append(resource)
-            raise HTTPException(429, "Too Many Requests")
+            if resource == "categories":
+                raise HTTPException(429, "Too Many Requests")
+            return {"data": [], "nextCursor": None}
 
-    monkeypatch.setattr(sync, "adaptor", RateLimitedAdaptor())
+    monkeypatch.setattr(sync, "adaptor", RateLimitedThenOkAdaptor())
+    monkeypatch.setattr(sync, "SYNC_RESOURCES", ("categories", "orders"))
+    monkeypatch.setattr(sync, "RESOURCE_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(sync, "RATE_LIMIT_PAUSE_SECONDS", 0)
+
+    results = await sync.sync_all(full=False, raise_http=False)
+
+    assert called == ["categories", "orders"]
+    assert results[0]["status"] == "interrupted"
+    assert results[1]["status"] == "success"
+    assert len(results) == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_all_stops_after_operator_cancel(sync_db, monkeypatch):
+    called: list[str] = []
+
+    class CancelledAdaptor:
+        async def list(self, resource: str, cursor: str | None):
+            called.append(resource)
+            raise HTTPException(409, "Sincronização interrompida pelo operador")
+
+    monkeypatch.setattr(sync, "adaptor", CancelledAdaptor())
     monkeypatch.setattr(sync, "SYNC_RESOURCES", ("categories", "orders"))
     monkeypatch.setattr(sync, "RESOURCE_PAUSE_SECONDS", 0)
     monkeypatch.setattr(sync, "RATE_LIMIT_PAUSE_SECONDS", 0)
