@@ -7,10 +7,11 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.domain.order_status import VALID_SALE_STATUSES
-from app.models import Customer, Order, OrderItem, Product, Seller
+from app.models import Customer, Order, OrderItem, Product, Seller, SyncState
 from app.schemas.analytics import AnalyticsFilters
-from app.services.analytics_filters import date_bounds
+from app.services.analytics_filters import data_through_timestamp, date_bounds
 from app.services.analytics_v2 import (
+    analytics_metadata,
     associations,
     breakdowns,
     cohorts,
@@ -713,4 +714,29 @@ def test_excluded_customers_leave_the_totals_and_the_list() -> None:
         assert included["summary"]["totalRevenue"] == overview(
             db, AnalyticsFilters(period="all")
         )["kpis"]["netRevenue"]["value"]
+
+
+def test_data_through_uses_orders_sync_success_time() -> None:
+    with make_session() as db:
+        db.add(
+            Order(
+                mercos_id="o1",
+                number="1",
+                status="2",
+                issued_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+                total=10,
+            )
+        )
+        db.add(
+            SyncState(
+                resource="orders",
+                status="success",
+                last_success_at=datetime(2026, 9, 11, 17, tzinfo=timezone.utc),
+                records=1,
+            )
+        )
+        db.commit()
+        through = data_through_timestamp(db)
+        assert through == datetime(2026, 9, 11, 17, tzinfo=timezone.utc)
+        assert analytics_metadata(db)["dataThrough"] == through
 

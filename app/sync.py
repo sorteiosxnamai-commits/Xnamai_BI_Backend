@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select, text
@@ -29,6 +30,7 @@ from app.models import (
 )
 
 log = logging.getLogger("uvicorn.error")
+BR_TZ = ZoneInfo("America/Sao_Paulo")
 
 MAX_PAGES = 5000
 RESOURCE_PAUSE_SECONDS = 5
@@ -83,9 +85,12 @@ def dt(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BR_TZ)
+    return parsed.astimezone(timezone.utc)
 
 
 def f(value):

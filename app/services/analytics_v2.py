@@ -43,6 +43,7 @@ from app.schemas.analytics import AnalyticsFilters
 from app.services.analytics_filters import (
     applied_filters,
     comparison_period,
+    data_through_timestamp,
     date_bounds,
     order_conditions,
     previous_bounds,
@@ -236,7 +237,7 @@ def analytics_metadata(db: Session) -> dict[str, Any]:
         if total_orders
         else 0.0
     )
-    data_through = db.scalar(select(func.max(Order.issued_at)))
+    data_through = data_through_timestamp(db)
     incomplete = list(
         db.scalars(
             select(SyncState.resource).where(

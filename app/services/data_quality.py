@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.domain.order_status import RECOGNIZED_ORDER_STATUSES, status_sql_in
 from app.models import Customer, Order, OrderItem, Product, Seller, SyncState
+from app.services.analytics_filters import data_through_timestamp
 
 
 RAW_MODELS = {
@@ -326,7 +327,7 @@ def build_data_quality_report(
         "emptyRaw": empty_raw,
         "metadata": {
             "generatedAt": generated_at,
-            "dataThrough": max_date,
+            "dataThrough": data_through_timestamp(db) or max_date,
             "isPartial": is_partial,
             "warnings": warnings,
         },

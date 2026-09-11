@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from fastapi import Query
 from sqlalchemy import and_, exists, func, or_, select
 
-from app.models import Customer, Order, OrderItem, Product
+from app.models import Customer, Order, OrderItem, Product, SyncState
 from app.schemas.analytics import AnalyticsFilters, Granularity, Period
 
 
@@ -60,6 +60,35 @@ def analytics_filters(
         maxValue=max_value,
         activeOnly=active_only,
     )
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def data_through_timestamp(db) -> datetime | None:
+    """Moment the last successful orders sync finished, else newest order time."""
+    last_success = db.scalar(
+        select(func.max(SyncState.last_success_at)).where(
+            SyncState.resource == "orders"
+        )
+    )
+    latest_updated = db.scalar(select(func.max(Order.source_updated_at)))
+    latest_issued = db.scalar(select(func.max(Order.issued_at)))
+    candidates = [
+        ts
+        for ts in (
+            _aware_utc(last_success),
+            _aware_utc(latest_updated),
+            _aware_utc(latest_issued),
+        )
+        if ts is not None
+    ]
+    return max(candidates) if candidates else None
 
 
 def date_bounds(

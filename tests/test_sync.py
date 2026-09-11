@@ -1,6 +1,7 @@
 import asyncio
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 from fastapi import HTTPException
@@ -12,6 +13,8 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.models import Category, Order, OrderItem, Product, ProductPrice, SyncRun, SyncState
 from app import sync
+
+BR = ZoneInfo("America/Sao_Paulo")
 
 
 @pytest.fixture(autouse=True)
@@ -626,3 +629,13 @@ def test_dimensions_and_product_prices_are_decimal_and_idempotent(sync_db):
 def test_invalid_nonempty_numeric_value_is_not_silently_zeroed():
     with pytest.raises(ValueError, match="Valor numérico inválido"):
         sync.f("valor-corrompido")
+
+
+def test_dt_treats_date_only_and_naive_as_brasilia():
+    date_only = sync.dt("2026-09-11")
+    naive = sync.dt("2026-09-11T14:00:00")
+    aware = sync.dt("2026-09-11T14:00:00+00:00")
+    assert date_only == datetime(2026, 9, 11, tzinfo=BR).astimezone(timezone.utc)
+    assert naive == datetime(2026, 9, 11, 14, tzinfo=BR).astimezone(timezone.utc)
+    assert aware == datetime(2026, 9, 11, 14, tzinfo=timezone.utc)
+    assert date_only.astimezone(BR).date().isoformat() == "2026-09-11"
