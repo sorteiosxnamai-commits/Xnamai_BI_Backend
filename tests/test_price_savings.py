@@ -8,7 +8,10 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.models import Customer, Order, OrderItem, Product, Seller
 from app.schemas.analytics import AnalyticsFilters
-from app.services.price_savings import NO_COMPARISON_WARNING, price_savings
+from app.services.price_savings import price_savings
+
+
+NOW = datetime(2026, 9, 11, 18, tzinfo=timezone.utc)
 
 
 def make_session() -> Session:
@@ -37,7 +40,7 @@ def seed_price_drop(db: Session) -> None:
                 customer_mercos_id="c1",
                 seller_mercos_id="s1",
                 status="2",
-                issued_at=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+                issued_at=datetime(2026, 7, 10, 12, tzinfo=timezone.utc),
                 total=Decimal("140.00"),
                 net_total=Decimal("140.00"),
             ),
@@ -144,33 +147,37 @@ def seed_price_drop(db: Session) -> None:
     db.commit()
 
 
-def test_period_all_without_list_discount_needs_comparison_window() -> None:
+def test_global_filters_do_not_change_club_discount() -> None:
     with make_session() as db:
         seed_price_drop(db)
-        result = price_savings(db, AnalyticsFilters(period="all"))
+        ignored = AnalyticsFilters(
+            dateFrom=date(2026, 9, 1),
+            dateTo=date(2026, 9, 2),
+            period="7d",
+            sellerIds=["missing-seller"],
+            customerIds=["c3"],
+            productIds=["p3"],
+        )
+        result = price_savings(db, ignored, now=NOW)
 
-        assert result["summary"]["droppedProductCount"] == 0
-        assert result["products"] == []
-        assert result["comparison"] is None
-        assert NO_COMPARISON_WARNING in result["metadata"]["warnings"]
-        assert result["summary"]["matchedPairCount"] == 0
-        assert result["matchedOrders"] == []
+        assert result["appliedFilters"]["scope"] == "club-analysis"
+        assert result["comparison"]["previousFrom"] == "2026-05-14"
+        assert result["comparison"]["previousTo"] == "2026-07-13"
+        assert result["comparison"]["currentFrom"] == "2026-07-13"
+        assert result["comparison"]["currentTo"] == "2026-09-11"
+        assert result["summary"]["droppedProductCount"] == 1
+        assert result["summary"]["matchedSavings"] == Decimal("30.00")
+        assert result["summary"]["matchedSavingsPct"] == 20.0
+        assert "112" not in {row["currentNumber"] for row in result["matchedOrders"]}
 
 
 def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
     with make_session() as db:
         seed_price_drop(db)
-        result = price_savings(
-            db,
-            AnalyticsFilters(
-                dateFrom=date(2026, 9, 1),
-                dateTo=date(2026, 9, 9),
-                period="30d",
-            ),
-        )
+        result = price_savings(db, now=NOW)
 
-        assert result["comparison"]["previousFrom"] == "2026-07-03"
-        assert result["comparison"]["previousTo"] == "2026-08-31"
+        assert result["comparison"]["previousFrom"] == "2026-05-14"
+        assert result["comparison"]["previousTo"] == "2026-07-13"
         assert result["summary"]["droppedProductCount"] == 1
         assert result["summary"]["matchedPairCount"] == 2
         assert result["summary"]["productSavings"] == Decimal("30.00")
@@ -220,14 +227,7 @@ def test_placeholder_list_price_does_not_inflate_club_savings() -> None:
             )
         )
         db.commit()
-        result = price_savings(
-            db,
-            AnalyticsFilters(
-                dateFrom=date(2026, 9, 1),
-                dateTo=date(2026, 9, 9),
-                period="30d",
-            ),
-        )
+        result = price_savings(db, now=NOW)
 
         orders = {row["currentNumber"]: row for row in result["matchedOrders"]}
         assert orders["111"]["savings"] == Decimal("10.00")
@@ -258,7 +258,7 @@ def test_lookback_includes_prices_from_60_days_not_only_adjacent_window() -> Non
                     customer_mercos_id="c1",
                     seller_mercos_id="s1",
                     status="2",
-                    issued_at=datetime(2026, 6, 20, 12, tzinfo=timezone.utc),
+                    issued_at=datetime(2026, 4, 20, 12, tzinfo=timezone.utc),
                     total=Decimal("50.00"),
                     net_total=Decimal("50.00"),
                 ),
@@ -319,14 +319,7 @@ def test_lookback_includes_prices_from_60_days_not_only_adjacent_window() -> Non
             ]
         )
         db.commit()
-        result = price_savings(
-            db,
-            AnalyticsFilters(
-                dateFrom=date(2026, 9, 1),
-                dateTo=date(2026, 9, 9),
-                period="30d",
-            ),
-        )
+        result = price_savings(db, now=NOW)
 
         product_ids = {row["id"] for row in result["products"]}
         assert "p4" in product_ids

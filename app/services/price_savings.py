@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -11,12 +11,7 @@ from sqlalchemy.orm import Session, defer
 
 from app.models import Customer, Order, OrderItem
 from app.schemas.analytics import AnalyticsFilters
-from app.services.analytics_filters import (
-    applied_filters,
-    comparison_period,
-    date_bounds,
-    lookback_previous_bounds,
-)
+from app.services.analytics_filters import BR_TZ
 from app.services.analytics_v2 import (
     PLACEHOLDER_LIST_PRICES,
     ZERO,
@@ -29,12 +24,13 @@ from app.services.analytics_v2 import (
 PRODUCT_LIMIT = 2000
 ORDER_LIMIT = 200
 CUSTOMER_LIMIT = 100
-MAX_DROP_PCT = Decimal("40")
+MAX_DROP_PCT = Decimal("70")
+CURRENT_WINDOW_DAYS = 60
 PRIOR_LOOKBACK_DAYS = 60
 NO_COMPARISON_WARNING = (
-    "Selecione um período ou datas para comparar com o recorte anterior, "
-    "sem misturar o preço atual do Club."
+    "Não foi possível montar a janela de 60 dias para comparar o preço do Club."
 )
+CLUB_FILTERS = AnalyticsFilters(period="all")
 
 
 @dataclass
@@ -88,6 +84,43 @@ class _ProductAgg:
     @property
     def n_orders(self) -> int:
         return self.order_count or len(self.orders)
+
+
+def _club_bounds(
+    *,
+    now: datetime | None = None,
+) -> tuple[
+    tuple[datetime, datetime],
+    tuple[datetime, datetime],
+]:
+    current_end = now or datetime.now(timezone.utc)
+    if current_end.tzinfo is None:
+        current_end = current_end.replace(tzinfo=timezone.utc)
+    current_start = current_end - timedelta(days=CURRENT_WINDOW_DAYS)
+    prior_start = current_start - timedelta(days=PRIOR_LOOKBACK_DAYS)
+    return (current_start, current_end), (prior_start, current_start)
+
+
+def _br_date(value: datetime) -> str:
+    return value.astimezone(BR_TZ).date().isoformat()
+
+
+def _br_last_included_date(end: datetime) -> str:
+    return (end.astimezone(BR_TZ) - timedelta(microseconds=1)).date().isoformat()
+
+
+def _club_comparison(
+    current_bounds: tuple[datetime, datetime],
+    prior_bounds: tuple[datetime, datetime],
+) -> dict[str, str]:
+    current_start, current_end = current_bounds
+    prior_start, prior_end = prior_bounds
+    return {
+        "currentFrom": _br_date(current_start),
+        "currentTo": _br_last_included_date(current_end),
+        "previousFrom": _br_date(prior_start),
+        "previousTo": _br_last_included_date(prior_end),
+    }
 
 
 def _pct(part: Decimal, whole: Decimal) -> float | None:
@@ -314,22 +347,23 @@ def _dropped_line_totals(
     return before, after, savings
 
 
-def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
+def price_savings(
+    db: Session,
+    filters: AnalyticsFilters | None = None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    del filters
     metadata = analytics_metadata(db)
-    comparison = comparison_period(filters, lookback_days=PRIOR_LOOKBACK_DAYS)
-    current_bounds = date_bounds(filters)
-    prior_bounds = lookback_previous_bounds(filters, days=PRIOR_LOOKBACK_DAYS)
+    current_bounds, prior_bounds = _club_bounds(now=now)
+    comparison = _club_comparison(current_bounds, prior_bounds)
     warnings = list(metadata["warnings"])
 
-    current_rows = _load_orders(db, filters, current_bounds)
-    if prior_bounds[0] is None:
-        warnings.append(NO_COMPARISON_WARNING)
-        previous_products: dict[str, _ProductAgg] = {}
-    else:
-        previous_products = _product_agg_from_db(db, filters, prior_bounds)
+    current_rows = _load_orders(db, CLUB_FILTERS, current_bounds)
+    previous_products = _product_agg_from_db(db, CLUB_FILTERS, prior_bounds)
     metadata = {**metadata, "warnings": warnings}
 
-    items_by_order = _load_items(db, filters, current_bounds)
+    items_by_order = _load_items(db, CLUB_FILTERS, current_bounds)
     current_baskets = _baskets(current_rows, items_by_order)
 
     product_rollups: dict[str, dict[str, Any]] = {}
@@ -481,6 +515,10 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         "matchedOrders": discounted_orders,
         "customers": customers,
         "comparison": comparison,
-        "appliedFilters": applied_filters(filters),
+        "appliedFilters": {
+            "scope": "club-analysis",
+            "currentDays": CURRENT_WINDOW_DAYS,
+            "previousDays": PRIOR_LOOKBACK_DAYS,
+        },
         "metadata": metadata,
     }

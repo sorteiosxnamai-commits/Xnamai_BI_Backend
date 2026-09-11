@@ -304,10 +304,10 @@ def get_associations(
 
 @router.get("/custom-views/price-savings")
 def get_price_savings(
-    filters: AnalyticsFilters = Depends(analytics_filters),
+    _filters: AnalyticsFilters = Depends(analytics_filters),
     db: Session = Depends(db_session),
 ):
-    return price_savings(db, filters)
+    return price_savings(db)
 
 
 @router.get("/filter-options")
