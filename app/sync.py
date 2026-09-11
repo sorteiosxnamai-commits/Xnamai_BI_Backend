@@ -31,12 +31,12 @@ from app.models import (
 log = logging.getLogger("uvicorn.error")
 
 MAX_PAGES = 5000
-ORDER_DETAIL_CONCURRENCY = 1
 RESOURCE_PAUSE_SECONDS = 5
 RATE_LIMIT_PAUSE_SECONDS = 180
 MISSING_DETAIL_BATCH = 5
 MISSING_DETAIL_MAX_BATCHES = 20
 SYNC_LEASE_TTL = timedelta(minutes=15)
+_order_detail_blocked = False
 DIMENSION_MODELS = {
     "categories": Category,
     "segments": CustomerSegment,
@@ -129,46 +129,63 @@ def _order_line_items(row: dict) -> list | None:
 
 
 async def _hydrate_order_details(rows: list[dict]) -> list[dict]:
-    """Fetch details when the v2 list payload omits items or returns them empty."""
-    semaphore = asyncio.Semaphore(ORDER_DETAIL_CONCURRENCY)
+    """Fetch details when the v2 list payload omits the items key.
 
-    async def fetch(row: dict):
+    Mercos allows GET-by-id only in sandbox. Production returns 401, so the
+    list payload must be persisted even when the individual endpoint is blocked.
+    """
+    global _order_detail_blocked
+    hydrated: list[dict] = []
+    for row in rows:
         items = _order_line_items(row)
-        if items:
-            return row
+        if items is not None or _order_detail_blocked:
+            hydrated.append(row)
+            continue
         mercos_id = str(row.get("id") or "")
         if not mercos_id:
             raise ValueError("Pedido sem id no payload de listagem")
-        async with semaphore:
+        try:
             detail = await adaptor.detail("orders", mercos_id)
+        except HTTPException as exc:
+            if exc.status_code in {401, 403, 404}:
+                _order_detail_blocked = True
+                log.warning(
+                    "Detalhe do pedido %s indisponível (%s); seguindo com a listagem",
+                    mercos_id,
+                    exc.status_code,
+                )
+                hydrated.append(row)
+                continue
+            raise
         detail_id = str(detail.get("id") or mercos_id)
         if detail_id != mercos_id:
             raise ValueError(
                 f"Detalhe do pedido {mercos_id} retornou id divergente {detail_id}"
             )
-        return {**row, **detail, "id": mercos_id}
-
-    results = await asyncio.gather(*(fetch(row) for row in rows), return_exceptions=True)
-    failures = [result for result in results if isinstance(result, Exception)]
-    if failures:
-        raise OrderDetailBatchError(len(failures), failures[0])
-    return [result for result in results if isinstance(result, dict)]
+        hydrated.append({**row, **detail, "id": mercos_id})
+    return hydrated
 
 
 def _orders_missing_items(limit: int) -> list[str]:
     with SessionLocal() as db:
-        return [
-            str(mercos_id)
-            for mercos_id in db.scalars(
-                select(Order.mercos_id)
-                .where(
-                    func.coalesce(Order.item_count, 0) == 0,
-                    status_sql_in(Order.status, VALID_SALE_STATUSES),
-                )
-                .order_by(Order.issued_at.desc())
-                .limit(limit)
-            ).all()
-        ]
+        candidates = db.scalars(
+            select(Order)
+            .where(
+                func.coalesce(Order.item_count, 0) == 0,
+                status_sql_in(Order.status, VALID_SALE_STATUSES),
+            )
+            .order_by(Order.issued_at.desc())
+            .limit(max(limit * 5, limit))
+        ).all()
+        missing: list[str] = []
+        for order in candidates:
+            raw = order.raw if isinstance(order.raw, dict) else {}
+            if "itens" in raw or "items" in raw:
+                continue
+            missing.append(str(order.mercos_id))
+            if len(missing) >= limit:
+                break
+        return missing
 
 
 def _persist_order_detail_rows(rows: list[dict]) -> int:
@@ -179,6 +196,8 @@ def _persist_order_detail_rows(rows: list[dict]) -> int:
 
 
 async def _backfill_missing_order_details() -> int:
+    if _order_detail_blocked:
+        return 0
     repaired = 0
     for _ in range(MISSING_DETAIL_MAX_BATCHES):
         ids = await asyncio.to_thread(_orders_missing_items, MISSING_DETAIL_BATCH)
@@ -188,6 +207,9 @@ async def _backfill_missing_order_details() -> int:
             rows = await _hydrate_order_details([{"id": mercos_id} for mercos_id in ids])
         except OrderDetailBatchError as exc:
             log.warning("Backfill de itens Mercos interrompido: %s", exc)
+            break
+        if not any(_order_line_items(row) for row in rows):
+            log.warning("Backfill de itens Mercos sem detalhe disponível; interrompendo")
             break
         persisted = await asyncio.to_thread(_persist_order_detail_rows, rows)
         repaired += persisted
@@ -675,7 +697,7 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
                 break
             received += len(rows)
             if resource == "orders":
-                details_needed = sum(1 for row in rows if not _order_line_items(row))
+                details_needed = sum(1 for row in rows if _order_line_items(row) is None)
                 try:
                     rows = await _hydrate_order_details(rows)
                     details_consulted += details_needed

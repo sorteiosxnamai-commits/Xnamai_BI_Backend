@@ -14,6 +14,13 @@ from app.models import Category, Order, OrderItem, Product, ProductPrice, SyncRu
 from app import sync
 
 
+@pytest.fixture(autouse=True)
+def reset_order_detail_block():
+    sync._order_detail_blocked = False
+    yield
+    sync._order_detail_blocked = False
+
+
 @pytest.fixture
 def sync_db(monkeypatch):
     engine = create_engine(
@@ -215,7 +222,7 @@ class ListWithEmptyItemsAdaptor:
 
 
 @pytest.mark.asyncio
-async def test_order_sync_hydrates_detail_when_list_items_are_empty(
+async def test_order_sync_keeps_empty_list_items_without_detail(
     sync_db,
     monkeypatch,
 ):
@@ -225,13 +232,64 @@ async def test_order_sync_hydrates_detail_when_list_items_are_empty(
     result = await sync.sync_resource("orders", full=False)
 
     assert result["status"] == "success"
-    assert fake.detail_calls == ["30"]
+    assert fake.detail_calls == []
     with sync_db() as db:
         order = db.scalar(select(Order))
-        assert order.item_count == 1
-        assert db.scalar(select(func.count(OrderItem.id))) == 1
+        assert order.item_count == 0
+        assert db.scalar(select(func.count(OrderItem.id))) == 0
         run = db.scalar(select(SyncRun))
-        assert run.details["detailsConsulted"] == 1
+        assert run.details["detailsConsulted"] == 0
+
+
+class ListWithoutItemsForbiddenDetailAdaptor:
+    def __init__(self):
+        self.detail_calls: list[str] = []
+
+    async def list(self, resource: str, cursor: str | None):
+        return {
+            "data": [
+                {
+                    "id": 40,
+                    "numero": 400,
+                    "status": 2,
+                    "total": "80,00",
+                    "ultima_alteracao": "2026-08-15T15:00:00+00:00",
+                },
+                {
+                    "id": 41,
+                    "numero": 401,
+                    "status": 2,
+                    "total": "90,00",
+                    "ultima_alteracao": "2026-08-15T16:00:00+00:00",
+                },
+            ],
+            "pageCursor": "2026-08-15T16:00:00+00:00",
+            "nextCursor": None,
+        }
+
+    async def detail(self, resource: str, mercos_id: str):
+        self.detail_calls.append(mercos_id)
+        raise HTTPException(403, "GET por ID não permitido em produção")
+
+
+@pytest.mark.asyncio
+async def test_order_sync_persists_list_when_production_forbids_detail(
+    sync_db,
+    monkeypatch,
+):
+    fake = ListWithoutItemsForbiddenDetailAdaptor()
+    monkeypatch.setattr(sync, "adaptor", fake)
+
+    result = await sync.sync_resource("orders", full=False)
+
+    assert result["status"] == "success"
+    assert fake.detail_calls == ["40"]
+    with sync_db() as db:
+        assert db.scalar(select(func.count(Order.id))) == 2
+        assert db.scalar(select(func.count(OrderItem.id))) == 0
+        state = db.get(SyncState, "orders")
+        assert state.cursor == "2026-08-15T16:00:00+00:00"
+        assert state.status == "success"
 
 
 @pytest.mark.asyncio
