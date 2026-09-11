@@ -17,6 +17,7 @@ RETRYABLE_STATUS = {429, 502, 503, 504}
 MAX_RETRY_WAIT = 300.0
 RATE_LIMIT_BUDGET = 600.0
 DEFAULT_429_WAIT = 30.0
+SUCCESS_PACE_SECONDS = 1.5
 
 _request_lock = asyncio.Lock()
 _not_before = 0.0
@@ -39,13 +40,29 @@ def _response_detail(response: httpx.Response) -> str:
     return text or response.reason_phrase
 
 
+def _tempo_from_payload(payload: object) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("tempo_ate_permitir_novamente")
+    details = payload.get("details")
+    if raw is None and isinstance(details, dict):
+        raw = details.get("tempo_ate_permitir_novamente")
+    if raw is None:
+        return None
+    try:
+        wait = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if wait <= 0:
+        return None
+    return min(wait + 0.5, MAX_RETRY_WAIT)
+
+
 def _retry_wait(response: httpx.Response, attempt: int) -> float:
     try:
-        payload = response.json()
-        if isinstance(payload, dict) and payload.get("tempo_ate_permitir_novamente") is not None:
-            wait = float(payload["tempo_ate_permitir_novamente"])
-            if wait > 0:
-                return min(wait + 0.5, MAX_RETRY_WAIT)
+        tempo = _tempo_from_payload(response.json())
+        if tempo is not None:
+            return tempo
     except (ValueError, TypeError):
         pass
     header = response.headers.get("Retry-After")
@@ -55,7 +72,7 @@ def _retry_wait(response: httpx.Response, attempt: int) -> float:
         except ValueError:
             pass
     if response.status_code == 429:
-        return DEFAULT_429_WAIT
+        return min(DEFAULT_429_WAIT * (2 ** attempt), MAX_RETRY_WAIT)
     return min(2 ** attempt, 30)
 
 
@@ -89,7 +106,7 @@ async def _respect_cooldown() -> None:
     delay = _not_before - time.monotonic()
     if delay <= 0.05:
         return
-    log.warning("Adaptor cooldown %.1ss before next Mercos call", delay)
+    log.warning("Adaptor cooldown %.1fs before next Mercos call", delay)
     waiter = asyncio.create_task(_cancel.wait())
     sleeper = asyncio.create_task(asyncio.sleep(delay))
     done, pending = await asyncio.wait(
@@ -159,7 +176,7 @@ class Adaptor:
                     wait = min(2 ** attempt, 30)
                     _extend_cooldown(wait)
                     log.warning(
-                        "Adaptor %s attempt %s/%s failed (%s); retry in %ss",
+                        "Adaptor %s attempt %s/%s failed (%s); retry in %.1fs",
                         resource,
                         attempt + 1,
                         retries,
@@ -181,7 +198,7 @@ class Adaptor:
                         _extend_cooldown(wait)
                         rate_limit_waited += wait
                         log.warning(
-                            "Adaptor %s HTTP %s attempt %s/%s; retry in %ss",
+                            "Adaptor %s HTTP %s attempt %s/%s; retry in %.1fs",
                             resource,
                             r.status_code,
                             attempt + 1,
@@ -196,7 +213,10 @@ class Adaptor:
                         status_code=502 if r.status_code >= 500 else r.status_code,
                         detail=f"Adaptor {r.status_code} em /v1/{resource}: {detail}",
                     )
-                return r.json()
+
+                payload = r.json()
+                _extend_cooldown(SUCCESS_PACE_SECONDS)
+                return payload
 
         raise HTTPException(
             502,
@@ -247,7 +267,7 @@ class Adaptor:
                         _extend_cooldown(wait)
                         rate_limit_waited += wait
                         log.warning(
-                            "Adaptor %s/%s HTTP %s attempt %s/%s; retry in %ss",
+                            "Adaptor %s/%s HTTP %s attempt %s/%s; retry in %.1fs",
                             resource,
                             mercos_id,
                             response.status_code,
@@ -265,6 +285,7 @@ class Adaptor:
                 payload = response.json()
                 if not isinstance(payload, dict):
                     raise HTTPException(502, f"Detalhe de {resource} retornou formato inválido")
+                _extend_cooldown(SUCCESS_PACE_SECONDS)
                 return payload
 
         raise HTTPException(

@@ -161,9 +161,10 @@ def test_global_filters_do_not_change_club_discount() -> None:
         result = price_savings(db, ignored, now=NOW)
 
         assert result["appliedFilters"]["scope"] == "club-analysis"
-        assert result["comparison"]["previousFrom"] == "2026-05-14"
-        assert result["comparison"]["previousTo"] == "2026-07-13"
-        assert result["comparison"]["currentFrom"] == "2026-07-13"
+        assert result["appliedFilters"]["currentDays"] == 45
+        assert result["comparison"]["previousFrom"] == "2026-06-13"
+        assert result["comparison"]["previousTo"] == "2026-07-28"
+        assert result["comparison"]["currentFrom"] == "2026-07-28"
         assert result["comparison"]["currentTo"] == "2026-09-11"
         assert result["summary"]["droppedProductCount"] == 1
         assert result["summary"]["matchedSavings"] == Decimal("30.00")
@@ -176,8 +177,8 @@ def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
         seed_price_drop(db)
         result = price_savings(db, now=NOW)
 
-        assert result["comparison"]["previousFrom"] == "2026-05-14"
-        assert result["comparison"]["previousTo"] == "2026-07-13"
+        assert result["comparison"]["previousFrom"] == "2026-06-13"
+        assert result["comparison"]["previousTo"] == "2026-07-28"
         assert result["summary"]["droppedProductCount"] == 1
         assert result["summary"]["matchedPairCount"] == 2
         assert result["summary"]["productSavings"] == Decimal("30.00")
@@ -187,6 +188,11 @@ def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
         assert result["summary"]["previousDroppedTotal"] == Decimal("150.00")
         assert result["summary"]["currentDroppedTotal"] == Decimal("120.00")
         assert result["summary"]["customersWithSavings"] == 2
+        assert result["summary"]["simpleAvgDropPct"] == 20.0
+        assert result["summary"]["qtyWeightedDropPct"] == 20.0
+        assert result["summary"]["valueWeightedDropPct"] == 20.0
+        assert result["summary"]["medianDropPct"] == 20.0
+        assert result["summary"]["customerAvgDropPct"] == 20.0
 
         product = result["products"][0]
         assert product["id"] == "p1"
@@ -235,7 +241,7 @@ def test_placeholder_list_price_does_not_inflate_club_savings() -> None:
         assert result["summary"]["matchedSavings"] == Decimal("30.00")
 
 
-def test_lookback_includes_prices_from_60_days_not_only_adjacent_window() -> None:
+def test_lookback_includes_prices_from_club_baseline_not_older_history() -> None:
     with make_session() as db:
         seed_price_drop(db)
         db.add_all(
@@ -334,5 +340,202 @@ def test_lookback_includes_prices_from_60_days_not_only_adjacent_window() -> Non
         assert orders["120"]["previousTotal"] == Decimal("50.00")
         assert orders["120"]["currentTotal"] == Decimal("40.00")
         assert orders["120"]["savingsPct"] == 20.0
+
+
+def test_pre_club_sales_do_not_dilute_current_price() -> None:
+    with make_session() as db:
+        seed_price_drop(db)
+        db.add_all(
+            [
+                Order(
+                    mercos_id="pre-club",
+                    number="90",
+                    customer_mercos_id="c1",
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 7, 20, 12, tzinfo=timezone.utc),
+                    total=Decimal("100.00"),
+                    net_total=Decimal("100.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="pre-club",
+                    position=0,
+                    mercos_item_id="pre1",
+                    product_mercos_id="p1",
+                    code="P1",
+                    name="Produto 1",
+                    quantity=Decimal("2"),
+                    unit_price=Decimal("50.00"),
+                    total=Decimal("100.00"),
+                ),
+            ]
+        )
+        db.commit()
+        result = price_savings(db, now=NOW)
+
+        p1 = next(row for row in result["products"] if row["id"] == "p1")
+        assert p1["currentAverageUnit"] == Decimal("40.00")
+        assert p1["previousAverageUnit"] == Decimal("50.00")
+        assert p1["dropPct"] == 20.0
+        assert "90" not in {row["currentNumber"] for row in result["matchedOrders"]}
+
+
+def test_average_drop_separates_simple_qty_and_value() -> None:
+    with make_session() as db:
+        db.add_all(
+            [
+                Customer(mercos_id="c1", name="Cliente 1", active=True),
+                Seller(mercos_id="s1", name="Vendedor", active=True),
+                Product(mercos_id="pa", code="PA", name="SKU A", active=True),
+                Product(mercos_id="pb", code="PB", name="SKU B", active=True),
+                Order(
+                    mercos_id="prev-a",
+                    number="1",
+                    customer_mercos_id="c1",
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 7, 1, 12, tzinfo=timezone.utc),
+                    total=Decimal("100.00"),
+                    net_total=Decimal("100.00"),
+                ),
+                Order(
+                    mercos_id="prev-b",
+                    number="2",
+                    customer_mercos_id="c1",
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 7, 2, 12, tzinfo=timezone.utc),
+                    total=Decimal("900.00"),
+                    net_total=Decimal("900.00"),
+                ),
+                Order(
+                    mercos_id="curr-mix",
+                    number="3",
+                    customer_mercos_id="c1",
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 9, 1, 12, tzinfo=timezone.utc),
+                    total=Decimal("860.00"),
+                    net_total=Decimal("860.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="prev-a",
+                    position=0,
+                    mercos_item_id="a0",
+                    product_mercos_id="pa",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("100.00"),
+                    total=Decimal("100.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="prev-b",
+                    position=0,
+                    mercos_item_id="b0",
+                    product_mercos_id="pb",
+                    quantity=Decimal("9"),
+                    unit_price=Decimal("100.00"),
+                    total=Decimal("900.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="curr-mix",
+                    position=0,
+                    mercos_item_id="a1",
+                    product_mercos_id="pa",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("50.00"),
+                    total=Decimal("50.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="curr-mix",
+                    position=1,
+                    mercos_item_id="b1",
+                    product_mercos_id="pb",
+                    quantity=Decimal("9"),
+                    unit_price=Decimal("90.00"),
+                    total=Decimal("810.00"),
+                ),
+            ]
+        )
+        db.commit()
+        result = price_savings(db, now=NOW)
+
+        assert result["summary"]["simpleAvgDropPct"] == 30.0
+        assert result["summary"]["qtyWeightedDropPct"] == 14.0
+        assert result["summary"]["valueWeightedDropPct"] == 14.0
+        assert result["summary"]["matchedSavings"] == Decimal("140.00")
+
+
+def test_customer_tiers_split_top_and_rest() -> None:
+    with make_session() as db:
+        db.add(Seller(mercos_id="s1", name="Vendedor", active=True))
+        db.add(Product(mercos_id="p1", code="P1", name="Produto 1", active=True))
+        db.add(
+            Order(
+                mercos_id="prev",
+                number="0",
+                customer_mercos_id="c1",
+                seller_mercos_id="s1",
+                status="2",
+                issued_at=datetime(2026, 7, 1, 12, tzinfo=timezone.utc),
+                total=Decimal("100.00"),
+                net_total=Decimal("100.00"),
+            )
+        )
+        db.add(
+            OrderItem(
+                order_mercos_id="prev",
+                position=0,
+                mercos_item_id="prev-i",
+                product_mercos_id="p1",
+                quantity=Decimal("1"),
+                unit_price=Decimal("100.00"),
+                total=Decimal("100.00"),
+            )
+        )
+        for index in range(12):
+            customer_id = f"c{index + 1}"
+            db.add(Customer(mercos_id=customer_id, name=f"Cliente {index + 1}", active=True))
+            qty = Decimal(12 - index)
+            current_unit = Decimal("80.00")
+            db.add(
+                Order(
+                    mercos_id=f"curr-{index}",
+                    number=str(100 + index),
+                    customer_mercos_id=customer_id,
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 9, 1, 12, tzinfo=timezone.utc),
+                    total=qty * current_unit,
+                    net_total=qty * current_unit,
+                )
+            )
+            db.add(
+                OrderItem(
+                    order_mercos_id=f"curr-{index}",
+                    position=0,
+                    mercos_item_id=f"i{index}",
+                    product_mercos_id="p1",
+                    quantity=qty,
+                    unit_price=current_unit,
+                    total=qty * current_unit,
+                )
+            )
+        db.commit()
+        result = price_savings(db, now=NOW)
+
+        tiers = {row["key"]: row for row in result["customerTiers"]}
+        assert tiers["top10"]["count"] == 10
+        assert tiers["top10"]["rankFrom"] == 1
+        assert tiers["top10"]["rankTo"] == 10
+        assert tiers["top20"]["count"] == 2
+        assert tiers["top20"]["rankFrom"] == 11
+        assert tiers["top20"]["rankTo"] == 12
+        assert tiers["rest"]["count"] == 0
+        assert tiers["top10"]["savingsSharePct"] > tiers["top20"]["savingsSharePct"]
+        assert result["summary"]["customersWithSavings"] == 12
+        assert result["summary"]["top10CustomerSavingsSharePct"] == tiers["top10"]["savingsSharePct"]
+        assert {row["id"] for row in tiers["top10"]["members"]} == {
+            f"c{index}" for index in range(1, 11)
+        }
 
 

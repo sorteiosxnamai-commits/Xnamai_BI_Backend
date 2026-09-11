@@ -50,11 +50,13 @@ class FakeClient:
         return response
 
 
-def response(status: int, *, text: str = "", headers: dict | None = None) -> httpx.Response:
+def response(status: int, *, text: str = "", headers: dict | None = None, json_body: dict | None = None) -> httpx.Response:
     request = httpx.Request(
         "GET",
         "https://mercosadaptor.onrender.com/v1/orders",
     )
+    if json_body is not None:
+        return httpx.Response(status, json=json_body, headers=headers or {}, request=request)
     merged = {"content-type": "text/html"}
     if headers:
         merged.update(headers)
@@ -186,7 +188,7 @@ async def test_list_retries_two_429s_then_succeeds(monkeypatch):
     assert result == {"data": [], "nextCursor": None}
     assert fake.calls == 3
     assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
-        [30, 30], abs=0.05
+        [30, 60], abs=0.05
     )
 
 
@@ -217,6 +219,38 @@ async def test_list_stops_retrying_429_after_wait_budget(monkeypatch):
     assert exc_info.value.status_code == 429
     assert fake.calls == 2
     assert sleep.await_args_list[0].args[0] == pytest.approx(40, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_list_honors_nested_mercos_wait(monkeypatch):
+    fake = FakeClient(
+        [
+            response(
+                429,
+                json_body={
+                    "error": "Too Many Requests",
+                    "details": {"tempo_ate_permitir_novamente": 87},
+                },
+            ),
+            response(200),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
+    monkeypatch.setattr(adaptor_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        adaptor_module,
+        "settings",
+        lambda: SimpleNamespace(
+            mercos_adaptor_url="https://mercosadaptor.onrender.com",
+            mercos_adaptor_api_key="test-key",
+        ),
+    )
+
+    result = await adaptor_module.Adaptor().list("orders")
+
+    assert result == {"data": [], "nextCursor": None}
+    assert sleep.await_args_list[0].args[0] == pytest.approx(87.5, abs=0.05)
 
 
 @pytest.mark.asyncio
