@@ -37,7 +37,7 @@ def seed_price_drop(db: Session) -> None:
                 customer_mercos_id="c1",
                 seller_mercos_id="s1",
                 status="2",
-                issued_at=datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+                issued_at=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
                 total=Decimal("140.00"),
                 net_total=Decimal("140.00"),
             ),
@@ -153,9 +153,8 @@ def test_period_all_without_list_discount_needs_comparison_window() -> None:
         assert result["products"] == []
         assert result["comparison"] is None
         assert NO_COMPARISON_WARNING in result["metadata"]["warnings"]
-        assert result["summary"]["matchedPairCount"] == 1
-        assert result["matchedOrders"][0]["currentNumber"] == "112"
-        assert result["matchedOrders"][0]["savings"] == Decimal("20.00")
+        assert result["summary"]["matchedPairCount"] == 0
+        assert result["matchedOrders"] == []
 
 
 def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
@@ -170,14 +169,15 @@ def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
             ),
         )
 
-        assert result["comparison"]["previousFrom"] == "2026-08-01"
-        assert result["comparison"]["previousTo"] == "2026-08-09"
+        assert result["comparison"]["previousFrom"] == "2026-08-23"
+        assert result["comparison"]["previousTo"] == "2026-08-31"
         assert result["summary"]["droppedProductCount"] == 1
-        assert result["summary"]["matchedPairCount"] == 3
+        assert result["summary"]["matchedPairCount"] == 2
         assert result["summary"]["productSavings"] == Decimal("30.00")
         assert result["summary"]["productSavingsPct"] == 20.0
-        assert result["summary"]["matchedSavings"] == Decimal("50.00")
-        assert result["summary"]["customersWithSavings"] == 3
+        assert result["summary"]["matchedSavings"] == Decimal("30.00")
+        assert result["summary"]["matchedSavingsPct"] == 20.0
+        assert result["summary"]["customersWithSavings"] == 2
 
         product = result["products"][0]
         assert product["id"] == "p1"
@@ -187,20 +187,16 @@ def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
         assert product["savings"] == Decimal("30.00")
 
         orders = {row["currentNumber"]: row for row in result["matchedOrders"]}
-        assert orders["110"]["previousTotal"] == Decimal("140.00")
-        assert orders["110"]["currentTotal"] == Decimal("120.00")
+        assert "112" not in orders
+        assert orders["110"]["previousTotal"] == Decimal("100.00")
+        assert orders["110"]["currentTotal"] == Decimal("80.00")
         assert orders["110"]["savings"] == Decimal("20.00")
+        assert orders["110"]["savingsPct"] == 20.0
         assert orders["111"]["savings"] == Decimal("10.00")
-        assert orders["112"]["previousTotal"] == Decimal("100.00")
-        assert orders["112"]["currentTotal"] == Decimal("80.00")
-        assert orders["112"]["savings"] == Decimal("20.00")
-        assert orders["112"]["savingsPct"] == 20.0
+        assert orders["111"]["savingsPct"] == 20.0
 
-        assert result["customers"][0]["savings"] in {
-            Decimal("20.00"),
-        }
         customer_ids = {row["id"] for row in result["customers"]}
-        assert customer_ids == {"c1", "c2", "c3"}
+        assert customer_ids == {"c1", "c2"}
 
 
 def test_placeholder_list_price_does_not_inflate_club_savings() -> None:
@@ -234,5 +230,5 @@ def test_placeholder_list_price_does_not_inflate_club_savings() -> None:
         orders = {row["currentNumber"]: row for row in result["matchedOrders"]}
         assert orders["111"]["savings"] == Decimal("10.00")
         assert orders["111"]["currentTotal"] == Decimal("40.00")
-        assert result["summary"]["matchedSavings"] == Decimal("50.00")
+        assert result["summary"]["matchedSavings"] == Decimal("30.00")
 

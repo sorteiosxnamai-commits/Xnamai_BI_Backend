@@ -128,6 +128,24 @@ def previous_bounds(
     )
 
 
+def adjacent_previous_bounds(
+    filters: AnalyticsFilters,
+    *,
+    now: datetime | None = None,
+) -> tuple[datetime | None, datetime | None]:
+    """Same-length window that ends where the current period starts, with no overlap."""
+    start, end = date_bounds(filters, now=now)
+    if start is None:
+        return None, None
+    effective_end = end or now or datetime.now(timezone.utc)
+    if effective_end.tzinfo is None:
+        effective_end = effective_end.replace(tzinfo=timezone.utc)
+    duration = effective_end - start
+    if duration <= timedelta(0):
+        return None, None
+    return start - duration, start
+
+
 def _inclusive_end_date(end: datetime) -> date:
     return (end.astimezone(BR_TZ) - timedelta(microseconds=1)).date()
 
@@ -136,9 +154,14 @@ def comparison_period(
     filters: AnalyticsFilters,
     *,
     now: datetime | None = None,
+    adjacent: bool = False,
 ) -> dict[str, str] | None:
     start, end = date_bounds(filters, now=now)
-    prev_start, prev_end = previous_bounds(filters, now=now)
+    prev_start, prev_end = (
+        adjacent_previous_bounds(filters, now=now)
+        if adjacent
+        else previous_bounds(filters, now=now)
+    )
     if start is None or prev_start is None or prev_end is None:
         return None
     effective_end = end or now or datetime.now(timezone.utc)

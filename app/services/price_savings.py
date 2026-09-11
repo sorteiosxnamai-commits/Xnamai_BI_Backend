@@ -12,10 +12,10 @@ from sqlalchemy.orm import Session
 from app.models import Customer, Order, OrderItem
 from app.schemas.analytics import AnalyticsFilters
 from app.services.analytics_filters import (
+    adjacent_previous_bounds,
     applied_filters,
     comparison_period,
     date_bounds,
-    previous_bounds,
 )
 from app.services.analytics_v2 import (
     PLACEHOLDER_LIST_PRICES,
@@ -31,7 +31,8 @@ ORDER_LIMIT = 200
 CUSTOMER_LIMIT = 100
 MAX_DROP_PCT = Decimal("40")
 NO_COMPARISON_WARNING = (
-    "Selecione um período ou datas para comparar com o mesmo recorte do mês anterior."
+    "Selecione um período ou datas para comparar com o recorte anterior, "
+    "sem misturar o preço atual do Club."
 )
 
 
@@ -240,11 +241,9 @@ def _before_unit(
 ) -> Decimal:
     net = line.unit_price
     previous = previous_products.get(line.product_id)
-    if previous is not None:
-        usable = _plausible_before(previous.average_unit, net)
-        if usable > 0:
-            return usable
-    return _plausible_before(line.list_unit_price, net)
+    if previous is None:
+        return ZERO
+    return _plausible_before(previous.average_unit, net)
 
 
 def _line_savings(
@@ -255,18 +254,26 @@ def _line_savings(
     before = _before_unit(line, previous_products)
     if before > net and line.quantity > 0:
         return (line.quantity * (before - net)).quantize(Decimal("0.01"))
-    if line.discount > 0 and line.total > 0:
-        discount_pct = line.discount / line.total * 100
-        if discount_pct <= MAX_DROP_PCT:
-            return line.discount.quantize(Decimal("0.01"))
     return ZERO
+
+
+def _dropped_line_totals(
+    line: _Line,
+    previous_products: dict[str, _ProductAgg],
+) -> tuple[Decimal, Decimal, Decimal] | None:
+    savings = _line_savings(line, previous_products)
+    if savings <= 0:
+        return None
+    after = line.total.quantize(Decimal("0.01"))
+    before = (after + savings).quantize(Decimal("0.01"))
+    return before, after, savings
 
 
 def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
     metadata = analytics_metadata(db)
-    comparison = comparison_period(filters)
+    comparison = comparison_period(filters, adjacent=True)
     current_bounds = date_bounds(filters)
-    prior_bounds = previous_bounds(filters)
+    prior_bounds = adjacent_previous_bounds(filters)
     warnings = list(metadata["warnings"])
 
     current_rows = _load_orders(db, filters, current_bounds)
@@ -331,6 +338,7 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
         )
 
     dropped_products.sort(key=lambda row: row["savings"], reverse=True)
+    dropped_product_count = len(dropped_products)
     dropped_products = dropped_products[:PRODUCT_LIMIT]
 
     for basket in current_baskets:
@@ -346,19 +354,22 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
 
     for basket in current_baskets:
         item_savings = ZERO
+        before_dropped = ZERO
+        after_dropped = ZERO
         discounted_skus = 0
         for line in basket.lines:
-            savings = _line_savings(line, previous_products)
-            if savings <= 0:
+            dropped = _dropped_line_totals(line, previous_products)
+            if dropped is None:
                 continue
+            before, after, savings = dropped
+            before_dropped += before
+            after_dropped += after
             item_savings += savings
             discounted_skus += 1
         if item_savings <= 0:
             continue
-        after_total = basket.total
-        before_total = (after_total + item_savings).quantize(Decimal("0.01"))
         club_savings += item_savings
-        before_club_total += before_total
+        before_club_total += before_dropped
         if basket.customer_id:
             customers_with_savings.add(basket.customer_id)
         club_order_count += 1
@@ -369,10 +380,10 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
                 "currentOrderId": basket.order.mercos_id,
                 "currentNumber": basket.order.number,
                 "currentIssuedAt": _iso(basket.order.issued_at),
-                "currentTotal": after_total,
-                "previousTotal": before_total,
+                "currentTotal": after_dropped,
+                "previousTotal": before_dropped,
                 "savings": item_savings,
-                "savingsPct": _pct(item_savings, before_total),
+                "savingsPct": _pct(item_savings, before_dropped),
                 "itemSavings": item_savings,
                 "skuCount": discounted_skus,
             }
@@ -389,8 +400,8 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
             },
         )
         rollup["matchedOrders"] += 1
-        rollup["previousTotal"] += before_total
-        rollup["currentTotal"] += after_total
+        rollup["previousTotal"] += before_dropped
+        rollup["currentTotal"] += after_dropped
         rollup["savings"] += item_savings
 
     discounted_orders.sort(key=lambda row: row["savings"], reverse=True)
@@ -410,7 +421,7 @@ def price_savings(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
     customers = customers[:CUSTOMER_LIMIT]
 
     summary = {
-        "droppedProductCount": len(dropped_products),
+        "droppedProductCount": dropped_product_count,
         "currentOrdersWithDroppedProducts": len(orders_with_drop),
         "productSavings": product_savings,
         "productSavingsPct": _pct(product_savings, previous_implied),

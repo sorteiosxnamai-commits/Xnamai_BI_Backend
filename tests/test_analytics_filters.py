@@ -2,7 +2,12 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from app.schemas.analytics import AnalyticsFilters
-from app.services.analytics_filters import comparison_period, previous_bounds
+from app.services.analytics_filters import (
+    adjacent_previous_bounds,
+    comparison_period,
+    date_bounds,
+    previous_bounds,
+)
 
 BR = ZoneInfo("America/Sao_Paulo")
 
@@ -51,3 +56,18 @@ def test_ytd_compares_same_dates_last_year() -> None:
     assert comparison is not None
     assert comparison["previousFrom"] == "2025-01-01"
     assert comparison["previousTo"] == "2025-09-09"
+
+
+def test_90d_adjacent_previous_window_does_not_overlap_current() -> None:
+    now = datetime(2026, 9, 11, 18, tzinfo=timezone.utc)
+    filters = AnalyticsFilters(period="90d")
+    start, _end = date_bounds(filters, now=now)
+    prev_start, prev_end = adjacent_previous_bounds(filters, now=now)
+    assert start is not None and prev_start is not None and prev_end is not None
+    assert prev_end == start
+    assert prev_start < prev_end
+    comparison = comparison_period(filters, now=now, adjacent=True)
+    assert comparison is not None
+    month_shifted = comparison_period(filters, now=now)
+    assert month_shifted is not None
+    assert month_shifted["previousTo"] > comparison["currentFrom"]
