@@ -6,6 +6,7 @@ from app.services.analytics_filters import (
     adjacent_previous_bounds,
     comparison_period,
     date_bounds,
+    lookback_previous_bounds,
     previous_bounds,
 )
 
@@ -71,3 +72,22 @@ def test_90d_adjacent_previous_window_does_not_overlap_current() -> None:
     month_shifted = comparison_period(filters, now=now)
     assert month_shifted is not None
     assert month_shifted["previousTo"] > comparison["currentFrom"]
+
+
+def test_club_lookback_is_60_days_before_current_start() -> None:
+    filters = AnalyticsFilters(
+        dateFrom=date(2026, 9, 1),
+        dateTo=date(2026, 9, 11),
+        period="30d",
+    )
+    prev_start, prev_end = lookback_previous_bounds(filters, days=60)
+    assert prev_start is not None and prev_end is not None
+    assert prev_start.astimezone(BR) == datetime(2026, 7, 3, tzinfo=BR)
+    assert prev_end.astimezone(BR) == datetime(2026, 9, 1, tzinfo=BR)
+    comparison = comparison_period(filters, lookback_days=60)
+    assert comparison == {
+        "currentFrom": "2026-09-01",
+        "currentTo": "2026-09-11",
+        "previousFrom": "2026-07-03",
+        "previousTo": "2026-08-31",
+    }

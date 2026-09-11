@@ -146,6 +146,19 @@ def adjacent_previous_bounds(
     return start - duration, start
 
 
+def lookback_previous_bounds(
+    filters: AnalyticsFilters,
+    *,
+    days: int = 60,
+    now: datetime | None = None,
+) -> tuple[datetime | None, datetime | None]:
+    """Fixed lookback that ends where the current period starts, with no overlap."""
+    start, _end = date_bounds(filters, now=now)
+    if start is None:
+        return None, None
+    return start - timedelta(days=days), start
+
+
 def _inclusive_end_date(end: datetime) -> date:
     return (end.astimezone(BR_TZ) - timedelta(microseconds=1)).date()
 
@@ -155,13 +168,17 @@ def comparison_period(
     *,
     now: datetime | None = None,
     adjacent: bool = False,
+    lookback_days: int | None = None,
 ) -> dict[str, str] | None:
     start, end = date_bounds(filters, now=now)
-    prev_start, prev_end = (
-        adjacent_previous_bounds(filters, now=now)
-        if adjacent
-        else previous_bounds(filters, now=now)
-    )
+    if lookback_days:
+        prev_start, prev_end = lookback_previous_bounds(
+            filters, days=lookback_days, now=now
+        )
+    elif adjacent:
+        prev_start, prev_end = adjacent_previous_bounds(filters, now=now)
+    else:
+        prev_start, prev_end = previous_bounds(filters, now=now)
     if start is None or prev_start is None or prev_end is None:
         return None
     effective_end = end or now or datetime.now(timezone.utc)

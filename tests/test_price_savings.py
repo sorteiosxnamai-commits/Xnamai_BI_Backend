@@ -169,7 +169,7 @@ def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
             ),
         )
 
-        assert result["comparison"]["previousFrom"] == "2026-08-23"
+        assert result["comparison"]["previousFrom"] == "2026-07-03"
         assert result["comparison"]["previousTo"] == "2026-08-31"
         assert result["summary"]["droppedProductCount"] == 1
         assert result["summary"]["matchedPairCount"] == 2
@@ -177,6 +177,8 @@ def test_price_savings_counts_discounted_items_not_identical_baskets() -> None:
         assert result["summary"]["productSavingsPct"] == 20.0
         assert result["summary"]["matchedSavings"] == Decimal("30.00")
         assert result["summary"]["matchedSavingsPct"] == 20.0
+        assert result["summary"]["previousDroppedTotal"] == Decimal("150.00")
+        assert result["summary"]["currentDroppedTotal"] == Decimal("120.00")
         assert result["summary"]["customersWithSavings"] == 2
 
         product = result["products"][0]
@@ -231,4 +233,113 @@ def test_placeholder_list_price_does_not_inflate_club_savings() -> None:
         assert orders["111"]["savings"] == Decimal("10.00")
         assert orders["111"]["currentTotal"] == Decimal("40.00")
         assert result["summary"]["matchedSavings"] == Decimal("30.00")
+
+
+def test_lookback_includes_prices_from_60_days_not_only_adjacent_window() -> None:
+    with make_session() as db:
+        seed_price_drop(db)
+        db.add_all(
+            [
+                Product(mercos_id="p4", code="P4", name="Produto 60d", active=True),
+                Product(mercos_id="p5", code="P5", name="Produto 70d", active=True),
+                Order(
+                    mercos_id="prev-60d",
+                    number="70",
+                    customer_mercos_id="c1",
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 7, 10, 12, tzinfo=timezone.utc),
+                    total=Decimal("50.00"),
+                    net_total=Decimal("50.00"),
+                ),
+                Order(
+                    mercos_id="prev-70d",
+                    number="60",
+                    customer_mercos_id="c1",
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 6, 20, 12, tzinfo=timezone.utc),
+                    total=Decimal("50.00"),
+                    net_total=Decimal("50.00"),
+                ),
+                Order(
+                    mercos_id="curr-p4",
+                    number="120",
+                    customer_mercos_id="c1",
+                    seller_mercos_id="s1",
+                    status="2",
+                    issued_at=datetime(2026, 9, 4, 12, tzinfo=timezone.utc),
+                    total=Decimal("80.00"),
+                    net_total=Decimal("80.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="prev-60d",
+                    position=0,
+                    mercos_item_id="e1",
+                    product_mercos_id="p4",
+                    code="P4",
+                    name="Produto 60d",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("50.00"),
+                    total=Decimal("50.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="prev-70d",
+                    position=0,
+                    mercos_item_id="e2",
+                    product_mercos_id="p5",
+                    code="P5",
+                    name="Produto 70d",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("50.00"),
+                    total=Decimal("50.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="curr-p4",
+                    position=0,
+                    mercos_item_id="e3",
+                    product_mercos_id="p4",
+                    code="P4",
+                    name="Produto 60d",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("40.00"),
+                    total=Decimal("40.00"),
+                ),
+                OrderItem(
+                    order_mercos_id="curr-p4",
+                    position=1,
+                    mercos_item_id="e4",
+                    product_mercos_id="p5",
+                    code="P5",
+                    name="Produto 70d",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("40.00"),
+                    total=Decimal("40.00"),
+                ),
+            ]
+        )
+        db.commit()
+        result = price_savings(
+            db,
+            AnalyticsFilters(
+                dateFrom=date(2026, 9, 1),
+                dateTo=date(2026, 9, 9),
+                period="30d",
+            ),
+        )
+
+        product_ids = {row["id"] for row in result["products"]}
+        assert "p4" in product_ids
+        assert "p5" not in product_ids
+        assert result["summary"]["matchedSavingsPct"] == result["summary"]["productSavingsPct"]
+        p4 = next(row for row in result["products"] if row["id"] == "p4")
+        assert p4["previousAverageUnit"] == Decimal("50.00")
+        assert p4["currentAverageUnit"] == Decimal("40.00")
+        assert p4["savings"] == Decimal("10.00")
+        assert p4["dropPct"] == 20.0
+        orders = {row["currentNumber"]: row for row in result["matchedOrders"]}
+        assert orders["120"]["previousTotal"] == Decimal("50.00")
+        assert orders["120"]["currentTotal"] == Decimal("40.00")
+        assert orders["120"]["savingsPct"] == 20.0
+
 
