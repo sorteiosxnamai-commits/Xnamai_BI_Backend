@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 import httpx
@@ -15,7 +17,8 @@ DEFAULT_RETRIES = 20
 WARMUP_RETRIES = 6
 RETRYABLE_STATUS = {429, 502, 503, 504}
 MAX_RETRY_WAIT = 300.0
-RATE_LIMIT_BUDGET = 600.0
+MAX_429_WAIT = 120.0
+RATE_LIMIT_BUDGET = 300.0
 DEFAULT_429_WAIT = 30.0
 SUCCESS_PACE_SECONDS = 1.5
 
@@ -70,9 +73,16 @@ def _retry_wait(response: httpx.Response, attempt: int) -> float:
         try:
             return min(max(float(header), 1.0), MAX_RETRY_WAIT)
         except ValueError:
-            pass
+            try:
+                retry_at = parsedate_to_datetime(header)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                wait = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                return min(max(wait, 1.0), MAX_RETRY_WAIT)
+            except (TypeError, ValueError, OverflowError):
+                pass
     if response.status_code == 429:
-        return min(DEFAULT_429_WAIT * (2 ** attempt), MAX_RETRY_WAIT)
+        return min(DEFAULT_429_WAIT * (2 ** attempt), MAX_429_WAIT)
     return min(2 ** attempt, 30)
 
 
@@ -86,7 +96,7 @@ def _should_retry_status(
     if response.status_code not in RETRYABLE_STATUS:
         return False, 0.0
     wait = _retry_wait(response, attempt)
-    if attempt + 1 >= retries or waited >= RATE_LIMIT_BUDGET:
+    if attempt + 1 >= retries or waited + wait > RATE_LIMIT_BUDGET:
         return False, wait
     return True, wait
 

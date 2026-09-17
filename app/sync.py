@@ -38,6 +38,7 @@ RATE_LIMIT_PAUSE_SECONDS = 180
 MISSING_DETAIL_BATCH = 5
 MISSING_DETAIL_MAX_BATCHES = 20
 SYNC_LEASE_TTL = timedelta(minutes=15)
+SYNC_COORDINATION_LOCK = "xnamai_sync_mercos"
 _order_detail_blocked = False
 DIMENSION_MODELS = {
     "categories": Category,
@@ -475,14 +476,34 @@ def _lease_is_active(state, now: datetime) -> bool:
     return heartbeat >= now - SYNC_LEASE_TTL
 
 
+def _acquire_sync_coordination_lock(db) -> None:
+    """Serialize short sync state transactions across service instances."""
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:resource))"),
+            {"resource": SYNC_COORDINATION_LOCK},
+        )
+
+
 def interrupt_running_syncs(reason: str = "Sincronização interrompida") -> int:
     now = datetime.now(timezone.utc)
     with SessionLocal() as db:
+        _acquire_sync_coordination_lock(db)
         states = list(
-            db.scalars(select(SyncState).where(SyncState.status == "running"))
+            db.scalars(
+                select(SyncState)
+                .where(SyncState.status == "running")
+                .order_by(SyncState.resource)
+                .with_for_update()
+            )
         )
         runs = list(
-            db.scalars(select(SyncRun).where(SyncRun.status == "running"))
+            db.scalars(
+                select(SyncRun)
+                .where(SyncRun.status == "running")
+                .order_by(SyncRun.id)
+                .with_for_update()
+            )
         )
         for state in states:
             state.status = "interrupted"
@@ -502,11 +523,7 @@ def _claim_sync(resource: str, full: bool, started_at: datetime):
     """Atomically claim a resource across workers and service instances."""
     now = datetime.now(timezone.utc)
     with SessionLocal() as db:
-        if db.bind is not None and db.bind.dialect.name == "postgresql":
-            db.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:resource))"),
-                {"resource": "xnamai_sync_mercos"},
-            )
+        _acquire_sync_coordination_lock(db)
         busy = db.scalars(select(SyncState)).all()
         for other in busy:
             if other.resource == resource:
@@ -583,6 +600,7 @@ def _persist_sync_page(
     items_persisted: int,
 ):
     with SessionLocal() as db:
+        _acquire_sync_coordination_lock(db)
         state = db.scalar(
             select(SyncState)
             .where(SyncState.resource == resource)
@@ -634,6 +652,7 @@ def _finish_sync_run(
 ):
     finished_at = datetime.now(timezone.utc)
     with SessionLocal() as db:
+        _acquire_sync_coordination_lock(db)
         state = db.get(SyncState, resource) or SyncState(resource=resource)
         owns_lease = state.lease_token == lease_token
         if owns_lease:

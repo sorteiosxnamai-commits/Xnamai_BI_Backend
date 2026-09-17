@@ -197,7 +197,6 @@ async def test_list_stops_retrying_429_after_wait_budget(monkeypatch):
     fake = FakeClient(
         [
             response(429, text="Too Many Requests", headers={"Retry-After": "40"}),
-            response(429, text="Too Many Requests", headers={"Retry-After": "40"}),
         ]
     )
     sleep = AsyncMock()
@@ -217,8 +216,33 @@ async def test_list_stops_retrying_429_after_wait_budget(monkeypatch):
         await adaptor_module.Adaptor().list("categories")
 
     assert exc_info.value.status_code == 429
-    assert fake.calls == 2
-    assert sleep.await_args_list[0].args[0] == pytest.approx(40, abs=0.05)
+    assert fake.calls == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_list_caps_default_429_wait_and_preserves_budget(monkeypatch):
+    fake = FakeClient([response(429, text="Too Many Requests") for _ in range(4)])
+    sleep = AsyncMock()
+    monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
+    monkeypatch.setattr(adaptor_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        adaptor_module,
+        "settings",
+        lambda: SimpleNamespace(
+            mercos_adaptor_url="https://mercosadaptor.onrender.com",
+            mercos_adaptor_api_key="test-key",
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await adaptor_module.Adaptor().list("orders")
+
+    assert exc_info.value.status_code == 429
+    assert fake.calls == 4
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
+        [30, 60, 120], abs=0.05
+    )
 
 
 @pytest.mark.asyncio

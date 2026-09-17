@@ -350,6 +350,32 @@ async def test_interrupt_running_syncs_releases_stuck_lease(sync_db):
 
 
 @pytest.mark.asyncio
+async def test_claim_finish_and_cancel_share_coordination_lock(sync_db, monkeypatch):
+    calls: list[str] = []
+
+    def record_lock(_db):
+        calls.append("lock")
+
+    class OnePageAdaptor:
+        async def list(self, resource: str, cursor: str | None):
+            return {
+                "data": [{"id": 1, "nome": "Categoria"}],
+                "pageCursor": "2026-09-17T00:00:00+00:00",
+                "nextCursor": None,
+            }
+
+    monkeypatch.setattr(sync, "_acquire_sync_coordination_lock", record_lock)
+    monkeypatch.setattr(sync, "adaptor", OnePageAdaptor())
+
+    result = await sync.sync_resource("categories")
+    released = sync.interrupt_running_syncs("Interrompida pelo operador")
+
+    assert result["status"] == "success"
+    assert released == 0
+    assert calls == ["lock", "lock", "lock", "lock"]
+
+
+@pytest.mark.asyncio
 async def test_claim_blocks_other_resources_while_one_is_running(sync_db, monkeypatch):
     with sync_db() as db:
         db.add(
