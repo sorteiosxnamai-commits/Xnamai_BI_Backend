@@ -2798,69 +2798,175 @@ def geography(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
 
 
 def cohorts(db: Session, filters: AnalyticsFilters) -> dict[str, Any]:
+    order_values = _current_order_values(filters, statuses=VALID_SALE_STATUSES)
     if db.bind is not None and db.bind.dialect.name == "sqlite":
-        month = func.strftime("%Y-%m", Order.issued_at)
+        value_month = func.strftime("%Y-%m", order_values.c.issued_at)
     else:
-        month = func.to_char(
+        value_month = func.to_char(
             func.date_trunc(
                 "month",
-                func.timezone("America/Sao_Paulo", Order.issued_at),
+                func.timezone("America/Sao_Paulo", order_values.c.issued_at),
             ),
             "YYYY-MM",
         )
     rows = db.execute(
-        select(Order.customer_mercos_id, month.label("month"))
-        .where(
-            *_sale_conditions(filters),
-            Order.customer_mercos_id.is_not(None),
+        select(
+            order_values.c.customer_id,
+            value_month.label("month"),
+            func.coalesce(func.sum(order_values.c.current_total), 0).label("revenue"),
         )
-        .distinct()
-        .order_by(Order.customer_mercos_id, month)
+        .where(order_values.c.customer_id.is_not(None))
+        .group_by(order_values.c.customer_id, value_month)
+        .order_by(order_values.c.customer_id, value_month)
     ).all()
-    customer_months: dict[str, list[str]] = {}
+
+    def month_distance(start: str, end: str) -> int:
+        start_year, start_month = map(int, start.split("-"))
+        end_year, end_month = map(int, end.split("-"))
+        return (end_year - start_year) * 12 + end_month - start_month
+
+    customer_months: dict[str, list[tuple[str, Decimal]]] = {}
     for row in rows:
-        customer_months.setdefault(row.customer_mercos_id, []).append(str(row.month))
+        customer_months.setdefault(str(row.customer_id), []).append(
+            (str(row.month), _decimal(row.revenue))
+        )
+
+    latest_month = max((str(row.month) for row in rows), default=None)
     matrix: dict[tuple[str, int], int] = {}
+    revenue_matrix: dict[tuple[str, int], Decimal] = {}
     cohort_sizes: dict[str, int] = {}
-    for months in customer_months.values():
-        if not months:
+    cohort_ages: dict[str, int] = {}
+    repeat_customers = 0
+    for observations in customer_months.values():
+        if not observations:
             continue
-        cohort = months[0]
+        cohort = observations[0][0]
         cohort_sizes[cohort] = cohort_sizes.get(cohort, 0) + 1
-        cohort_year, cohort_month = map(int, cohort.split("-"))
-        for observed in months:
-            year, month_number = map(int, observed.split("-"))
-            offset = (year - cohort_year) * 12 + month_number - cohort_month
+        cohort_ages[cohort] = month_distance(cohort, latest_month or cohort)
+        if len(observations) > 1:
+            repeat_customers += 1
+        for observed, revenue in observations:
+            offset = month_distance(cohort, observed)
             matrix[(cohort, offset)] = matrix.get((cohort, offset), 0) + 1
-    return {
-        "cohorts": [
+            revenue_matrix[(cohort, offset)] = (
+                revenue_matrix.get((cohort, offset), ZERO) + revenue
+            )
+
+    cohort_rows: list[dict[str, Any]] = []
+    for cohort, size in sorted(cohort_sizes.items()):
+        cumulative_revenue = ZERO
+        retention = []
+        for offset in range(cohort_ages[cohort] + 1):
+            revenue = revenue_matrix.get((cohort, offset), ZERO)
+            cumulative_revenue += revenue
+            retained = matrix.get((cohort, offset), 0)
+            retention.append(
+                {
+                    "monthOffset": offset,
+                    "customers": retained,
+                    "rate": round((retained / size) * 100, 2),
+                    "revenue": revenue,
+                    "cumulativeRevenue": cumulative_revenue,
+                    "cumulativeLtv": cumulative_revenue / size,
+                }
+            )
+        cohort_rows.append(
             {
                 "cohort": cohort,
                 "size": size,
-                "retention": [
-                    {
-                        "monthOffset": offset,
-                        "customers": matrix.get((cohort, offset), 0),
-                        "rate": round(
-                            (matrix.get((cohort, offset), 0) / size) * 100,
-                            2,
-                        ),
-                    }
-                    for offset in range(
-                        max(
-                            (
-                                key_offset
-                                for key_cohort, key_offset in matrix
-                                if key_cohort == cohort
-                            ),
-                            default=0,
-                        )
-                        + 1
-                    )
-                ],
+                "totalRevenue": cumulative_revenue,
+                "realizedLtv": cumulative_revenue / size,
+                "retention": retention,
             }
-            for cohort, size in sorted(cohort_sizes.items())
-        ],
+        )
+
+    max_offset = max(cohort_ages.values(), default=0)
+    retention_curve = []
+    ltv_curve = []
+    for offset in range(max_offset + 1):
+        eligible = [row for row in cohort_rows if cohort_ages[row["cohort"]] >= offset]
+        eligible_customers = sum(row["size"] for row in eligible)
+        active_customers = sum(
+            next(
+                cell["customers"]
+                for cell in row["retention"]
+                if cell["monthOffset"] == offset
+            )
+            for row in eligible
+        )
+        cumulative_revenue = sum(
+            (
+                next(
+                    cell["cumulativeRevenue"]
+                    for cell in row["retention"]
+                    if cell["monthOffset"] == offset
+                )
+                for row in eligible
+            ),
+            ZERO,
+        )
+        retention_curve.append(
+            {
+                "monthOffset": offset,
+                "retentionRate": round(
+                    (active_customers / eligible_customers) * 100, 2
+                )
+                if eligible_customers
+                else 0.0,
+                "activeCustomers": active_customers,
+                "eligibleCustomers": eligible_customers,
+                "cohortCount": len(eligible),
+            }
+        )
+        ltv_curve.append(
+            {
+                "monthOffset": offset,
+                "ltv": cumulative_revenue / eligible_customers
+                if eligible_customers
+                else ZERO,
+                "cumulativeRevenue": cumulative_revenue,
+                "eligibleCustomers": eligible_customers,
+                "cohortCount": len(eligible),
+            }
+        )
+
+    customers = len(customer_months)
+    total_revenue = sum(
+        (row["totalRevenue"] for row in cohort_rows),
+        ZERO,
+    )
+    month_one_eligible = sum(
+        row["size"] for row in cohort_rows if cohort_ages[row["cohort"]] >= 1
+    )
+    month_one_retained = sum(
+        next(
+            cell["customers"]
+            for cell in row["retention"]
+            if cell["monthOffset"] == 1
+        )
+        for row in cohort_rows
+        if cohort_ages[row["cohort"]] >= 1
+    )
+    return {
+        "summary": {
+            "customers": customers,
+            "repeatCustomers": repeat_customers,
+            "repeatRate": round((repeat_customers / customers) * 100, 2)
+            if customers
+            else 0.0,
+            "month1RetainedCustomers": month_one_retained,
+            "month1EligibleCustomers": month_one_eligible,
+            "month1RetentionRate": round(
+                (month_one_retained / month_one_eligible) * 100, 2
+            )
+            if month_one_eligible
+            else None,
+            "totalRevenue": total_revenue,
+            "realizedLtv": total_revenue / customers if customers else ZERO,
+        },
+        "retentionCurve": retention_curve,
+        "ltvCurve": ltv_curve,
+        "cohorts": cohort_rows,
         "appliedFilters": applied_filters(filters),
         "metadata": analytics_metadata(db),
     }

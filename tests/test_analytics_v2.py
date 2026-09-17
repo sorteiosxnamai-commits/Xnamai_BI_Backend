@@ -683,6 +683,80 @@ def test_customers_summary_splits_top_cohorts_and_long_tail() -> None:
         assert summary["rest"]["members"][0]["id"] == "c21"
 
 
+def test_cohorts_calculate_retention_and_cumulative_ltv() -> None:
+    with make_session() as db:
+        db.add(
+            Product(
+                mercos_id="p1",
+                code="P1",
+                name="Produto",
+                list_price=Decimal("50"),
+                stock=Decimal("10"),
+                active=True,
+            )
+        )
+        db.add_all(
+            [
+                Customer(mercos_id="c1", name="Cliente 1", active=True),
+                Customer(mercos_id="c2", name="Cliente 2", active=True),
+                Customer(mercos_id="c3", name="Cliente 3", active=True),
+            ]
+        )
+        orders = [
+            ("o1", "c1", datetime(2026, 1, 5, tzinfo=timezone.utc), Decimal("2")),
+            ("o2", "c1", datetime(2026, 2, 5, tzinfo=timezone.utc), Decimal("1")),
+            ("o3", "c2", datetime(2026, 1, 7, tzinfo=timezone.utc), Decimal("1")),
+            ("o4", "c3", datetime(2026, 2, 8, tzinfo=timezone.utc), Decimal("4")),
+            ("o5", "c3", datetime(2026, 3, 8, tzinfo=timezone.utc), Decimal("2")),
+        ]
+        for position, (order_id, customer_id, issued_at, quantity) in enumerate(orders):
+            db.add(
+                Order(
+                    mercos_id=order_id,
+                    number=order_id,
+                    customer_mercos_id=customer_id,
+                    status="2",
+                    issued_at=issued_at,
+                    total=quantity * Decimal("50"),
+                    item_count=1,
+                    sku_count=1,
+                )
+            )
+            db.add(
+                OrderItem(
+                    order_mercos_id=order_id,
+                    position=0,
+                    mercos_item_id=str(position),
+                    product_mercos_id="p1",
+                    name="Produto",
+                    quantity=quantity,
+                    total=quantity * Decimal("50"),
+                )
+            )
+        db.commit()
+
+        result = cohorts(db, AnalyticsFilters(period="all"))
+
+        assert result["summary"] == {
+            "customers": 3,
+            "repeatCustomers": 2,
+            "repeatRate": 66.67,
+            "month1RetainedCustomers": 2,
+            "month1EligibleCustomers": 3,
+            "month1RetentionRate": 66.67,
+            "totalRevenue": Decimal("500"),
+            "realizedLtv": Decimal("166.6666666666666666666666667"),
+        }
+        january, february = result["cohorts"]
+        assert january["size"] == 2
+        assert [cell["rate"] for cell in january["retention"]] == [100.0, 50.0, 0.0]
+        assert january["retention"][1]["cumulativeLtv"] == Decimal("100")
+        assert february["realizedLtv"] == Decimal("300")
+        assert result["retentionCurve"][1]["retentionRate"] == 66.67
+        assert result["ltvCurve"][1]["ltv"] == Decimal("166.6666666666666666666666667")
+        assert result["ltvCurve"][2]["ltv"] == Decimal("100")
+
+
 def test_excluded_customers_leave_the_totals_and_the_list() -> None:
     with make_session() as db:
         seed_orders(db)
@@ -714,8 +788,6 @@ def test_excluded_customers_leave_the_totals_and_the_list() -> None:
         assert included["summary"]["totalRevenue"] == overview(
             db, AnalyticsFilters(period="all")
         )["kpis"]["netRevenue"]["value"]
-
-
 def test_data_through_uses_orders_sync_success_time() -> None:
     with make_session() as db:
         db.add(
@@ -739,4 +811,3 @@ def test_data_through_uses_orders_sync_success_time() -> None:
         through = data_through_timestamp(db)
         assert through == datetime(2026, 9, 11, 17, tzinfo=timezone.utc)
         assert analytics_metadata(db)["dataThrough"] == through
-

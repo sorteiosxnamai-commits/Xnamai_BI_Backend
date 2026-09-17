@@ -28,6 +28,14 @@
   C acima de 95%.
 - **RFM**: notas 1–5 de recência, frequência e valor monetário entre os
   clientes contidos nos filtros.
+- **Coorte de clientes**: grupo definido pelo mês da primeira compra observada
+  dentro do recorte selecionado.
+- **Retenção M+N**: percentual dos clientes de uma coorte que realizou ao
+  menos uma compra no enésimo mês após a primeira compra observada. Coortes
+  que ainda não completaram esse tempo não entram na taxa consolidada.
+- **LTV observado**: faturamento analítico acumulado dividido pelos clientes da
+  coorte ou do conjunto analisado. É um valor realizado no histórico disponível,
+  não uma projeção de receita futura.
 - **Velocidade média**: quantidade vendida dividida pelos dias do período.
 - **Cobertura estimada**: estoque atual dividido pela velocidade média.
   É indisponível para período `all` ou produto sem venda.
