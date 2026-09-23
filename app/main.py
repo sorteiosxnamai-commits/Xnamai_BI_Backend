@@ -35,7 +35,6 @@ from app.schemas.data_quality import DataQualityResponse
 from app.services.data_quality import build_data_quality_report
 from app.adaptor import clear_cancel, keep_adaptor_warm, request_cancel
 from app.sync import (
-    SYNC_LEASE_TTL,
     SYNC_RESOURCES,
     interrupt_running_syncs,
     sync_all,
@@ -58,50 +57,16 @@ async def lifespan(app):
         log.warning("AUTH_ADMIN_PASSWORD missing: interactive login is disabled")
     if cfg.jwt_secret == "change-me-in-production":
         log.warning("JWT_SECRET is using the development default")
-    # Never auto-resume Mercos sync on boot — it starves dashboard reads on free Render.
-    # User clicks Sincronizar / Primeira carga when they want to sync.
-    with SessionLocal() as db:
-        interrupted_at = datetime.now(timezone.utc)
-        stale_before = interrupted_at - SYNC_LEASE_TTL
-        stuck = list(
-            db.scalars(
-                select(SyncState).where(
-                    SyncState.status == "running",
-                    (SyncState.heartbeat_at.is_(None))
-                    | (SyncState.heartbeat_at < stale_before),
-                )
-            )
+    # A lease belongs to the process that created it. After a process restart,
+    # even a recent heartbeat is orphaned and must not block the new scheduler.
+    interrupted = interrupt_running_syncs(
+        "Serviço reiniciou durante a sincronização"
+    )
+    if interrupted:
+        log.warning(
+            "Released %s orphaned sync lease(s) after service restart",
+            interrupted,
         )
-        stale_resources = {state.resource for state in stuck}
-        for state in stuck:
-            state.status = "interrupted"
-            state.error = "Serviço reiniciou durante a sync — use Sincronizar para continuar"
-            state.lease_token = None
-            db.add(state)
-        stuck_runs = (
-            list(
-                db.scalars(
-                    select(SyncRun).where(
-                        SyncRun.status == "running",
-                        SyncRun.resource.in_(stale_resources),
-                    )
-                )
-            )
-            if stale_resources
-            else []
-        )
-        for run in stuck_runs:
-            run.status = "interrupted"
-            run.finished_at = interrupted_at
-            run.error = "Serviço reiniciou durante a sincronização"
-            db.add(run)
-        if stuck or stuck_runs:
-            db.commit()
-            log.warning(
-                "Marked %s sync state(s) and %s run(s) interrupted (no auto-resume)",
-                len(stuck),
-                len(stuck_runs),
-            )
     if cfg.mercos_adaptor_url and cfg.mercos_adaptor_api_key:
         scheduler.add_job(
             sync_orders_job,

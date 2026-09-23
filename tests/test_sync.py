@@ -350,6 +350,35 @@ async def test_interrupt_running_syncs_releases_stuck_lease(sync_db):
 
 
 @pytest.mark.asyncio
+async def test_scheduled_orders_job_reports_when_lease_blocks_sync(monkeypatch):
+    messages: list[str] = []
+
+    class CapturingLogger:
+        def info(self, message, *args):
+            messages.append(message % args if args else message)
+
+        def warning(self, message, *args):
+            messages.append(message % args if args else message)
+
+    async def blocked_sync(resource, full, *, raise_http):
+        assert resource == "orders"
+        assert full is False
+        assert raise_http is False
+        return {
+            "resource": resource,
+            "status": "running",
+            "message": "Sincronização Mercos já está em andamento",
+        }
+
+    monkeypatch.setattr(sync, "sync_resource", blocked_sync)
+    monkeypatch.setattr(sync, "log", CapturingLogger())
+    await sync.sync_orders_job()
+
+    assert "Scheduled orders sync starting" in messages
+    assert any(message.startswith("Scheduled orders sync skipped") for message in messages)
+
+
+@pytest.mark.asyncio
 async def test_claim_finish_and_cancel_share_coordination_lock(sync_db, monkeypatch):
     calls: list[str] = []
 

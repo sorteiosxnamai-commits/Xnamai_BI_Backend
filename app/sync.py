@@ -933,7 +933,20 @@ async def sync_all(full=False, *, raise_http=True):
 
 
 async def sync_orders_job():
-    await sync_resource("orders", full=False, raise_http=False)
+    log.info("Scheduled orders sync starting")
+    result = await sync_resource("orders", full=False, raise_http=False)
+    if result.get("status") == "running":
+        log.warning(
+            "Scheduled orders sync skipped: %s",
+            result.get("message", "another sync owns the lease"),
+        )
+        return
+    log.info(
+        "Scheduled orders sync finished: status=%s records=%s run_id=%s",
+        result.get("status"),
+        result.get("records", 0),
+        result.get("runId"),
+    )
 
 
 async def sync_catalog_job():
