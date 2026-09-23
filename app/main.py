@@ -107,6 +107,12 @@ async def lifespan(app):
             sync_orders_job,
             "interval",
             minutes=max(1, cfg.sync_orders_minutes),
+            next_run_time=(
+                datetime.now(timezone.utc)
+                if not cfg.database_url.startswith("sqlite")
+                else datetime.now(timezone.utc)
+                + timedelta(minutes=max(1, cfg.sync_orders_minutes))
+            ),
             id="sync_orders",
             replace_existing=True,
             max_instances=1,

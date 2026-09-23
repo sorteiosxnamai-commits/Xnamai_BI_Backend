@@ -421,6 +421,11 @@ async def test_sync_all_continues_after_rate_limit(sync_db, monkeypatch):
     assert len(results) == 2
 
 
+def test_full_sync_prioritizes_orders_before_catalog_resources():
+    assert sync.SYNC_RESOURCES[0] == "orders"
+    assert sync.SYNC_RESOURCES[1:] == sync.CATALOG_RESOURCES
+
+
 @pytest.mark.asyncio
 async def test_sync_all_stops_after_operator_cancel(sync_db, monkeypatch):
     called: list[str] = []

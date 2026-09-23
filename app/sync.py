@@ -72,7 +72,10 @@ OPTIONAL_CATALOG_RESOURCES = {
     "commercial-policies",
     "product-prices",
 }
-SYNC_RESOURCES = (*CATALOG_RESOURCES, "orders")
+# Pedidos alimentam os indicadores do BI e precisam ser atualizados antes dos
+# cadastros auxiliares. Assim, um rate limit em uma dimensao opcional nao deixa
+# a atualizacao comercial presa no fim de uma sincronizacao completa.
+SYNC_RESOURCES = ("orders", *CATALOG_RESOURCES)
 
 
 class OrderDetailBatchError(Exception):
