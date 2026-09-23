@@ -427,7 +427,7 @@ async def test_claim_blocks_other_resources_while_one_is_running(sync_db, monkey
 
 
 @pytest.mark.asyncio
-async def test_sync_all_continues_after_rate_limit(sync_db, monkeypatch):
+async def test_sync_all_stops_after_rate_limit(sync_db, monkeypatch):
     called: list[str] = []
 
     class RateLimitedThenOkAdaptor:
@@ -444,10 +444,9 @@ async def test_sync_all_continues_after_rate_limit(sync_db, monkeypatch):
 
     results = await sync.sync_all(full=False, raise_http=False)
 
-    assert called == ["categories", "orders"]
+    assert called == ["categories"]
     assert results[0]["status"] == "interrupted"
-    assert results[1]["status"] == "success"
-    assert len(results) == 2
+    assert len(results) == 1
 
 
 def test_full_sync_prioritizes_orders_before_catalog_resources():

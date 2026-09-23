@@ -881,17 +881,13 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
         }
 
 
-def _operator_cancelled(result: dict) -> bool:
-    if result.get("statusCode") == 409:
-        return True
-    error = str(result.get("error") or "").lower()
-    return "interrompida pelo operador" in error
-
-
 def _should_stop_pipeline(result: dict) -> bool:
     if result.get("status") == "running":
         return True
-    return result.get("status") == "interrupted" and _operator_cancelled(result)
+    # A transient failure (especially Mercos 429) affects the shared account,
+    # not only one endpoint. Continuing with categories/products just spends
+    # more quota and delays the priority orders sync.
+    return result.get("status") == "interrupted"
 
 
 async def _pause_after_resource(result: dict, *, last: bool) -> None:

@@ -222,7 +222,7 @@ async def test_list_stops_retrying_429_after_wait_budget(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_caps_default_429_wait_and_preserves_budget(monkeypatch):
-    fake = FakeClient([response(429, text="Too Many Requests") for _ in range(4)])
+    fake = FakeClient([response(429, text="Too Many Requests") for _ in range(9)])
     sleep = AsyncMock()
     monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
     monkeypatch.setattr(adaptor_module.asyncio, "sleep", sleep)
@@ -239,9 +239,9 @@ async def test_list_caps_default_429_wait_and_preserves_budget(monkeypatch):
         await adaptor_module.Adaptor().list("orders")
 
     assert exc_info.value.status_code == 429
-    assert fake.calls == 4
+    assert fake.calls == 9
     assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
-        [30, 60, 120], abs=0.05
+        [30, 60, 120, 120, 120, 120, 120, 120], abs=0.05
     )
 
 

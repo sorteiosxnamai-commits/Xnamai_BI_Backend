@@ -18,7 +18,10 @@ WARMUP_RETRIES = 6
 RETRYABLE_STATUS = {429, 502, 503, 504}
 MAX_RETRY_WAIT = 300.0
 MAX_429_WAIT = 120.0
-RATE_LIMIT_BUDGET = 300.0
+# Mercos commonly applies a rolling limit longer than five minutes. Keep the
+# same claimed sync alive through that window so scheduled/manual retries do
+# not continuously restart the cooldown. This remains below SYNC_LEASE_TTL.
+RATE_LIMIT_BUDGET = 840.0
 DEFAULT_429_WAIT = 30.0
 SUCCESS_PACE_SECONDS = 1.5
 
