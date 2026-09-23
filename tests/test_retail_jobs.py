@@ -94,7 +94,7 @@ def test_job_commits_per_product_and_resumes_after_interrupt():
                 job2.status = "running"
                 job2.cursor = 1
                 job2.processed = 1
-                job2.heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+                job2.heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=15)
                 session.add(job2)
                 session.commit()
 
@@ -161,9 +161,9 @@ def test_reclaim_marks_stale_running_job():
         failed=0,
         skipped=0,
         errors=[],
-        heartbeat_at=now - timedelta(minutes=10),
+        heartbeat_at=now - timedelta(minutes=15),
         created_at=now - timedelta(minutes=11),
-        updated_at=now - timedelta(minutes=10),
+        updated_at=now - timedelta(minutes=15),
     )
     session.add(job)
     session.commit()
