@@ -12,14 +12,12 @@ from sqlalchemy.orm import Session
 from app.analytics import REVENUE_STATUSES, _aware, _now, classify_customer
 from app.config import settings
 from app.domain.order_status import status_sql_in
-from app.models import CrmAttendance, Customer, Order, OrderItem, Product
+from app.models import CrmAttendance, Customer, Order, OrderItem
 from app.services.crm import (
     _customer_extras,
     _customer_filters,
     _days_since_last_order,
-    _iso,
     _money_total,
-    _order_stats,
     _order_stats_subquery,
 )
 

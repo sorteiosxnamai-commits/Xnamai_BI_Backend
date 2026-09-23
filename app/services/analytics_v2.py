@@ -15,7 +15,6 @@ from sqlalchemy import (
     desc,
     exists,
     func,
-    literal,
     or_,
     select,
 )

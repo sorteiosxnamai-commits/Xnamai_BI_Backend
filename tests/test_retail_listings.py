@@ -1,5 +1,4 @@
 from app.services.retail_listings import (
-    collapse_platform_market_price,
     collect_listings,
     is_placeholder_seller,
     is_usable_listing_url,

@@ -1,5 +1,4 @@
 from fastapi import HTTPException, Response
-from fastapi.security import HTTPAuthorizationCredentials
 import pytest
 
 from app import auth
