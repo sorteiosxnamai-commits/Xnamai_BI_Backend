@@ -30,6 +30,8 @@ curl -X POST "https://xnamai-bi-backend.onrender.com/api/v1/sync/all?full=true" 
   -H "X-API-Key: SUA_BI_API_KEY"
 ```
 
-Depois o scheduler roda pedidos a cada `SYNC_ORDERS_MINUTES` e catálogo a cada `SYNC_CATALOG_HOURS`.
+Depois o scheduler roda pedidos a cada `SYNC_ORDERS_MINUTES` e, em rodízio,
+um recurso de catálogo a cada `SYNC_CATALOG_MINUTES`. Respostas 429 liberam a
+execução imediatamente para uma nova tentativa automática no próximo ciclo.
 
 Swagger: `/docs`.

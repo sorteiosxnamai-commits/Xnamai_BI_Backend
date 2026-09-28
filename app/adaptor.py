@@ -18,10 +18,7 @@ WARMUP_RETRIES = 6
 RETRYABLE_STATUS = {429, 502, 503, 504}
 MAX_RETRY_WAIT = 300.0
 MAX_429_WAIT = 120.0
-# Mercos commonly applies a rolling limit longer than five minutes. Keep the
-# same claimed sync alive through that window so scheduled/manual retries do
-# not continuously restart the cooldown. This remains below SYNC_LEASE_TTL.
-RATE_LIMIT_BUDGET = 840.0
+RATE_LIMIT_BUDGET = 120.0
 DEFAULT_429_WAIT = 30.0
 SUCCESS_PACE_SECONDS = 1.5
 
@@ -99,6 +96,11 @@ def _should_retry_status(
     if response.status_code not in RETRYABLE_STATUS:
         return False, 0.0
     wait = _retry_wait(response, attempt)
+    # Do not keep a database lease open while Mercos is rate-limiting. The
+    # persistent scheduler will retry on its next cycle without hammering the
+    # shared account or leaving the UI apparently stuck for many minutes.
+    if response.status_code == 429:
+        return False, wait
     if attempt + 1 >= retries or waited + wait > RATE_LIMIT_BUDGET:
         return False, wait
     return True, wait
@@ -221,6 +223,13 @@ class Adaptor:
                         continue
 
                 if r.is_error:
+                    if r.status_code == 429:
+                        wait = _retry_wait(r, attempt)
+                        _extend_cooldown(wait)
+                        log.warning(
+                            "Adaptor %s rate limited; releasing sync for scheduled retry",
+                            resource,
+                        )
                     detail = _response_detail(r)
                     raise HTTPException(
                         status_code=502 if r.status_code >= 500 else r.status_code,

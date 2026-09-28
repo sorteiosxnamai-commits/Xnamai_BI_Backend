@@ -86,7 +86,13 @@ async def lifespan(app):
         scheduler.add_job(
             sync_catalog_job,
             "interval",
-            hours=max(1, cfg.sync_catalog_hours),
+            minutes=max(5, cfg.sync_catalog_minutes),
+            next_run_time=(
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+                if not cfg.database_url.startswith("sqlite")
+                else datetime.now(timezone.utc)
+                + timedelta(minutes=max(5, cfg.sync_catalog_minutes))
+            ),
             id="sync_catalog",
             replace_existing=True,
             max_instances=1,
@@ -103,9 +109,9 @@ async def lifespan(app):
         )
         scheduler.start()
         log.info(
-            "Scheduler started (orders every %sm, catalog every %sh, adaptor ping every 8m)",
+            "Scheduler started (orders every %sm, one catalog resource every %sm, adaptor ping every 8m)",
             cfg.sync_orders_minutes,
-            cfg.sync_catalog_hours,
+            cfg.sync_catalog_minutes,
         )
     else:
         log.warning("Scheduler disabled: MERCOS_ADAPTOR_URL/API_KEY missing")

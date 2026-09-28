@@ -110,7 +110,7 @@ async def test_list_wakes_adaptor_before_orders(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_retries_429_then_succeeds(monkeypatch):
+async def test_list_releases_429_for_scheduled_retry(monkeypatch):
     fake = FakeClient(
         [
             response(429, text="Too Many Requests", headers={"Retry-After": "7"}),
@@ -129,15 +129,17 @@ async def test_list_retries_429_then_succeeds(monkeypatch):
         ),
     )
 
-    result = await adaptor_module.Adaptor().list("customers")
+    with pytest.raises(HTTPException) as exc_info:
+        await adaptor_module.Adaptor().list("customers")
 
-    assert result == {"data": [], "nextCursor": None}
-    assert fake.calls == 2
-    assert sleep.await_args_list[0].args[0] == pytest.approx(7, abs=0.05)
+    assert exc_info.value.status_code == 429
+    assert fake.calls == 1
+    sleep.assert_not_awaited()
+    assert adaptor_module._not_before > 0
 
 
 @pytest.mark.asyncio
-async def test_list_uses_default_429_backoff_without_retry_after(monkeypatch):
+async def test_list_releases_default_429_without_sleeping(monkeypatch):
     fake = FakeClient(
         [
             response(429, text="Too Many Requests"),
@@ -156,14 +158,16 @@ async def test_list_uses_default_429_backoff_without_retry_after(monkeypatch):
         ),
     )
 
-    result = await adaptor_module.Adaptor().list("products")
+    with pytest.raises(HTTPException) as exc_info:
+        await adaptor_module.Adaptor().list("products")
 
-    assert result == {"data": [], "nextCursor": None}
-    assert sleep.await_args_list[0].args[0] == pytest.approx(30, abs=0.05)
+    assert exc_info.value.status_code == 429
+    assert fake.calls == 1
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_list_retries_two_429s_then_succeeds(monkeypatch):
+async def test_list_never_hammers_repeated_429s(monkeypatch):
     fake = FakeClient(
         [
             response(429, text="Too Many Requests"),
@@ -183,13 +187,12 @@ async def test_list_retries_two_429s_then_succeeds(monkeypatch):
         ),
     )
 
-    result = await adaptor_module.Adaptor().list("categories")
+    with pytest.raises(HTTPException) as exc_info:
+        await adaptor_module.Adaptor().list("categories")
 
-    assert result == {"data": [], "nextCursor": None}
-    assert fake.calls == 3
-    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
-        [30, 60], abs=0.05
-    )
+    assert exc_info.value.status_code == 429
+    assert fake.calls == 1
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -221,7 +224,7 @@ async def test_list_stops_retrying_429_after_wait_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_caps_default_429_wait_and_preserves_budget(monkeypatch):
+async def test_list_releases_429_on_first_response(monkeypatch):
     fake = FakeClient([response(429, text="Too Many Requests") for _ in range(9)])
     sleep = AsyncMock()
     monkeypatch.setattr(adaptor_module.httpx, "AsyncClient", lambda **kwargs: fake)
@@ -239,14 +242,12 @@ async def test_list_caps_default_429_wait_and_preserves_budget(monkeypatch):
         await adaptor_module.Adaptor().list("orders")
 
     assert exc_info.value.status_code == 429
-    assert fake.calls == 9
-    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx(
-        [30, 60, 120, 120, 120, 120, 120, 120], abs=0.05
-    )
+    assert fake.calls == 1
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_list_honors_nested_mercos_wait(monkeypatch):
+async def test_list_preserves_nested_mercos_wait_as_cooldown(monkeypatch):
     fake = FakeClient(
         [
             response(
@@ -271,10 +272,13 @@ async def test_list_honors_nested_mercos_wait(monkeypatch):
         ),
     )
 
-    result = await adaptor_module.Adaptor().list("orders")
+    with pytest.raises(HTTPException) as exc_info:
+        await adaptor_module.Adaptor().list("orders")
 
-    assert result == {"data": [], "nextCursor": None}
-    assert sleep.await_args_list[0].args[0] == pytest.approx(87.5, abs=0.05)
+    assert exc_info.value.status_code == 429
+    assert fake.calls == 1
+    sleep.assert_not_awaited()
+    assert adaptor_module._not_before > 0
 
 
 @pytest.mark.asyncio

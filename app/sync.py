@@ -803,6 +803,25 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             "status": "success",
             "runId": run_id,
         }
+    except asyncio.CancelledError:
+        await asyncio.to_thread(
+            _finish_sync_run,
+            run_id,
+            lease_token,
+            resource,
+            status="interrupted",
+            pages=pages,
+            received=received,
+            persisted=persisted,
+            failed=max(failed, received - persisted),
+            cursor_after=committed_cursor,
+            details_consulted=details_consulted,
+            items_persisted=items_persisted,
+            started_at=started_at,
+            error="Execução cancelada durante reinício do serviço",
+        )
+        log.warning("Sync %s cancelled; lease released", resource)
+        raise
     except Exception as exc:
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
         # Network blips / Render cold starts — keep cursor and allow auto-resume
@@ -839,11 +858,20 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
                 "status": "unavailable",
                 "error": str(detail),
             }
+        rate_limited = (
+            isinstance(source_exc, HTTPException)
+            and source_exc.status_code == 429
+        )
         transient = isinstance(source_exc, HTTPException) and (
             "inacessível" in str(source_exc.detail).lower()
             or source_exc.status_code in {409, 429, 502, 503}
         )
-        status = "interrupted" if transient else "error"
+        status = "waiting" if rate_limited else "interrupted" if transient else "error"
+        stored_error = (
+            "Mercos limitou as requisições; nova tentativa será feita automaticamente"
+            if rate_limited
+            else str(detail)[:1000]
+        )
         failed = max(failed, received - persisted)
         await asyncio.to_thread(
             _finish_sync_run,
@@ -859,10 +887,12 @@ async def sync_resource(resource: str, full=False, *, raise_http=True):
             details_consulted=details_consulted,
             items_persisted=items_persisted,
             started_at=started_at,
-            error=str(detail)[:1000],
+            error=stored_error,
         )
         if isinstance(source_exc, HTTPException) and source_exc.status_code == 409:
             log.warning("Sync %s cancelled by operator", resource)
+        elif rate_limited:
+            log.warning("Sync %s waiting for the next automatic retry", resource)
         else:
             log.exception("Sync failed for %s", resource)
         if raise_http:
@@ -887,7 +917,7 @@ def _should_stop_pipeline(result: dict) -> bool:
     # A transient failure (especially Mercos 429) affects the shared account,
     # not only one endpoint. Continuing with categories/products just spends
     # more quota and delays the priority orders sync.
-    return result.get("status") == "interrupted"
+    return result.get("status") in {"interrupted", "waiting"}
 
 
 async def _pause_after_resource(result: dict, *, last: bool) -> None:
@@ -945,5 +975,35 @@ async def sync_orders_job():
     )
 
 
+def _next_catalog_resource() -> str:
+    with SessionLocal() as db:
+        attempts = dict(
+            db.execute(
+                select(SyncRun.resource, func.max(SyncRun.started_at))
+                .where(SyncRun.resource.in_(CATALOG_RESOURCES))
+                .group_by(SyncRun.resource)
+            ).all()
+        )
+
+    def oldest_attempt(resource: str):
+        attempted_at = attempts.get(resource)
+        if attempted_at is None:
+            return (0, 0.0, CATALOG_RESOURCES.index(resource))
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+        return (1, attempted_at.timestamp(), CATALOG_RESOURCES.index(resource))
+
+    return min(CATALOG_RESOURCES, key=oldest_attempt)
+
+
 async def sync_catalog_job():
-    await _run_resource_sequence(CATALOG_RESOURCES, False)
+    resource = await asyncio.to_thread(_next_catalog_resource)
+    log.info("Scheduled catalog sync starting: resource=%s", resource)
+    result = await sync_resource(resource, full=False, raise_http=False)
+    log.info(
+        "Scheduled catalog sync finished: resource=%s status=%s records=%s run_id=%s",
+        resource,
+        result.get("status"),
+        result.get("records", 0),
+        result.get("runId"),
+    )

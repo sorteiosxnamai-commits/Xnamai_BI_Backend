@@ -1,6 +1,6 @@
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 
@@ -350,6 +350,26 @@ async def test_interrupt_running_syncs_releases_stuck_lease(sync_db):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_sync_releases_lease(sync_db, monkeypatch):
+    class CancelledAdaptor:
+        async def list(self, resource: str, cursor: str | None):
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(sync, "adaptor", CancelledAdaptor())
+
+    with pytest.raises(asyncio.CancelledError):
+        await sync.sync_resource("orders", raise_http=False)
+
+    with sync_db() as db:
+        state = db.get(SyncState, "orders")
+        run = db.scalar(select(SyncRun))
+        assert state.status == "interrupted"
+        assert state.lease_token is None
+        assert run.status == "interrupted"
+        assert run.finished_at is not None
+
+
+@pytest.mark.asyncio
 async def test_scheduled_orders_job_reports_when_lease_blocks_sync(monkeypatch):
     messages: list[str] = []
 
@@ -445,13 +465,30 @@ async def test_sync_all_stops_after_rate_limit(sync_db, monkeypatch):
     results = await sync.sync_all(full=False, raise_http=False)
 
     assert called == ["categories"]
-    assert results[0]["status"] == "interrupted"
+    assert results[0]["status"] == "waiting"
     assert len(results) == 1
 
 
 def test_full_sync_prioritizes_orders_before_catalog_resources():
     assert sync.SYNC_RESOURCES[0] == "orders"
     assert sync.SYNC_RESOURCES[1:] == sync.CATALOG_RESOURCES
+
+
+def test_catalog_scheduler_rotates_to_oldest_attempt(sync_db):
+    now = datetime.now(timezone.utc)
+    with sync_db() as db:
+        for index, resource in enumerate(sync.CATALOG_RESOURCES):
+            db.add(
+                SyncRun(
+                    resource=resource,
+                    mode="incremental",
+                    status="success",
+                    started_at=now - timedelta(minutes=index),
+                )
+            )
+        db.commit()
+
+    assert sync._next_catalog_resource() == sync.CATALOG_RESOURCES[-1]
 
 
 @pytest.mark.asyncio

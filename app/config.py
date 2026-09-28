@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     auth_cookie_samesite: str = "none"
     cors_origins: str = "http://localhost:5173,https://xnamai-bi-frontend.vercel.app"
     sync_orders_minutes: int = 10
-    sync_catalog_hours: int = 6
+    sync_catalog_minutes: int = 30
     log_level: str = "INFO"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
