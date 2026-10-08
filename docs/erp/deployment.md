@@ -79,3 +79,27 @@ corpo dentro de uma janela. Confirme com um payload real antes de depender disso
 O ERP limita concorrência local (um pedido ao Adaptor por vez, por processo) e respeita 429 com
 espera dinâmica, mas **a coordenação entre BI, ERP e agente é responsabilidade do gateway**
 (ver `adaptor-requirements.md`). Até lá, uma carga completa do ERP concorre com a do BI.
+
+## Carga e sincronização sem interface (08/10/2026)
+
+Quem processa `erp_jobs` em produção é o **scheduler do backend** (tarefa `erp_queue` a cada 30 s,
+`ERP_QUEUE_IN_SCHEDULER=true`), sem worker separado. O claim de jobs é atômico no banco e há lease com
+heartbeat; um recurso nunca é sincronizado por dois processos ao mesmo tempo (`ResourceBusy`).
+
+- **Automático** (`ERP_AUTO_SYNC=true`): a cada ciclo o scheduler enfileira, por recurso e na ordem de
+  dependência, o que está vencido. Recurso nunca sincronizado = carga inicial (paginada, com checkpoint
+  confirmado na mesma transação da página); depois, incremental pelo checkpoint. Reinício não refaz carga
+  completa e jobs ativos equivalentes não são duplicados. Recurso negado (403) é reavaliado só a cada
+  24 intervalos; 401 do Adaptor é falha de autenticação e interrompe o job sem marcar recurso como negado.
+- **Comando** (mesmos serviços de fila/lease/sync/checkpoint; só lê do Mercos, só grava `erp_*`):
+
+```
+python -m app.erp.cli status                       # estado por recurso e da fila
+python -m app.erp.cli run [--resource R] [--timeout S]   # executa/retoma a carga e mostra o resultado
+```
+
+- **Versão em execução:** `GET /api/v1/erp/build` (sem dados de negócio) devolve commit do deploy
+  (`RENDER_GIT_COMMIT`), flags do consumidor e das escritas.
+- **Progresso:** log por página (`ERP sync <recurso> run=<id> página=N: consultando o Adaptor / respondeu
+  N registros em Xs; gravando / gravada (persistidos, inalterados, quarentena)`), sem payload; o checkpoint
+  guarda a última atividade (`last_attempt_at`).

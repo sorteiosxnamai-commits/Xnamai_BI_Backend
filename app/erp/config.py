@@ -41,6 +41,10 @@ class ErpSettings(BaseSettings):
     # O scheduler do BI (já ativo no serviço web) esvazia a fila do ERP a cada 30 s.
     # Dispensa serviço de worker separado; desligue se um worker dedicado for usado.
     erp_queue_in_scheduler: bool = True
+    # Carga inicial e sincronização incremental automáticas: enfileira, por recurso, o que
+    # está vencido (nunca sincronizado = carga inicial; depois, incremental pelo checkpoint).
+    # Não repete carga completa a cada reinício e não duplica jobs ativos.
+    erp_auto_sync: bool = True
     erp_snapshot_retention_days: int = 90
     erp_inventory_authority: str = "mercos"
     erp_adaptor_timeout_seconds: float = 90.0

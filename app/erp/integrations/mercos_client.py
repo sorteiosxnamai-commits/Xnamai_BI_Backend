@@ -185,11 +185,18 @@ class MercosAdaptorClient:
                 status_code=429,
                 retry_after=retry_after_seconds(response),
             )
-        if response.status_code in (401, 403):
+        if response.status_code == 401:
+            # Falha de autenticação do ERP no Adaptor: NÃO é restrição do recurso.
+            raise AdaptorError(
+                "unauthorized",
+                f"Autenticação recusada pelo Adaptor (401) em {alias}",
+                status_code=401,
+            )
+        if response.status_code == 403:
             raise AdaptorError(
                 "forbidden",
-                f"Acesso negado ({response.status_code}) em {alias}: {_detail(response)}",
-                status_code=response.status_code,
+                f"Acesso negado (403) em {alias}: {_detail(response)}",
+                status_code=403,
             )
         if response.status_code == 404:
             raise AdaptorError("not_found", f"Recurso {alias} indisponível", status_code=404)
@@ -232,11 +239,13 @@ class MercosAdaptorClient:
                 "rate_limited", "Mercos limitou as requisições", status_code=429,
                 retry_after=retry_after_seconds(response),
             )
-        if response.status_code in (401, 403):
+        if response.status_code == 401:
             raise AdaptorError(
-                "forbidden",
-                f"Detalhe por ID indisponível na conta ({response.status_code})",
-                status_code=response.status_code,
+                "unauthorized", "Autenticação recusada pelo Adaptor (401)", status_code=401
+            )
+        if response.status_code == 403:
+            raise AdaptorError(
+                "forbidden", "Detalhe por ID indisponível na conta (403)", status_code=403
             )
         if response.is_error:
             raise AdaptorError(

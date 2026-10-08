@@ -8443,6 +8443,23 @@
         }
       }
     },
+    "/api/v1/erp/build": {
+      "get": {
+        "summary": "Versão em execução (sem dados de negócio)",
+        "description": "Commit do deploy e flags do consumidor da fila. Sem autenticação: não expõe segredos\nnem dados; responde 404 `erp_disabled` quando o módulo está desligado.",
+        "operationId": "build_api_v1_erp_build_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/erp/me": {
       "get": {
         "tags": [

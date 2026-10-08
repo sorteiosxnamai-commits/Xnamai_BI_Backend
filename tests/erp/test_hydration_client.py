@@ -86,8 +86,8 @@ def test_hydration_rate_limit_and_divergent_id(erp_session_factory):
 def test_client_list_page_classifies_errors_without_retrying():
     cases = {
         429: "rate_limited",
-        403: "forbidden",
-        401: "forbidden",
+        403: "forbidden",  # recurso negado pela conta
+        401: "unauthorized",  # credencial do ERP no Adaptor: falha geral, não restrição
         404: "not_found",
         502: "unavailable",
     }

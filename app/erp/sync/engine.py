@@ -197,6 +197,7 @@ def _persist_page(
             or 0
         )
         checkpoint = _checkpoint(db, connection_id, resource)
+        checkpoint.last_attempt_at = utcnow()  # última atividade confirmada
         checkpoint.transport_cursor = transport_cursor or checkpoint.transport_cursor
         checkpoint.unresolved = unresolved
         # Só avança o cursor de processamento quando nada ficou pendente.
@@ -313,7 +314,14 @@ async def sync_resource(
                 return result
             if await asyncio.to_thread(cancel_requested):
                 return await finish("cancelled", "Cancelado pelo operador; nada foi desfeito")
+            log.info("ERP sync %s run=%s página=%s: consultando o Adaptor", resource, run_id, page_number)
+            started_page = datetime.now()
             page = await client.list_page(definition.alias, cursor)
+            log.info(
+                "ERP sync %s run=%s página=%s: Adaptor respondeu %s registros em %.1fs; gravando",
+                resource, run_id, page_number, len(page.data),
+                (datetime.now() - started_page).total_seconds(),
+            )
             result.received += len(page.data)
             if not page.data:
                 break
@@ -332,6 +340,11 @@ async def sync_resource(
                 lease_token=lease_token,
             )
             result.pages = page_number
+            log.info(
+                "ERP sync %s run=%s página=%s: gravada (persistidos=%s inalterados=%s quarentena=%s)",
+                resource, run_id, page_number,
+                stats["persisted"], stats["unchanged"], stats["quarantined"],
+            )
             result.persisted += stats["persisted"]
             result.unchanged += stats["unchanged"]
             result.quarantined += stats["quarantined"]
@@ -358,6 +371,9 @@ async def sync_resource(
     except AdaptorError as exc:
         if exc.kind == "rate_limited":
             return await finish("waiting_rate_limit", exc.message, retry=exc.retry_after or 30.0)
+        if exc.kind == "unauthorized":
+            # Credencial do ERP no Adaptor: falha geral, não restrição do recurso.
+            return await finish("auth_failed", exc.message)
         if exc.kind == "forbidden":
             return await finish("forbidden", exc.message, access="denied")
         if exc.kind == "not_found":
@@ -425,7 +441,9 @@ async def hydrate_orders(
             if exc.kind == "rate_limited":
                 result.status = "waiting_rate_limit"
                 result.retry_after = exc.retry_after or 30.0
-            elif exc.kind == "forbidden":
+            elif exc.kind in ("forbidden", "unauthorized"):
+                # Detalhe por ID bloqueado na conta (a listagem já provou que a credencial vale):
+                # resultado legível, não fatal.
                 result.status = "forbidden"
                 with session_scope() as db:
                     capabilities.record_access(

@@ -7,6 +7,7 @@ scheduler nem os cursores/mutex do BI.
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 
 from app.erp import inbox, outbox, queue
@@ -51,6 +52,8 @@ async def run_sync_job(client: MercosAdaptorClient, job) -> dict:
         results.append(outcome.as_dict())
         if outcome.status == "lease_lost":
             break  # outro worker é o dono agora; não mexer em mais nada
+        if outcome.status == "auth_failed":
+            break  # a credencial vale para todos os recursos: não insistir nos demais
         if outcome.status == "busy":
             retry_after = outcome.retry_after
             break
@@ -118,7 +121,7 @@ async def process_next_job(client: MercosAdaptorClient) -> bool:
                 error="Aguardando limite de requisições do Mercos",
                 run_after=utcnow() + timedelta(seconds=outcome["retryAfter"]),
             )
-        elif statuses & {"failed", "interrupted", "forbidden", "unavailable"}:
+        elif statuses & {"failed", "interrupted", "forbidden", "unavailable", "auth_failed"}:
             # Falha visível; o agendamento periódico decide a próxima tentativa.
             queue.finish(db, job.id, job.lease_token, status="failed", result=outcome,
                          error="; ".join(r["error"] for r in outcome["results"] if r["error"])[:1000])
@@ -191,6 +194,14 @@ async def worker_loop(
                 pass
 
 
+_next_schedule_at = 0.0
+
+
+def reset_schedule_clock() -> None:
+    global _next_schedule_at
+    _next_schedule_at = 0.0
+
+
 async def drain_once(client: MercosAdaptorClient | None = None, max_cycles: int = 50) -> int:
     """Esvazia a fila (webhooks, jobs, outbox) e volta; sem laço permanente.
 
@@ -201,6 +212,15 @@ async def drain_once(client: MercosAdaptorClient | None = None, max_cycles: int 
     if not cfg.erp_enabled or not cfg.erp_queue_in_scheduler:
         return 0
     client = client or MercosAdaptorClient()
+    global _next_schedule_at
+    if cfg.erp_auto_sync and client.configured and time.monotonic() >= _next_schedule_at:
+        _next_schedule_at = time.monotonic() + 60
+        try:
+            queued = await asyncio.to_thread(schedule_periodic, cfg.erp_connection_id)
+            if queued:
+                log.info("ERP: agendado(s) pelo ciclo automático: %s", ", ".join(queued))
+        except Exception:  # noqa: BLE001
+            log.exception("ERP: falha ao agendar sincronização automática")
     total = 0
     for _ in range(max_cycles):
         busy = await process_inbox()

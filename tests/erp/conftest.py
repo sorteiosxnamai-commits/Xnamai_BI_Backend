@@ -22,6 +22,8 @@ SETTINGS_CONSUMERS = (
     "app.erp.outbox",
     "app.erp.inbox",
     "app.erp.workers",
+    "app.erp.cli",
+    "app.erp.router",
     "app.erp.routers.access",
     "app.erp.routers.commercial",
     "app.erp.routers.integration",

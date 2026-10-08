@@ -6,7 +6,7 @@ from sqlalchemy import select
 from app.erp import queue
 from app.erp.integrations.mercos_client import ListPage
 from app.erp.models import ErpCategory, ErpJob
-from app.erp.workers import drain_once
+from app.erp.workers import drain_once, reset_schedule_clock
 
 
 class OnePage:
@@ -19,7 +19,8 @@ class OnePage:
 
 @pytest.fixture(autouse=True)
 def _setup(erp_cfg, erp_session_factory):
-    erp_cfg()
+    erp_cfg(erp_auto_sync=False)
+    reset_schedule_clock()
 
 
 def test_drain_runs_queued_job_and_returns(erp_session_factory):
