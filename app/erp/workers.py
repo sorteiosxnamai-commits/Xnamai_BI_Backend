@@ -189,3 +189,24 @@ async def worker_loop(
                 await asyncio.wait_for(stop.wait(), timeout=cfg.erp_worker_poll_seconds)
             except asyncio.TimeoutError:
                 pass
+
+
+async def drain_once(client: MercosAdaptorClient | None = None, max_cycles: int = 50) -> int:
+    """Esvazia a fila (webhooks, jobs, outbox) e volta; sem laço permanente.
+
+    Usado pelo scheduler do BI no próprio serviço web. Não agenda sincronização
+    periódica: só executa o que o operador enfileirou. O claim atômico no banco
+    mantém a segurança se um worker separado também existir."""
+    cfg = erp_settings()
+    if not cfg.erp_enabled or not cfg.erp_queue_in_scheduler:
+        return 0
+    client = client or MercosAdaptorClient()
+    total = 0
+    for _ in range(max_cycles):
+        busy = await process_inbox()
+        busy += int(await process_next_job(client))
+        busy += await process_outbox(client)
+        total += busy
+        if not busy:
+            break
+    return total

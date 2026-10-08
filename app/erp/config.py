@@ -38,6 +38,9 @@ class ErpSettings(BaseSettings):
     erp_reconcile_window_hours: int = 24
     erp_job_lease_seconds: int = 300
     erp_worker_poll_seconds: float = 2.0
+    # O scheduler do BI (já ativo no serviço web) esvazia a fila do ERP a cada 30 s.
+    # Dispensa serviço de worker separado; desligue se um worker dedicado for usado.
+    erp_queue_in_scheduler: bool = True
     erp_snapshot_retention_days: int = 90
     erp_inventory_authority: str = "mercos"
     erp_adaptor_timeout_seconds: float = 90.0

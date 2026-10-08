@@ -31,6 +31,7 @@ from app.routers.auth import router as auth_router
 from app.routers.crm import router as crm_router
 from app.routers.exports import router as exports_router
 from app.routers.retail import router as retail_router
+from app.erp.config import erp_settings
 from app.erp.router import router as erp_router
 from app.schemas.data_quality import DataQualityResponse
 from app.services.data_quality import build_data_quality_report
@@ -46,6 +47,16 @@ from app.sync import (
 
 log = logging.getLogger("uvicorn.error")
 scheduler = AsyncIOScheduler()
+
+
+async def erp_queue_job() -> None:
+    from app.erp.workers import drain_once
+
+    try:
+        await drain_once()
+    except Exception:  # noqa: BLE001
+        log.exception("ERP queue cycle failed")
+
 _sync_busy = False
 
 
@@ -108,6 +119,17 @@ async def lifespan(app):
             max_instances=1,
             coalesce=True,
         )
+        if erp_settings().erp_enabled and erp_settings().erp_queue_in_scheduler:
+            scheduler.add_job(
+                erp_queue_job,
+                "interval",
+                seconds=30,
+                id="erp_queue",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            log.info("ERP queue drained by the scheduler every 30s")
         scheduler.start()
         log.info(
             "Scheduler started (orders every %sm, one catalog resource every %sm, adaptor ping every 8m)",
