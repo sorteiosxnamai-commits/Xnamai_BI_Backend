@@ -300,3 +300,41 @@ def test_restart_after_crash_mid_dispatch_never_resends(erp_session_factory):
     with erp_session_factory() as db:
         op = db.get(ErpOperation, op_id)
         assert op.status == "unknown" and op.error_code == "crash_after_dispatch"
+
+
+def test_heartbeat_never_blocks_on_a_locked_job_row(erp_session_factory):
+    with erp_session_factory() as db:
+        queue.enqueue(db, kind="sync", connection_id=C, resource="customers")
+        db.commit()
+        job = queue.claim_next(db)
+        job_id, token = job.id, job.lease_token
+    holder = erp_session_factory()
+    holder.execute(select(ErpJob).where(ErpJob.id == job_id).with_for_update())  # transação longa
+    try:
+        started = time.monotonic()
+        with erp_session_factory() as db:
+            assert queue.heartbeat(db, job_id, token) is True  # lease ainda é nosso
+            assert queue.heartbeat(db, job_id, "outro-token") is False
+        assert time.monotonic() - started < 2  # não esperou pelo lock
+    finally:
+        holder.rollback()
+        holder.close()
+
+
+def test_page_commit_holds_the_job_lock_only_at_the_end(erp_session_factory):
+    """Lock tomado no fim da página: a gravação longa não bloqueia o heartbeat."""
+    with erp_session_factory() as db:
+        queue.enqueue(db, kind="sync", connection_id=C, resource="customers")
+        db.commit()
+        job = queue.claim_next(db)
+        job_id, token = job.id, job.lease_token
+    beats = []
+
+    def slow(page_number):
+        # durante a "gravação" da página, outro fio renova o lease
+        with erp_session_factory() as db:
+            beats.append(queue.heartbeat(db, job_id, token))
+
+    client = SlowClient([page([1, 2], "2026-10-07T10:00:00")], on_page=slow)
+    result = asyncio.run(engine.sync_resource(client, C, "customers", job_id=job_id, lease_token=token))
+    assert result.status == "success" and beats == [True]

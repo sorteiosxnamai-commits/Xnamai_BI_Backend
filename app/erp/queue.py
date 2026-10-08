@@ -154,8 +154,22 @@ def claim_next(
 
 
 def heartbeat(db: Session, job_id: int, token: str) -> bool:
+    """Renova o lease sem esperar por lock.
+
+    A gravação de uma página trava a linha do job só ao final (milissegundos), mas se o
+    heartbeat cair nessa janela ele não deve bloquear até estourar o lock_timeout: pula a
+    renovação e apenas confirma, sem lock, que o lease continua sendo nosso."""
+    locked = db.scalar(
+        select(ErpJob.id)
+        .where(ErpJob.id == job_id, ErpJob.lease_token == token)
+        .with_for_update(skip_locked=True)
+    )
+    if locked is None:
+        current = db.scalar(select(ErpJob.lease_token).where(ErpJob.id == job_id))
+        db.rollback()
+        return current == token
     now = utcnow()
-    result = db.execute(
+    db.execute(
         update(ErpJob)
         .where(ErpJob.id == job_id, ErpJob.lease_token == token)
         .values(
@@ -164,7 +178,7 @@ def heartbeat(db: Session, job_id: int, token: str) -> bool:
         )
     )
     db.commit()
-    return result.rowcount == 1
+    return True
 
 
 def finish(

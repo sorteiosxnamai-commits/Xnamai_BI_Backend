@@ -165,7 +165,6 @@ def _persist_page(
     definition = definition_for(resource)
     persisted = unchanged = quarantined = 0
     with session_scope() as db:
-        queue.assert_lease(db, job_id, lease_token)
         for row in rows:
             fallback_key = f"sem-id:{fingerprint(row)[:16]}"
             try:
@@ -214,6 +213,10 @@ def _persist_page(
         run.quarantined = (run.quarantined or 0) + quarantined
         run.cursor_after = checkpoint.cursor
         db.add(run)
+        # O lock da linha do job só é tomado AQUI, no fim da página, imediatamente antes do
+        # commit: quem perdeu o lease não confirma (rollback da página inteira), e o lock
+        # dura milissegundos em vez de toda a gravação (que pode ser lenta).
+        queue.assert_lease(db, job_id, lease_token)
     return {
         "persisted": persisted,
         "unchanged": unchanged,
