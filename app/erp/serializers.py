@@ -235,7 +235,11 @@ CATALOG_EXTRA = {
 }
 
 
-def catalog_entry(resource: str, row: Any) -> dict:
+CATALOG_PII_ATTRS = {"document": 2, "phone": 2, "email": 0}
+
+
+def catalog_entry(resource: str, row: Any, user: Any) -> dict:
+    pii = user.can("pii:read")
     data = {
         "id": row.external_id,
         "localId": row.id,
@@ -249,6 +253,8 @@ def catalog_entry(resource: str, row: Any) -> dict:
             value = quantity(value)
         elif isinstance(value, date):
             value = value.isoformat()
+        elif attr in CATALOG_PII_ATTRS and not pii:
+            value = mask(value, CATALOG_PII_ATTRS[attr])
         data[attr] = value
     return data
 

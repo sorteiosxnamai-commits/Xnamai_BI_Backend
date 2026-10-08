@@ -424,7 +424,7 @@ def list_catalog(
         sort=sort, default_sort="name", order=order, page=page, page_size=page_size,
     )
     return result.envelope(
-        lambda row: ser.catalog_entry(resource, row), sort=key, order=direction,
+        lambda row: ser.catalog_entry(resource, row, user), sort=key, order=direction,
         filters={"search": search, "active": active},
     )
 
@@ -442,7 +442,7 @@ def get_catalog_entry(
     row = db.scalar(select(M).where(M.connection_id == cid(), M.id == local_id))
     if row is None:
         raise http_error(404, "not_found", "Registro não encontrado")
-    return ser.catalog_entry(resource, row)
+    return ser.catalog_entry(resource, row, user)
 
 
 @router.get("/product-prices", summary="Preços por produto/tabela")

@@ -175,3 +175,16 @@ def test_unmapped_fields_are_visible_in_inventory(erp_cfg, erp_session_factory):
     status = client().get("/api/v1/erp/integration/status", headers=bearer()).json()
     segments = next(r for r in status["resources"] if r["resource"] == "segments")
     assert segments["unmappedFields"] == 1
+
+
+def test_catalog_personal_fields_are_masked_without_pii_permission(seeded, erp_session_factory):
+    from tests.erp.test_api_access import add_operator
+
+    add_operator(erp_session_factory, "ana@x.com", ["consulta"])
+    c = client()
+    admin = c.get("/api/v1/erp/catalogs/users", headers=bearer()).json()["items"][0]
+    assert admin["email"] == "v@x.com"
+    ana = c.get("/api/v1/erp/catalogs/users", headers=bearer("ana@x.com", "viewer")).json()["items"][0]
+    assert ana["email"] != "v@x.com" and set(ana["email"]) == {"•"}
+    detail = c.get(f"/api/v1/erp/catalogs/users/{ana['localId']}", headers=bearer("ana@x.com", "viewer")).json()
+    assert set(detail["email"]) == {"•"}
