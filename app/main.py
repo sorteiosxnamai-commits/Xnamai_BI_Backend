@@ -31,6 +31,7 @@ from app.routers.auth import router as auth_router
 from app.routers.crm import router as crm_router
 from app.routers.exports import router as exports_router
 from app.routers.retail import router as retail_router
+from app.erp.router import router as erp_router
 from app.schemas.data_quality import DataQualityResponse
 from app.services.data_quality import build_data_quality_report
 from app.adaptor import clear_cancel, keep_adaptor_warm, request_cancel
@@ -128,7 +129,7 @@ app.add_middleware(
     allow_origins=_cors.origins,
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -150,6 +151,8 @@ app.include_router(crm_router)
 app.include_router(retail_router)
 app.include_router(analytics_router, dependencies=[Depends(current_user)])
 app.include_router(exports_router)
+# ERP: isolado em /api/v1/erp; guard nega por padrão e responde 404 com ERP desligado
+app.include_router(erp_router)
 
 
 @app.get("/health")

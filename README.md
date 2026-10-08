@@ -35,3 +35,11 @@ um recurso de catálogo a cada `SYNC_CATALOG_MINUTES`. Respostas 429 liberam a
 execução imediatamente para uma nova tentativa automática no próximo ciclo.
 
 Swagger: `/docs`.
+
+## ERP Xnamai (módulo isolado, desligado por padrão)
+
+O ERP vive em `app/erp`, sob `/api/v1/erp`, com tabelas `erp_*` e metadata próprio. Ele sincroniza
+com o Mercos pelo Adaptor, sem tocar nas tabelas nem no scheduler do BI. Ligue com `ERP_ENABLED=true`
+e suba o worker com `python -m app.erp.worker`. Veja `docs/erp/`: `status.md` (o que foi feito e o
+que não foi verificado), `deployment.md`, `coverage.md`, `field-mapping.md`,
+`adaptor-requirements.md` e `legacy-compat.md`.

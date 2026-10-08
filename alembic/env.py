@@ -6,6 +6,8 @@ from sqlalchemy import engine_from_config, pool, text
 from app.config import settings
 from app.database import Base
 from app import models  # noqa: F401
+from app.erp import models as erp_models  # noqa: F401
+from app.erp.db import ErpBase
 
 
 config = context.config
@@ -19,7 +21,8 @@ config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = Base.metadata
+# O metadata ERP é separado do legado; ambos participam das migrações.
+target_metadata = [Base.metadata, ErpBase.metadata]
 
 
 def run_migrations_offline() -> None:
