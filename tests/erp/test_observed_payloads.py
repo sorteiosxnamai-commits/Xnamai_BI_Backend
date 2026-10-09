@@ -112,3 +112,26 @@ def test_cursor_is_sent_in_the_only_format_mercos_accepts():
     # o cursor que o próprio engine devolve após a sobreposição também é aceito
     assert format_cursor(overlap_cursor("2026-10-08 14:13:05", 60)) == "2026-10-08 14:12:05"
     assert format_cursor("não é data") == "não é data"
+
+
+def test_customer_credit_limit_is_a_list_of_objects_in_the_real_payload(erp_session_factory):
+    """Observado em produção: `limite_credito: [{limite_disponivel, limite_total}]`."""
+    from app.erp.models import ErpCustomer, ErpQuarantine
+
+    result = run("customers", [
+        {"id": 90, "razao_social": "Com limite",
+         "limite_credito": [{"limite_disponivel": 765.9, "limite_total": 800.0}],
+         "ultima_alteracao": "2026-10-08 09:00:00"},
+        {"id": 91, "razao_social": "Limite antigo", "limite_credito": "150,50",
+         "ultima_alteracao": "2026-10-08 09:00:00"},
+        {"id": 92, "razao_social": "Sem limite", "limite_credito": [],
+         "ultima_alteracao": "2026-10-08 09:00:00"},
+    ])
+    assert result.persisted == 3 and result.quarantined == 0
+    with erp_session_factory() as db:
+        rows = {c.external_id: c for c in db.scalars(select(ErpCustomer))}
+        assert db.scalar(select(ErpQuarantine)) is None
+    assert str(rows["90"].credit_limit) == "800.00"
+    assert rows["90"].extras["limite_credito"] == [{"limite_disponivel": 765.9, "limite_total": 800.0}]
+    assert str(rows["91"].credit_limit) == "150.50"
+    assert rows["92"].credit_limit is None

@@ -180,8 +180,20 @@ def _first_email(row: dict) -> str | None:
     return text(row.get("email"))
 
 
+def _credit_total(value: Any) -> Decimal | None:
+    """`limite_credito` no Mercos é uma lista `[{limite_total, limite_disponivel}]` (vazia quando
+    não há limite). O limite local é o total do primeiro item; a lista inteira, com o disponível,
+    fica preservada em `extras.limite_credito`. Número solto (formato antigo) também é aceito."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, dict):
+        value = value.get("limite_total")
+    return to_decimal(value)
+
+
 def _customer_extras(row: dict) -> dict:
     return {
+        "limite_credito": row.get("limite_credito"),
         "emails": row.get("emails"),
         "telefones": row.get("telefones"),
         "campos_extras": row.get("extras"),
@@ -215,10 +227,11 @@ CUSTOMER_FIELDS = (
     Field("seller_external_id", ("vendedor_id", "usuario_id"), ident),
     Field("blocked", ("bloqueado",), boolean),
     Field("block_reason", ("motivo_bloqueio",)),
-    Field("credit_limit", ("limite_credito",), dec),
+    Field("credit_limit", ("limite_credito",), _credit_total, False,
+          "Total do primeiro item da lista `limite_credito`; o disponível fica em extras."),
     Field("active", ("ativo",), boolean),
     Field("notes", ("observacao", "observacoes")),
-    Field("extras", ("extras", "emails", "telefones", "tags"), _customer_extras, True,
+    Field("extras", ("extras", "emails", "telefones", "tags", "limite_credito"), _customer_extras, True,
           "Campos extras, e-mails/telefones adicionais e tags."),
     Field("source_created_at", ("data_criacao",), instant),
 )

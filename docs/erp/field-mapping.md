@@ -141,10 +141,10 @@ Clientes. Chave externa: `id`.
 | `seller_external_id` | `vendedor_id`, `usuario_id` | ident |  |
 | `blocked` | `bloqueado` | boolean |  |
 | `block_reason` | `motivo_bloqueio` | text |  |
-| `credit_limit` | `limite_credito` | dec |  |
+| `credit_limit` | `limite_credito` | _credit_total | Total do primeiro item da lista `limite_credito`; o disponível fica em extras. |
 | `active` | `ativo` | boolean |  |
 | `notes` | `observacao`, `observacoes` | text |  |
-| `extras` | `extras`, `emails`, `telefones`, `tags` | _customer_extras | Campos extras, e-mails/telefones adicionais e tags. |
+| `extras` | `extras`, `emails`, `telefones`, `tags`, `limite_credito` | _customer_extras | Campos extras, e-mails/telefones adicionais e tags. |
 | `source_created_at` | `data_criacao` | instant |  |
 | `source_updated_at` | `ultima_alteracao` | instant | Versão de origem |
 | `source_deleted` | `excluido` | boolean | Exclusão externa conserva histórico |
