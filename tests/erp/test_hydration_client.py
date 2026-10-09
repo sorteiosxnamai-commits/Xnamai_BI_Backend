@@ -89,6 +89,7 @@ def test_client_list_page_classifies_errors_without_retrying():
         403: "forbidden",  # recurso negado pela conta
         401: "unauthorized",  # credencial do ERP no Adaptor: falha geral, não restrição
         404: "not_found",
+        422: "invalid",  # validação (ex.: formato de data): falha explícita
         502: "unavailable",
     }
     for status, kind in cases.items():
@@ -105,7 +106,8 @@ def test_client_rejects_unknown_alias_and_sends_only_allowed_filter():
     with pytest.raises(AdaptorError):
         asyncio.run(client.list_page("../secrets", None))
     asyncio.run(client.list_page("orders", "2026-10-07T10:00:00"))
-    assert dict(transport.calls[0].url.params) == {"alterado_apos": "2026-10-07T10:00:00"}
+    # o Mercos só aceita "%Y-%m-%d %H:%M:%S": o cursor ISO é convertido
+    assert dict(transport.calls[0].url.params) == {"alterado_apos": "2026-10-07 10:00:00"}
     assert transport.calls[0].url.path == "/v1/orders"
 
 

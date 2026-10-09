@@ -81,3 +81,34 @@ def test_payment_conditions_and_sellers_real_fields(erp_session_factory):
     assert cond.consider_credit_limit is True and cond.available_b2b is False
     assert cond.represented_external_id == "7"
     assert seller.access_blocked is True and seller.is_admin is False and seller.phone == "000"
+
+
+def test_customer_with_empty_list_in_scalar_fields_is_persisted_not_quarantined(erp_session_factory):
+    """Observado em produção: o Mercos devolve `[]` em campos escalares sem valor
+    (3500 clientes caíram em quarentena com "Valor numérico inválido: []")."""
+    from app.erp.models import ErpCustomer, ErpQuarantine
+
+    result = run("customers", [
+        {"id": 77, "razao_social": "Cliente Teste", "limite_credito": [], "bloqueado": [],
+         "segmento_id": [], "vendedor_id": [], "cidade": [], "emails": [], "telefones": [],
+         "ultima_alteracao": "2026-10-08 09:00:00"},
+    ])
+    assert result.persisted == 1 and result.quarantined == 0
+    with erp_session_factory() as db:
+        row = db.scalar(select(ErpCustomer))
+        assert db.scalar(select(ErpQuarantine)) is None
+    assert row.credit_limit is None
+    assert row.blocked is None  # lista vazia não vira False
+    assert row.segment_external_id is None and row.city is None  # nem a string "[]"
+
+
+def test_cursor_is_sent_in_the_only_format_mercos_accepts():
+    from app.erp.integrations.mercos_client import format_cursor
+    from app.erp.sync.engine import overlap_cursor
+
+    assert format_cursor("2022-02-09T09:36:28") == "2022-02-09 09:36:28"
+    assert format_cursor("2026-10-08 14:13:05") == "2026-10-08 14:13:05"
+    assert format_cursor("2026-10-08T14:13:05.123456") == "2026-10-08 14:13:05"
+    # o cursor que o próprio engine devolve após a sobreposição também é aceito
+    assert format_cursor(overlap_cursor("2026-10-08 14:13:05", 60)) == "2026-10-08 14:12:05"
+    assert format_cursor("não é data") == "não é data"

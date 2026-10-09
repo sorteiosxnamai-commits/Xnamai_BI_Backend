@@ -47,6 +47,18 @@ DEFAULT_RATE_LIMIT_WAIT = 30.0
 MAX_RATE_LIMIT_WAIT = 600.0
 
 
+def format_cursor(cursor: str) -> str:
+    """O Mercos só aceita `%Y-%m-%d %H:%M:%S` em `alterado_apos` (422 caso contrário).
+    Mantém o horário de relógio do cursor, sem fuso nem fração de segundo."""
+    from datetime import datetime
+
+    try:
+        parsed = datetime.fromisoformat(str(cursor).strip().replace(" ", "T", 1))
+    except ValueError:
+        return str(cursor)
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
 class AdaptorError(Exception):
     def __init__(
         self,
@@ -166,7 +178,7 @@ class MercosAdaptorClient:
             raise AdaptorError("invalid", f"Recurso não suportado pelo ERP: {alias}")
         if not self.configured:
             raise AdaptorError("unavailable", "Adaptor não configurado para o ERP")
-        params = {"alterado_apos": cursor} if cursor else {}
+        params = {"alterado_apos": format_cursor(cursor)} if cursor else {}
         try:
             async with self._gate, self._client() as client:
                 response = await client.get(
@@ -200,6 +212,14 @@ class MercosAdaptorClient:
             )
         if response.status_code == 404:
             raise AdaptorError("not_found", f"Recurso {alias} indisponível", status_code=404)
+        if response.status_code in (400, 422):
+            # Requisição recusada por validação (ex.: formato de data): falha explícita,
+            # não "indisponível" nem tentativa cega de repetir.
+            raise AdaptorError(
+                "invalid",
+                f"Adaptor {response.status_code} em {alias}: {_detail(response)}",
+                status_code=response.status_code,
+            )
         if response.is_error:
             raise AdaptorError(
                 "unavailable",

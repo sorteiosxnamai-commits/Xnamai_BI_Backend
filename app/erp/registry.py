@@ -130,12 +130,16 @@ def _key_id(row: dict) -> str:
 
 
 def _first_present(row: dict, keys: tuple[str, ...]) -> tuple[bool, Any]:
+    """Chave presente com valor útil. Nulo e contêiner vazio (`[]`, `{}`) valem como nulo: o
+    Mercos devolve `[]` para campos escalares sem valor, e isso não é número/texto/booleano."""
     present = False
     for key in keys:
         if key in row:
             present = True
-            if row[key] is not None:
-                return True, row[key]
+            value = row[key]
+            if value is None or (isinstance(value, (list, dict)) and not value):
+                continue
+            return True, value
     return present, None
 
 
