@@ -48,8 +48,8 @@ nasce **desligado** (`ERP_ENABLED=false`, `VITE_ERP_ENABLED=false`). A primeira 
    assinatura/formato do webhook seguem inferidos. Use `homologation.md` e a sonda.
 2. **Adaptor.** Rotas e cota prontas e testadas com Mercos simulado; extensões sem caminho/paginação
    confirmados seguem **desligadas** até o sandbox. O ERP ainda não *consome* títulos, pagamentos,
-   comissões, promoções, produto, estoque, cancelar e faturar (falta mapeamento, serviço e tela, que
-   dependem do payload real). Redis real não foi exercitado (só `fakeredis`).
+   comissões, promoções, produto e estoque (falta mapeamento, serviço e tela, que dependem do payload
+   real). Cancelar pedido tem consumidor desligado por padrão; faturamento segue não liberado. Redis real não foi exercitado (só `fakeredis`).
 3. **Produção.** Nada foi aplicado em banco real nem em serviço de produção. O worker não está no
    `render.yaml` (criaria serviço pago).
 4. **Limites do PostgreSQL embutido.** É um servidor PostgreSQL 16 de verdade, mas rodou local, sem
@@ -97,3 +97,12 @@ título locais, que não são nota fiscal nem boleto).
 **Cota compartilhada:** o gate do Adaptor serializa toda chamada que passa por ele, e o BI passa
 pelo Adaptor. `LocalGate` vale para uma instância; réplicas exigem `MERCOS_REDIS_URL` (`RedisGate`,
 falha fechada). O Adaptor em produção ainda roda a versão sem o gate (alterações não commitadas).
+
+## Painel operacional de pedidos (plano de implementação, executado localmente)
+
+Implementado **localmente**, sem commit/deploy de produção e sem escrita real no Mercos:
+menu Visão Geral, Pedidos, Nota Fiscal, Frete, Financeiro, Reembolsos e Configurações; migração aditiva
+`20261009_01` (7 tabelas novas); cotação de frete **manual**, rascunho fiscal local, recebível por pedido,
+solicitação/aprovação de reembolso e consumidor de cancelamento. Matriz detalhada em
+`transicao-painel-operacional.md`. **Isto não declara o ERP completo**: frete automático, NF-e, Pix e
+devolução efetiva de dinheiro dependem de integrações externas (ver `adaptor-requirements.md`).

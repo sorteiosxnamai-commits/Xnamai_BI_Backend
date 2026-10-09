@@ -8,7 +8,7 @@ from app.main import app
 
 
 def bearer(username: str = "admin@xnamai.com", role: str = "admin") -> dict:
-    token = _token(AuthUser(username=username, role=role), "access", timedelta(minutes=5))
+    token = _token(AuthUser(username=username, role=role), "access", timedelta(hours=6))  # suite PG lenta: token curto expirava no meio da execucao
     return {"Authorization": f"Bearer {token}"}
 
 

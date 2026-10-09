@@ -53,8 +53,8 @@ snapshot de origem restrito e inventário de campos. Mapeamento campo a campo em
 | `read.payments` | Pagamentos Mercos Pay | D | sim | sim | não | — | F10 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Ativação da conta a verificar. |
 | `write.products` | Criar/editar produtos | D | sim | sim | não | `ERP_WRITE_PRODUCTS` | F06 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. |
 | `write.inventory_publish` | Publicar ajuste de estoque | D | sim | sim | não | `ERP_WRITE_INVENTORY_PUBLISH` | F08 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Saldo é absoluto; exige autoridade definida. |
-| `write.order_cancel` | Cancelar pedido | D | sim | sim | não | `ERP_WRITE_ORDERS` | F27 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Operação dedicada documentada. |
-| `write.billing` | Registrar/alterar faturamento | D | sim | sim | não | `ERP_WRITE_BILLING` | F28 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. |
+| `write.order_cancel` | Cancelar pedido | D | sim | sim | sim | `ERP_WRITE_ORDERS` | F27 | Operação dedicada documentada (POST pedidos/cancelar/{id}); só envia com a flag de pedidos, chave ERP com escopo de cancelamento e extensão ligada. Confirmação só pelo espelho (pedido volta cancelado). |
+| `write.billing` | Registrar/alterar faturamento | D | sim | sim | não | `ERP_WRITE_BILLING` | F28 | Não liberado: o Adaptor não tem leitura de faturamento, então não há como reconciliar o resultado. Faturamento do Mercos não é emissão fiscal. |
 | `read.commissions` | Comissões | D | sim | sim | não | — | F12 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Chave própria `comissao_id`. |
 | `read.product_images` | Imagens de produto | D | não | sim | não | — | F25 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Leitura devolve hashes, não URLs. |
 | `read.payment_methods` | Formas de pagamento | D | sim | sim | não | — | F21 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. |
@@ -67,6 +67,12 @@ snapshot de origem restrito e inventário de campos. Mapeamento campo a campo em
 | `local.suppliers_purchases` | Fornecedores e compras | E | não | não | sim | — | — | Processo próprio do ERP. |
 | `local.inventory` | Depósitos, razão e reservas | E | não | não | sim | — | — | Processo próprio; publicação ao Mercos desabilitada. |
 | `local.finance` | Contas a pagar, caixa e centros de custo | E | não | não | sim | — | — | Processo próprio; não confunde título Mercos. |
+| `local.shipping_manual` | Frete: cotação manual e seleção local | E | não | não | sim | — | — | Processo próprio; a seleção é local e não contrata frete, etiqueta ou envio. |
+| `local.shipping_provider` | Cotação automática de frete (conector) | V | não | não | não | — | — | Sem conector de frete: depende de escolher provedor, credenciais de homologação e regras comerciais. Use o cadastro manual. |
+| `local.invoice_draft` | Montagem fiscal (rascunho de planejamento) | E | não | não | sim | — | — | Processo próprio; rascunho não é nota emitida. |
+| `local.invoice_issue` | Emissão de nota fiscal eletrônica | V | não | não | não | — | — | Sem emissor fiscal configurado. Faturamento do Mercos não substitui a emissão. |
+| `local.refund_requests` | Solicitações de reembolso (fluxo interno) | E | não | não | sim | — | — | Processo próprio; solicitar ou aprovar não devolve dinheiro. |
+| `local.refund_external` | Devolução automática e Pix | V | não | não | não | — | — | Depende de PSP/banco/Mercos Pay. Ler pagamentos não prova gerar cobrança nem devolver valores. |
 | `local.fiscal_banking` | Fiscal eletrônico, bancos, boletos, logística | E/V | não | não | não | — | — | Integrações específicas futuras; não inferir de campos ou links. |
 | `legacy.bi_crm_retail` | BI, CRM e Análise Varejo atuais | Existente | não | não | sim | — | — | Permanecem acessíveis e inalterados. |
 

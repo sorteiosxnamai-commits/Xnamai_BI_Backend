@@ -25,7 +25,9 @@ matriz antes → depois e relatório de compatibilidade: `MercosAdaptor/docs/erp
   o que o Adaptor **declara** (build + extensão ligada + escopo da chave). Isso não prova acesso da conta
   Mercos: `accountAccess` só muda com 200/403 reais.
 - Capacidade que o Adaptor já oferece, mas o ERP ainda não liga (títulos, pagamentos, comissões,
-  promoções, produto, estoque, cancelar, faturar), aparece como "falta a ligação no ERP". A ligação
+  promoções, produto, estoque), aparece como "falta a ligação no ERP". **Cancelar pedido** já tem consumidor
+  no ERP (`POST /v1/orders/{id}/cancel`, sem corpo), desligado por padrão (flag de pedidos, chave de escrita
+  com escopo e extensão ligada) e confirmado só quando o espelho devolve o pedido cancelado. A ligação
   (mapeamento, serviço, tela, permissão) segue como próximo trabalho e depende do payload real do sandbox.
 
 ## Ainda não confirmado no Mercos
@@ -39,3 +41,15 @@ filtros de títulos. As rotas existem e estão testadas com transporte simulado,
 - Cota: fila FIFO sem reserva por consumidor; uma carga completa do ERP concorre com o BI.
 - Só duas chaves (legada e ERP).
 - Redis real não foi exercitado.
+
+## Painel operacional de pedidos: dependências externas (sem contornos)
+
+| Função | Situação | O que falta, especificamente |
+|---|---|---|
+| Cancelar pedido | consumidor no ERP, desligado | `ERP_WRITE_ORDERS`, chave ERP com escopo `write:order-cancel`, extensão ligada no Adaptor, **validação em sandbox Mercos** (nenhuma chamada real foi feita) |
+| Faturamento (Mercos) | **não liberado** | Adaptor sem leitura (GET) de faturamento: sem como reconciliar o resultado. Não é emissão fiscal |
+| Títulos / pagamentos Mercos | indisponível | extensões desligadas e payload real não validado |
+| Frete automático | indisponível | provedor/contrato de frete (credenciais, tabela, API). Hoje só cotação **manual** local; selecionar não contrata |
+| Nota fiscal (NF-e) | indisponível | emissor fiscal homologado (certificado, CNPJ emitente, regras tributárias). Rascunho local não é NF-e; emitir responde 409 `issuer_unavailable` |
+| Pix / cobrança | indisponível | PSP/banco (credenciais, webhook de confirmação). Pagamento Pix fica sempre `unknown` |
+| Reembolso efetivo | manual | integração bancária/PSP. O ERP só registra solicitação, aprovação e confirmação externa manual |

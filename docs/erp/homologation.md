@@ -122,3 +122,14 @@ não exista; não remover. `representada_id` aparece em todos os registros de tr
 payload, mas **ainda não está provado** se os IDs são únicos na conta ou por representada nem se
 os filtros restringem a leitura. Enquanto isso, nenhuma chave de identidade é alterada e escritas
 dependentes de escopo permanecem desligadas.
+
+## Cancelamento de pedido (a validar em sandbox Mercos)
+
+Nenhuma chamada real foi feita. Roteiro, apenas com conta de **sandbox**, flag `ERP_WRITE_ORDERS` ligada
+só nesse ambiente e chave ERP com `write:order-cancel`:
+
+1. Pedido de teste completo; `POST /sales-orders/{id}/cancel` com `expectedVersion` e motivo.
+2. Esperado: operação `succeeded` **sem** `mirror_confirmed_at` (aceito ≠ confirmado).
+3. Sincronizar pedidos; esperado: pedido `cancelled` no espelho e operação confirmada.
+4. Timeout simulado: operação `unknown`, nunca reenviada automaticamente.
+5. Faturamento: **não testar** (capacidade não liberada).

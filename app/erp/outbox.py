@@ -62,6 +62,8 @@ CAPABILITY_BY_KIND = {
     "update_customer": "write.customers",
     "create_order": "write.orders",
     "update_order": "write.orders",
+    "cancel_order": "write.order_cancel",
+    "bill_order": "write.billing",
     "create_title": "write.titles",
     "update_title": "write.titles",
 }
@@ -70,6 +72,8 @@ TARGET_BY_KIND = {
     "update_customer": "customers",
     "create_order": "orders",
     "update_order": "orders",
+    "cancel_order": "orders",
+    "bill_order": "orders",
     "create_title": "titles",
     "update_title": "titles",
 }
@@ -263,6 +267,38 @@ def submit(
                 "order_incomplete",
                 "Pedido sem itens completos; operação bloqueada até a hidratação",
             )
+    elif kind in ("cancel_order", "bill_order"):
+        entity = _load_target(db, connection_id, kind, target_external_id)
+        if expected_version != entity.version:
+            raise http_error(
+                409, "version_mismatch", "A versão local mudou; recarregue antes de agir",
+                currentVersion=entity.version,
+            )
+        if not entity.items_complete:
+            raise http_error(
+                409, "order_incomplete", "Pedido sem itens completos; operação bloqueada até a hidratação"
+            )
+        if entity.kind == "cancelled":
+            raise http_error(409, "order_already_cancelled", "O pedido já está cancelado no espelho")
+        if kind == "bill_order" and entity.kind != "order":
+            raise http_error(409, "not_billable", "Só pedidos (não orçamentos) recebem faturamento")
+        in_flight = db.scalar(
+            select(ErpOperation.id).where(
+                ErpOperation.connection_id == connection_id,
+                ErpOperation.kind == kind,
+                ErpOperation.target_external_id == target_external_id,
+                ErpOperation.idempotency_key != idempotency_key,
+                ErpOperation.status.in_(("queued", "processing", "waiting_rate_limit", "unknown", "succeeded")),
+                ErpOperation.mirror_confirmed_at.is_(None),
+            )
+        )
+        if in_flight is not None:
+            raise http_error(
+                409, "operation_in_progress",
+                "Já existe uma operação deste tipo para o pedido aguardando resultado ou confirmação",
+                operationId=in_flight,
+            )
+        base_fingerprint = entity.fingerprint
     elif kind == "create_order":
         customer = db.scalar(
             select(ErpCustomer).where(
@@ -295,6 +331,19 @@ def submit(
 
     if kind in ("create_customer", "update_customer"):
         mercos_payload = customer_payload(dto)
+    elif kind == "cancel_order":
+        mercos_payload = {}  # o cancelamento do Mercos não recebe corpo; o motivo fica só no ERP
+    elif kind == "bill_order":
+        if not (target_external_id or "").isdigit():
+            raise http_error(422, "invalid_order_id", "O faturamento exige o ID numérico do pedido no Mercos")
+        mercos_payload = {
+            "pedido_id": int(target_external_id),
+            "valor_faturado": float(dto["billedValue"]),
+            "data_faturamento": dto["billedAt"],
+            "numero_nf": dto.get("invoiceNumber"),
+            "informacoes_adicionais": dto.get("notes"),
+        }
+        mercos_payload = {k: v for k, v in mercos_payload.items() if v is not None}
     else:
         mercos_payload = order_payload(dto, create=kind == "create_order")
     op = ErpOperation(
@@ -430,6 +479,16 @@ def _prepare_dispatch(op_id: str, token: str) -> dict | None:
             op.lease_token = None
             db.add(op)
             return None
+        if op.kind == "cancel_order":
+            target = _load_target(db, op.connection_id, op.kind, op.target_external_id)
+            if target.kind == "cancelled":  # o espelho já mostra cancelado: não enviar de novo
+                op.status = "failed"
+                op.error_code = "already_cancelled"
+                op.error = "O pedido já consta como cancelado no espelho; nada foi enviado"
+                op.completed_at = utcnow()
+                op.lease_token = None
+                db.add(op)
+                return None
         conflict = detect_conflict(db, op)
         if conflict:
             op.status = "conflict"

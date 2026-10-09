@@ -21,7 +21,11 @@ from app.erp.routers import (
     finance,
     integration,
     inventory,
+    invoice_drafts,
+    order_finance,
     purchasing,
+    refunds,
+    shipping,
     webhooks,
 )
 
@@ -60,6 +64,10 @@ for module in (
     inventory,
     finance,
     admin,
+    shipping,
+    invoice_drafts,
+    order_finance,
+    refunds,
     webhooks,
 ):
     router.include_router(module.router)

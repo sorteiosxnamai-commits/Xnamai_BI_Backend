@@ -76,6 +76,21 @@ class OrderPatch(Strict):
     items: list[OrderItemInput] | None = Field(default=None, min_length=1, max_length=500)
 
 
+class OrderCancelInput(Strict):
+    expectedVersion: int = Field(ge=1)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class OrderBillingInput(Strict):
+    """Registro de faturamento no Mercos. NÃO é emissão fiscal."""
+
+    expectedVersion: int = Field(ge=1)
+    billedValue: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+    billedAt: date
+    invoiceNumber: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=5000)
+
+
 class ReconcileInput(Strict):
     decision: Literal["check", "confirm_created", "confirm_not_created"]
     externalId: str | None = Field(default=None, max_length=200)

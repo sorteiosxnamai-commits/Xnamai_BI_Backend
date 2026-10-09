@@ -27,3 +27,12 @@ Frontend: `App.tsx` ganhou um ramo `/erp` antes do fallback `BiApp`; `HomeGate.t
 cartão (somente com `VITE_ERP_ENABLED=true`); `crm.css` ganhou regras da grade de quatro cartões;
 `AuthProvider`, rotas, menus, filtros e caches do BI não foram tocados. `src/test/setup.ts` agora
 limpa o DOM entre testes (sem `globals`, o cleanup automático do Testing Library não rodava).
+
+## Verificação da transição (painel operacional)
+
+- OpenAPI comparado com o `HEAD`: **58 operações legadas idênticas** (0 alteradas, 0 removidas); 26 operações
+  novas, todas sob `/api/v1/erp`. Entre as rotas ERP já existentes, 3 mudaram: `GET /sales-orders`
+  (parâmetros/filtros novos, aditivo) e `POST /sales-orders/{id}/cancel` e `/billings`, que antes só
+  respondiam 409 e agora aceitam corpo (cancelamento) ou seguem 409 `capability_disabled` (faturamento).
+- Migração `20261009_01` só cria/derruba as 7 tabelas novas; `20261007_01` permanece intacta.
+- Rotas do ERP anterior (`/erp/clientes`, `/erp/produtos` etc.) preservadas em `ErpApp.tsx`.

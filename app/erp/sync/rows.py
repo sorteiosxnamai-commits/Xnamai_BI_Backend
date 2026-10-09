@@ -8,7 +8,7 @@ import logging
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.erp.common import as_utc, fingerprint, utcnow
@@ -59,19 +59,23 @@ def _resolve_quarantine(db: Session, connection_id: str, resource: str, key: str
     )
 
 
-def _confirm_operations(db: Session, connection_id: str, resource: str, key: str) -> None:
-    """Retorno da origem confirma o outbox; nunca gera nova escrita."""
-    db.execute(
-        update(ErpOperation)
-        .where(
-            ErpOperation.connection_id == connection_id,
-            ErpOperation.target_resource == resource,
-            ErpOperation.external_id == key,
-            ErpOperation.status == "succeeded",
-            ErpOperation.mirror_confirmed_at.is_(None),
-        )
-        .values(mirror_confirmed_at=utcnow())
+def _confirm_operations(
+    db: Session, connection_id: str, resource: str, key: str, mirror_cancelled: bool = False
+) -> None:
+    """Retorno da origem confirma o outbox; nunca gera nova escrita.
+
+    Cancelamento só é confirmado quando o ESPELHO mostra o pedido cancelado: resposta 2xx do
+    Mercos não basta (o pedido pode ter sido recusado depois ou o espelho ainda estar antigo)."""
+    query = update(ErpOperation).where(
+        ErpOperation.connection_id == connection_id,
+        ErpOperation.target_resource == resource,
+        or_(ErpOperation.external_id == key, ErpOperation.target_external_id == key),
+        ErpOperation.status == "succeeded",
+        ErpOperation.mirror_confirmed_at.is_(None),
     )
+    if not mirror_cancelled:
+        query = query.where(ErpOperation.kind != "cancel_order")
+    db.execute(query.values(mirror_confirmed_at=utcnow()))
 
 
 def quarantine(
@@ -169,7 +173,7 @@ def process_row(
         definition.finalize(entity, row, definition)
         db.add(entity)
     _resolve_quarantine(db, connection_id, definition.alias, key)
-    _confirm_operations(db, connection_id, definition.alias, key)
+    _confirm_operations(db, connection_id, definition.alias, key, getattr(entity, "kind", None) == "cancelled")
     return "persisted"
 
 
@@ -372,17 +376,28 @@ def _persist_batch(
             .values(resolved_at=utcnow())
         )
     if confirm_keys:
-        db.execute(
-            update(ErpOperation)
-            .where(
-                ErpOperation.connection_id == connection_id,
-                ErpOperation.target_resource == resource,
+        cancelled_keys = {k for k in confirm_keys if getattr(plan[k][0], "kind", None) == "cancelled"}
+        base = update(ErpOperation).where(
+            ErpOperation.connection_id == connection_id,
+            ErpOperation.target_resource == resource,
+            or_(
                 ErpOperation.external_id.in_(list(confirm_keys)),
-                ErpOperation.status == "succeeded",
-                ErpOperation.mirror_confirmed_at.is_(None),
-            )
-            .values(mirror_confirmed_at=utcnow())
+                ErpOperation.target_external_id.in_(list(confirm_keys)),
+            ),
+            ErpOperation.status == "succeeded",
+            ErpOperation.mirror_confirmed_at.is_(None),
         )
+        db.execute(base.where(ErpOperation.kind != "cancel_order").values(mirror_confirmed_at=utcnow()))
+        if cancelled_keys:  # cancelamento: só quando o espelho já mostra o pedido cancelado
+            db.execute(
+                base.where(
+                    ErpOperation.kind == "cancel_order",
+                    or_(
+                        ErpOperation.external_id.in_(list(cancelled_keys)),
+                        ErpOperation.target_external_id.in_(list(cancelled_keys)),
+                    ),
+                ).values(mirror_confirmed_at=utcnow())
+            )
     db.flush()
     return persisted, unchanged, quarantined
 

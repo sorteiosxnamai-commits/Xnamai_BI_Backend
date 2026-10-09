@@ -195,12 +195,17 @@ def test_validation_errors_use_422(erp_cfg):
 
 def test_unimplemented_capabilities_return_409_not_fake_success():
     c = client()
+    bodies = {
+        "/api/v1/erp/sales-orders/1/cancel": {"expectedVersion": 1, "reason": "Cliente desistiu"},
+        "/api/v1/erp/sales-orders/1/billings": {"expectedVersion": 1, "billedValue": "10.00", "billedAt": "2026-10-09"},
+    }
     for path, method in (
         ("/api/v1/erp/sales-orders/1/cancel", "post"),
         ("/api/v1/erp/sales-orders/1/billings", "post"),
         ("/api/v1/erp/products", "post"),
     ):
-        response = getattr(c, method)(path, headers=bearer())
+        headers = {**bearer(), "Idempotency-Key": "capability-key-0001"}
+        response = getattr(c, method)(path, headers=headers, **({"json": bodies[path]} if path in bodies else {}))
         assert response.status_code == 409, path
         assert response.json()["detail"]["code"] == "capability_disabled"
     titles = c.get("/api/v1/erp/external-titles", headers=bearer()).json()

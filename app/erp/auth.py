@@ -36,6 +36,12 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             "integration:read",
             "integration:sync",
             "integration:resolve",
+            "shipping:read",
+            "shipping:write",
+            "invoices:read",
+            "invoices:write",
+            "refunds:read",
+            "refunds:request",
         }
     ),
     "estoque": frozenset(
@@ -67,9 +73,13 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             "financial_links:read",
             "purchases:read",
             "integration:read",
+            "invoices:read",
+            "refunds:read",
+            "refunds:request",
+            "refunds:approve",
         }
     ),
-    "consulta": frozenset({"read", "integration:read"}),
+    "consulta": frozenset({"read", "integration:read", "shipping:read", "invoices:read", "refunds:read"}),
 }
 
 

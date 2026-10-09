@@ -319,3 +319,76 @@ def test_erp_installs_over_existing_legacy_data_and_keeps_every_legacy_row():
     assert _legacy_fingerprint(engine) == before  # dados legados intactos após o rollback
     tables = set(inspect(create_engine(url)).get_table_names())
     assert not any(t.startswith("erp_") for t in tables)
+
+
+NEW_PANEL_TABLES = {
+    "erp_shipping_quotes", "erp_shipping_volumes", "erp_shipping_options",
+    "erp_invoice_drafts", "erp_invoice_draft_items", "erp_refund_requests", "erp_refund_events",
+}
+
+
+def _fingerprint_tables(engine, names) -> dict[str, str]:
+    import hashlib
+
+    result = {}
+    with engine.connect() as conn:
+        for table in sorted(names):
+            rows = conn.execute(text(f'SELECT * FROM "{table}"')).fetchall()
+            result[table] = hashlib.sha256(repr(sorted(map(repr, rows))).encode()).hexdigest() + f":{len(rows)}"
+    return result
+
+
+def test_panel_migration_only_creates_new_erp_tables():
+    """Estática: a migração do painel só mexe nas 7 tabelas novas (nada legado, nada do ERP publicado)."""
+    text_ = (ROOT / "alembic" / "versions" / "20261009_01_erp_operational_panel.py").read_text(encoding="utf-8")
+    created = set(re.findall(r"op\.create_table\('([a-z_]+)'", text_))
+    dropped = set(re.findall(r"op\.drop_table\('([a-z_]+)'", text_))
+    assert created == NEW_PANEL_TABLES == dropped
+    assert 'down_revision = "20261007_01"' in text_
+    assert "alter_column" not in text_ and "add_column" not in text_ and "drop_column" not in text_
+
+
+@pytest.mark.skipif(not PG_URL, reason="requer ERP_TEST_DATABASE_URL (PostgreSQL real)")
+def test_panel_migration_is_additive_over_published_erp_data_and_reversible():
+    from datetime import datetime, timezone
+
+    from app.erp.models import ErpAuditEvent, ErpCustomer, ErpSalesOrder
+
+    url = fresh_database("erp_panel_migration")
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    config.set_main_option("sqlalchemy.url", url)
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    command.upgrade(config, "20261007_01")  # estado já publicado em produção
+    with sessionmaker(bind=engine)() as db:
+        db.add_all([
+            ErpCustomer(connection_id="xnamai", external_id="c1", name="Cliente publicado"),
+            ErpSalesOrder(connection_id="xnamai", external_id="o1", number="1"),
+            ErpAuditEvent(operator="ana@x.com", action="x", connection_id="xnamai", at=datetime.now(timezone.utc)),
+        ])
+        db.commit()
+    published = set(inspect(engine).get_table_names()) - NEW_PANEL_TABLES - {"alembic_version"}  # marcador de revisão muda por definição
+    assert not (set(inspect(engine).get_table_names()) & NEW_PANEL_TABLES)
+    before = _fingerprint_tables(engine, published)
+
+    command.upgrade(config, "head")
+    assert NEW_PANEL_TABLES <= set(inspect(engine).get_table_names())
+    assert _fingerprint_tables(engine, published) == before  # legado e ERP publicado intactos, linha a linha
+    # as tabelas novas funcionam com as restrições de verdade (índice parcial: uma seleção por pedido)
+    with engine.begin() as conn:
+        for number in (1, 2):
+            conn.execute(text(
+                "INSERT INTO erp_shipping_quotes (connection_id, order_external_id, order_version, status, source, "
+                "version, created_by, created_at, updated_at) VALUES ('xnamai','o1',1,:s,'manual',1,'t',now(),now())"
+            ), {"s": "selected" if number == 1 else "draft"})
+    with pytest.raises(Exception):  # segunda cotação selecionada do mesmo pedido
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO erp_shipping_quotes (connection_id, order_external_id, order_version, status, source, "
+                "version, created_by, created_at, updated_at) VALUES ('xnamai','o1',1,'selected','manual',1,'t',now(),now())"
+            ))
+
+    command.downgrade(config, "20261007_01")
+    assert not (set(inspect(create_engine(url)).get_table_names()) & NEW_PANEL_TABLES)
+    assert _fingerprint_tables(create_engine(url), published) == before  # retorno preserva o que já existia

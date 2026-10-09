@@ -25,6 +25,10 @@ SETTINGS_CONSUMERS = (
     "app.erp.cli",
     "app.erp.router",
     "app.erp.routers.access",
+    "app.erp.routers.shipping",
+    "app.erp.routers.invoice_drafts",
+    "app.erp.routers.refunds",
+    "app.erp.routers.order_finance",
     "app.erp.routers.commercial",
     "app.erp.routers.integration",
     "app.erp.routers.purchasing",
@@ -100,3 +104,25 @@ def erp_cfg(monkeypatch):
         return cfg
 
     return build
+
+
+@pytest.fixture(autouse=True)
+def _reset_api_rate_limit():
+    """O limitador do BI é uma instância por processo; a suíte soma centenas de chamadas por minuto.
+
+    Só esvazia o balde entre testes: o middleware em si não é alterado."""
+
+    def reset():
+        from app.main import app
+        from app.middleware.rate_limit import ApiRateLimitMiddleware
+
+        layer = getattr(app, "middleware_stack", None)
+        while layer is not None:
+            if isinstance(layer, ApiRateLimitMiddleware):
+                layer.requests.clear()
+                return
+            layer = getattr(layer, "app", None)
+
+    reset()
+    yield
+    reset()

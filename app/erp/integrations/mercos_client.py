@@ -39,6 +39,8 @@ WRITE_ROUTES = {
     "update_customer": ("PUT", "/v1/customers/{id}"),
     "create_order": ("POST", "/v1/orders"),
     "update_order": ("PUT", "/v1/orders/{id}"),
+    "cancel_order": ("POST", "/v1/orders/{id}/cancel"),
+    "bill_order": ("POST", "/v1/billings"),
     "create_title": ("POST", "/v1/titles"),
     "update_title": ("PUT", "/v1/titles/{id}"),
 }
@@ -370,6 +372,10 @@ class MercosAdaptorClient:
                 return WriteOutcome("unknown", status_code=status, error_code="invalid_response",
                                     error="Resposta de sucesso ilegível")
             external = extract_external_id(body)
+            if external is None and kind == "cancel_order" and external_id:
+                # O cancelamento não devolve ID; o alvo já é conhecido. 2xx = ACEITO, nunca confirmado:
+                # a confirmação vem do espelho (pedido volta cancelado).
+                external = str(external_id)
             if external is None:
                 return WriteOutcome(
                     "unknown",

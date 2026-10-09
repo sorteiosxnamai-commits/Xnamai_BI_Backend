@@ -218,9 +218,14 @@ def test_capabilities_discovery_updates_the_matrix_from_the_real_adaptor(stack, 
     assert matrix["write.products"]["supportedByAdaptor"] is False          # sem escopo para a chave ERP
     assert "escopo" in matrix["write.products"]["reason"]
     assert matrix["read.titles"]["supportedByAdaptor"] is False             # extensão desligada no Adaptor
-    # suportado pelo Adaptor mas o ERP ainda não tem a tela: mensagem honesta
-    assert matrix["write.order_cancel"]["implementedInErp"] is False
-    assert "falta a ligação no ERP" in matrix["write.order_cancel"]["reason"]
+    # cancelamento: ligado no ERP (DTO, outbox, reconciliação pelo espelho), mas segue DESLIGADO enquanto
+    # a flag de pedidos estiver desligada (padrão de produção)
+    assert matrix["write.order_cancel"]["implementedInErp"] is True
+    assert matrix["write.order_cancel"]["enabled"] is False
+    assert "ERP_WRITE_ORDERS" in matrix["write.order_cancel"]["reason"]
+    # faturamento: o Adaptor oferece, mas NÃO é liberado (sem GET para reconciliar); o motivo é o real
+    assert matrix["write.billing"]["implementedInErp"] is False
+    assert matrix["write.billing"]["enabled"] is False and matrix["write.billing"]["reason"]
     # descoberta não prova a conta Mercos
     assert matrix["read.customers"]["accountAccess"] in ("unknown", "allowed")
 

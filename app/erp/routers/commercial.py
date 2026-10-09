@@ -15,9 +15,12 @@ from app.erp.config import erp_settings
 from app.erp.db import erp_db
 from app.erp.models import commercial as m
 from app.erp.registry import REGISTRY
+from app.erp.services import order_operations as oo
 from app.erp.schemas.commands import (
     CustomerCreate,
     CustomerPatch,
+    OrderBillingInput,
+    OrderCancelInput,
     OrderCreate,
     OrderPatch,
     TitleInput,
@@ -261,15 +264,38 @@ def patch_product(
 # --- pedidos -------------------------------------------------------------------
 
 
+def _order_filters(
+    search, customerId, kind, commercialStatus, paymentStatus, billingStatus,
+    itemsComplete, pending, dateFrom, dateTo, shipping=None, fiscal=None, financeStatus=None,
+) -> oo.OrderFilters:
+    extra = [
+        (name, value)
+        for name, value in (("shipping", shipping), ("fiscal", fiscal), ("financeStatus", financeStatus))
+        if value
+    ]
+    return oo.OrderFilters(
+        search=search, customer_id=customerId, kind=kind, commercial_status=commercialStatus,
+        payment_status=paymentStatus, billing_status=billingStatus, items_complete=itemsComplete,
+        pending=pending, date_from=dateFrom, date_to=dateTo, extra=tuple(extra),
+    )
+
+
 @router.get("/sales-orders", summary="Pedidos e orçamentos")
 def list_orders(
     search: str | None = None,
     customerId: str | None = None,
     kind: str | None = None,
     commercialStatus: str | None = None,
+    paymentStatus: str | None = None,
+    billingStatus: str | None = None,
     itemsComplete: bool | None = None,
+    pending: bool | None = None,
+    shipping: str | None = None,
+    fiscal: str | None = None,
+    financeStatus: str | None = None,
     dateFrom: date | None = None,
     dateTo: date | None = None,
+    include: str | None = Query(None, pattern="^operational$"),
     page: int = PAGE,
     page_size: int = PAGE_SIZE,
     sort: str | None = None,
@@ -278,21 +304,11 @@ def list_orders(
     db: Session = Depends(erp_db),
 ):
     M = m.ErpSalesOrder
-    query = select(M).where(M.connection_id == cid())
-    if search:
-        query = query.where(_like(M.number, search))
-    if customerId:
-        query = query.where(M.customer_external_id == customerId)
-    if kind:
-        query = query.where(M.kind == kind)
-    if commercialStatus:
-        query = query.where(M.commercial_status == commercialStatus)
-    if itemsComplete is not None:
-        query = query.where(M.items_complete == itemsComplete)
-    if dateFrom:
-        query = query.where(M.issue_date >= dateFrom)
-    if dateTo:
-        query = query.where(M.issue_date <= dateTo)
+    filters = _order_filters(
+        search, customerId, kind, commercialStatus, paymentStatus, billingStatus,
+        itemsComplete, pending, dateFrom, dateTo, shipping, fiscal, financeStatus,
+    )
+    query = oo.apply_filters(select(M), cid(), filters)
     result, key, direction = paginate(
         db, query, id_column=M.id,
         sort_columns={"issuedAt": M.issued_at, "number": M.number, "netTotal": M.net_total},
@@ -309,14 +325,40 @@ def list_orders(
     }
     envelope = result.envelope(
         lambda row: ser.order(row, user), sort=key, order=direction,
-        filters={"search": search, "customerId": customerId, "kind": kind,
-                 "commercialStatus": commercialStatus, "itemsComplete": itemsComplete,
-                 "dateFrom": dateFrom and dateFrom.isoformat(),
-                 "dateTo": dateTo and dateTo.isoformat()},
+        filters=filters.as_dict(),
     )
     for item in envelope["items"]:
         item["customerName"] = customers.get(item["customerId"])
+    if include == "operational":
+        summaries = oo.summarize_page(db, cid(), list(result.items), user)
+        for item in envelope["items"]:
+            item["operational"] = summaries.get(item["id"])
     return envelope
+
+
+@router.get("/operational-summary", summary="Resumo agregado dos pedidos filtrados (painel operacional)")
+def operational_summary(
+    search: str | None = None,
+    customerId: str | None = None,
+    kind: str | None = None,
+    commercialStatus: str | None = None,
+    paymentStatus: str | None = None,
+    billingStatus: str | None = None,
+    itemsComplete: bool | None = None,
+    pending: bool | None = None,
+    shipping: str | None = None,
+    fiscal: str | None = None,
+    financeStatus: str | None = None,
+    dateFrom: date | None = None,
+    dateTo: date | None = None,
+    user: ErpUser = Depends(require("read")),
+    db: Session = Depends(erp_db),
+):
+    filters = _order_filters(
+        search, customerId, kind, commercialStatus, paymentStatus, billingStatus,
+        itemsComplete, pending, dateFrom, dateTo, shipping, fiscal, financeStatus,
+    )
+    return oo.operational_summary(db, cid(), filters)
 
 
 @router.get("/sales-orders/{external_id}", summary="Detalhe do pedido/orçamento")
@@ -338,7 +380,21 @@ def get_order(
         )
     )
     data["customerName"] = customer.name if customer else None
+    data["operational"] = oo.summarize_page(db, cid(), [row], user)[row.external_id]
     return data
+
+
+@router.get("/sales-orders/{external_id}/history", summary="Histórico operacional do pedido")
+def order_history(
+    external_id: str,
+    user: ErpUser = Depends(require("read")),
+    db: Session = Depends(erp_db),
+):
+    """Ações humanas (auditoria) e operações externas do pedido, da mais recente para a mais antiga.
+
+    Atualização vinda do espelho do Mercos NÃO é ação humana e não aparece aqui."""
+    _get(db, m.ErpSalesOrder, external_id)
+    return {"items": oo.order_history(db, cid(), external_id)}
 
 
 @router.post("/sales-orders", status_code=202, summary="Cria pedido (outbox)")
@@ -372,20 +428,38 @@ def patch_order(
     return accepted(op, created)
 
 
-@router.post("/sales-orders/{external_id}/cancel", status_code=409,
-             summary="Cancela pedido (capacidade pendente no Adaptor)")
+@router.post("/sales-orders/{external_id}/cancel", status_code=202,
+             summary="Cancela pedido no Mercos (outbox; desligado até a capacidade estar liberada)")
 def cancel_order(
-    external_id: str, user: ErpUser = Depends(require("orders:cancel")), db: Session = Depends(erp_db)
+    external_id: str,
+    body: OrderCancelInput,
+    idempotency_key: str | None = Header(None),
+    user: ErpUser = Depends(require("orders:cancel")),
+    db: Session = Depends(erp_db),
 ):
-    _disabled(db, "write.order_cancel")
+    op, created = outbox.submit(
+        db, connection_id=cid(), user=user, kind="cancel_order", body=body,
+        idempotency_key=idempotency_key, target_external_id=external_id,
+    )
+    db.commit()
+    return accepted(op, created)
 
 
-@router.post("/sales-orders/{external_id}/billings", status_code=409,
-             summary="Registra faturamento (capacidade pendente no Adaptor)")
+@router.post("/sales-orders/{external_id}/billings", status_code=202,
+             summary="Registra faturamento no Mercos (não é emissão fiscal; não liberado sem reconciliação)")
 def bill_order(
-    external_id: str, user: ErpUser = Depends(require("orders:bill")), db: Session = Depends(erp_db)
+    external_id: str,
+    body: OrderBillingInput,
+    idempotency_key: str | None = Header(None),
+    user: ErpUser = Depends(require("orders:bill")),
+    db: Session = Depends(erp_db),
 ):
-    _disabled(db, "write.billing")
+    op, created = outbox.submit(
+        db, connection_id=cid(), user=user, kind="bill_order", body=body,
+        idempotency_key=idempotency_key, target_external_id=external_id,
+    )
+    db.commit()
+    return accepted(op, created)
 
 
 # --- catálogos auxiliares -------------------------------------------------------

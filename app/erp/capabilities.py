@@ -83,9 +83,14 @@ CAPABILITIES: tuple[CapabilityDef, ...] = (
                   True, True, False, "inventory_publish", "F08",
                   PENDING_ADAPTOR + " Saldo é absoluto; exige autoridade definida."),
     CapabilityDef("write.order_cancel", "Cancelar pedido", "write", "D", True, True,
-                  False, "orders", "F27", PENDING_ADAPTOR + " Operação dedicada documentada."),
+                  True, "orders", "F27",
+                  "Operação dedicada documentada (POST pedidos/cancelar/{id}); só envia com a flag de "
+                  "pedidos, chave ERP com escopo de cancelamento e extensão ligada. Confirmação só pelo "
+                  "espelho (pedido volta cancelado)."),
     CapabilityDef("write.billing", "Registrar/alterar faturamento", "write", "D", True,
-                  True, False, "billing", "F28", PENDING_ADAPTOR),
+                  True, False, "billing", "F28",
+                  "Não liberado: o Adaptor não tem leitura de faturamento, então não há como reconciliar "
+                  "o resultado. Faturamento do Mercos não é emissão fiscal."),
     CapabilityDef("read.commissions", "Comissões", "sync", "D", True, True, False,
                   source="F12", reason=PENDING_ADAPTOR + " Chave própria `comissao_id`."),
     CapabilityDef("read.product_images", "Imagens de produto", "sync", "D", False, True,
@@ -116,6 +121,26 @@ CAPABILITIES: tuple[CapabilityDef, ...] = (
                   False, True, reason="Processo próprio; publicação ao Mercos desabilitada."),
     CapabilityDef("local.finance", "Contas a pagar, caixa e centros de custo", "local", "E",
                   False, False, True, reason="Processo próprio; não confunde título Mercos."),
+    CapabilityDef("local.shipping_manual", "Frete: cotação manual e seleção local", "local", "E", False,
+                  False, True,
+                  reason="Processo próprio; a seleção é local e não contrata frete, etiqueta ou envio."),
+    CapabilityDef("local.shipping_provider", "Cotação automática de frete (conector)", "local", "V",
+                  False, False, False,
+                  reason="Sem conector de frete: depende de escolher provedor, credenciais de "
+                         "homologação e regras comerciais. Use o cadastro manual."),
+    CapabilityDef("local.invoice_draft", "Montagem fiscal (rascunho de planejamento)", "local", "E",
+                  False, False, True,
+                  reason="Processo próprio; rascunho não é nota emitida."),
+    CapabilityDef("local.invoice_issue", "Emissão de nota fiscal eletrônica", "local", "V", False,
+                  False, False,
+                  reason="Sem emissor fiscal configurado. Faturamento do Mercos não substitui a emissão."),
+    CapabilityDef("local.refund_requests", "Solicitações de reembolso (fluxo interno)", "local", "E",
+                  False, False, True,
+                  reason="Processo próprio; solicitar ou aprovar não devolve dinheiro."),
+    CapabilityDef("local.refund_external", "Devolução automática e Pix", "local", "V", False, False,
+                  False,
+                  reason="Depende de PSP/banco/Mercos Pay. Ler pagamentos não prova gerar cobrança "
+                         "nem devolver valores."),
     CapabilityDef("local.fiscal_banking", "Fiscal eletrônico, bancos, boletos, logística",
                   "local", "E/V", False, False, False,
                   reason="Integrações específicas futuras; não inferir de campos ou links."),
@@ -132,6 +157,8 @@ def _enabled(
 ) -> tuple[bool, str | None]:
     cfg = erp_settings()
     if not item.implemented:
+        if item.reason and item.reason.startswith("Não liberado"):
+            return False, item.reason  # decisão deliberada: o motivo real, não o genérico
         if adaptor_supported:
             return False, "O Adaptor já oferece esta capacidade; falta a ligação no ERP (tela/serviço)"
         return False, item.reason or "Não implementado"

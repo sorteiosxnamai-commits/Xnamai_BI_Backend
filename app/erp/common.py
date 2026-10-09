@@ -89,6 +89,14 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def plain_decimal(value: Decimal | None) -> str | None:
+    """Decimal sem notação científica e sem zeros à direita (`30.0000` -> `30`, `20.000` -> `20`)."""
+    if value is None:
+        return None
+    text = format(value.normalize(), "f")
+    return text
+
+
 def money(value: Decimal | None) -> str | None:
     """Dinheiro em contrato como string decimal."""
     if value is None:
