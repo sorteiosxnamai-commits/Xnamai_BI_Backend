@@ -4,6 +4,7 @@ Cada linha roda em SAVEPOINT: uma linha inválida vai para a quarentena sem
 contaminar o restante da página nem avançar o checkpoint.
 """
 
+import logging
 from datetime import timedelta
 from typing import Any
 
@@ -19,6 +20,8 @@ from app.erp.models.core import (
     ErpSourceSnapshot,
 )
 from app.erp.registry import REGISTRY, ResourceDef, map_row
+
+log = logging.getLogger("uvicorn.error")
 
 
 def _find_entity(db: Session, connection_id: str, definition: ResourceDef, row: dict, key: str):
@@ -168,6 +171,220 @@ def process_row(
     _resolve_quarantine(db, connection_id, definition.alias, key)
     _confirm_operations(db, connection_id, definition.alias, key)
     return "persisted"
+
+
+def persist_rows(
+    db: Session,
+    connection_id: str,
+    definition: ResourceDef,
+    rows: list[dict],
+    run_id: int | None,
+) -> tuple[int, int, int]:
+    """Grava uma página. Devolve (persistidos, inalterados, em quarentena).
+
+    Caminho rápido: poucas consultas por PÁGINA (pré-carga de entidades, snapshots e quarentena;
+    um flush em lote; DELETE/UPDATE em massa) em vez de ~10 comandos por linha. Com latência de
+    rede até o banco, o custo por comando domina; o lote reduz o tempo da carga na mesma
+    proporção. Qualquer falha do lote desfaz a página (SAVEPOINT) e refaz linha a linha, com o
+    isolamento por linha de sempre: o resultado é idêntico, só mais lento."""
+    if definition.lookup is None and len(rows) > 1:
+        try:
+            with db.begin_nested():
+                return _persist_batch(db, connection_id, definition, rows, run_id)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "ERP: lote de %s falhou; refazendo a página linha a linha", definition.alias, exc_info=True
+            )
+    return _persist_rowwise(db, connection_id, definition, rows, run_id)
+
+
+def _persist_rowwise(
+    db: Session,
+    connection_id: str,
+    definition: ResourceDef,
+    rows: list[dict],
+    run_id: int | None,
+) -> tuple[int, int, int]:
+    persisted = unchanged = quarantined = 0
+    resource = definition.alias
+    for row in rows:
+        fallback_key = f"sem-id:{fingerprint(row)[:16]}"
+        try:
+            key = definition.key(row)
+        except ValueError as exc:
+            quarantine(db, connection_id, resource, fallback_key, str(exc), row, run_id)
+            quarantined += 1
+            continue
+        try:
+            with db.begin_nested():
+                outcome = process_row(db, connection_id, definition, row, run_id)
+        except Exception as exc:  # noqa: BLE001 - qualquer falha de linha isola a linha
+            quarantine(db, connection_id, resource, key, f"{type(exc).__name__}: {exc}", row, run_id)
+            quarantined += 1
+            continue
+        if outcome == "persisted":
+            persisted += 1
+        else:
+            unchanged += 1
+    return persisted, unchanged, quarantined
+
+
+def _persist_batch(
+    db: Session,
+    connection_id: str,
+    definition: ResourceDef,
+    rows: list[dict],
+    run_id: int | None,
+) -> tuple[int, int, int]:
+    from sqlalchemy import delete
+
+    resource = definition.alias
+    model = definition.model
+    quarantined = 0
+    items: list[tuple[dict, str, str]] = []
+    for row in rows:
+        try:
+            key = definition.key(row)
+        except ValueError as exc:
+            quarantine(
+                db, connection_id, resource, f"sem-id:{fingerprint(row)[:16]}", str(exc), row, run_id
+            )
+            quarantined += 1
+            continue
+        items.append((row, key, fingerprint(row)))
+    if not items:
+        return 0, 0, quarantined
+
+    keys = list({key for _, key, _ in items})
+    entities = {
+        entity.external_id: entity
+        for entity in db.scalars(
+            select(model).where(model.connection_id == connection_id, model.external_id.in_(keys))
+        )
+    }
+    snapshots = {
+        (external_key, fp)
+        for external_key, fp in db.execute(
+            select(ErpSourceSnapshot.external_key, ErpSourceSnapshot.fingerprint).where(
+                ErpSourceSnapshot.connection_id == connection_id,
+                ErpSourceSnapshot.resource == resource,
+                ErpSourceSnapshot.external_key.in_(keys),
+            )
+        )
+    }
+    pending_quarantine = set(
+        db.scalars(
+            select(ErpQuarantine.external_key).where(
+                ErpQuarantine.connection_id == connection_id,
+                ErpQuarantine.resource == resource,
+                ErpQuarantine.external_key.in_(keys),
+                ErpQuarantine.resolved_at.is_(None),
+            )
+        )
+    )
+    retention = timedelta(days=erp_settings().erp_snapshot_retention_days)
+    persisted = unchanged = 0
+    resolve_keys: set[str] = set()
+    confirm_keys: set[str] = set()
+    plan: dict[str, tuple[Any, Any]] = {}
+
+    for row, key, fp in items:
+        entity = entities.get(key)
+        if entity is not None and entity.fingerprint == fp:
+            if key in pending_quarantine:
+                resolve_keys.add(key)
+            unchanged += 1
+            continue
+        try:
+            mapped = map_row(definition, row)
+        except Exception as exc:  # noqa: BLE001 - linha inválida vai para a quarentena
+            quarantine(db, connection_id, resource, key, f"{type(exc).__name__}: {exc}", row, run_id)
+            quarantined += 1
+            continue
+        incoming = as_utc(mapped.values.get("source_updated_at"))
+        current = as_utc(entity.source_updated_at) if entity is not None else None
+        stale = bool(entity is not None and incoming and current and incoming < current)
+        if (key, fp) not in snapshots:
+            snapshots.add((key, fp))
+            db.add(
+                ErpSourceSnapshot(
+                    connection_id=connection_id,
+                    resource=resource,
+                    external_key=key,
+                    source_version=(incoming.isoformat() if incoming else None),
+                    fingerprint=fp,
+                    payload=row,
+                    retention_until=utcnow() + retention,
+                )
+            )
+        if stale:
+            unchanged += 1  # versão antiga atrasada não regride a entidade mais nova
+            continue
+        created = entity is None
+        if created:
+            entity = model(connection_id=connection_id, external_id=key)
+        for attr, value in mapped.values.items():
+            setattr(entity, attr, value)
+        entity.fingerprint = fp
+        entity.captured_at = utcnow()
+        entity.version = (entity.version or 0) + 1
+        if definition.finalize is not None:
+            try:
+                definition.finalize(entity, row, definition)
+            except Exception as exc:  # noqa: BLE001
+                if not created:
+                    db.expire(entity)
+                quarantine(db, connection_id, resource, key, f"{type(exc).__name__}: {exc}", row, run_id)
+                quarantined += 1
+                continue
+        db.add(entity)
+        entities[key] = entity
+        plan[key] = (entity, mapped)  # repetição do mesmo id na página: vale a última
+        persisted += 1
+        if key in pending_quarantine:
+            resolve_keys.add(key)
+        confirm_keys.add(key)
+
+    db.flush()  # entidades novas/alteradas em lote; atribui os ids
+
+    for child in definition.children:
+        fk = getattr(child.model, child.fk)
+        targets = [
+            (entity, mapped.children[child.name])
+            for entity, mapped in plan.values()
+            if child.name in mapped.children
+        ]
+        if not targets:
+            continue
+        db.execute(delete(child.model).where(fk.in_([entity.id for entity, _ in targets])))
+        for entity, children in targets:
+            for data in children or []:
+                db.add(child.model(**{child.fk: entity.id}, **data))
+    if resolve_keys:
+        db.execute(
+            update(ErpQuarantine)
+            .where(
+                ErpQuarantine.connection_id == connection_id,
+                ErpQuarantine.resource == resource,
+                ErpQuarantine.external_key.in_(list(resolve_keys)),
+                ErpQuarantine.resolved_at.is_(None),
+            )
+            .values(resolved_at=utcnow())
+        )
+    if confirm_keys:
+        db.execute(
+            update(ErpOperation)
+            .where(
+                ErpOperation.connection_id == connection_id,
+                ErpOperation.target_resource == resource,
+                ErpOperation.external_id.in_(list(confirm_keys)),
+                ErpOperation.status == "succeeded",
+                ErpOperation.mirror_confirmed_at.is_(None),
+            )
+            .values(mirror_confirmed_at=utcnow())
+        )
+    db.flush()
+    return persisted, unchanged, quarantined
 
 
 def _typed_keys(row: dict) -> dict[str, str]:

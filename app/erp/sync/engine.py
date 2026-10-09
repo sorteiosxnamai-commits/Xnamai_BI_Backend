@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.erp import capabilities, queue
-from app.erp.common import as_utc, fingerprint, parse_source_instant, utcnow
+from app.erp.common import as_utc, parse_source_instant, utcnow
 from app.erp.config import erp_settings
 from app.erp.db import session_scope
 from app.erp.integrations.mercos_client import AdaptorError, MercosAdaptorClient
@@ -26,6 +26,7 @@ from app.erp.models.core import ErpJob, ErpQuarantine, ErpSyncCheckpoint, ErpSyn
 from app.erp.registry import REGISTRY, SYNC_ORDER
 from app.erp.sync.rows import (
     definition_for,
+    persist_rows,
     process_row,
     quarantine,
     update_field_inventory,
@@ -163,27 +164,10 @@ def _persist_page(
     lease_token: str | None = None,
 ) -> dict:
     definition = definition_for(resource)
-    persisted = unchanged = quarantined = 0
     with session_scope() as db:
-        for row in rows:
-            fallback_key = f"sem-id:{fingerprint(row)[:16]}"
-            try:
-                key = definition.key(row)
-            except ValueError as exc:
-                quarantine(db, connection_id, resource, fallback_key, str(exc), row, run_id)
-                quarantined += 1
-                continue
-            try:
-                with db.begin_nested():
-                    outcome = process_row(db, connection_id, definition, row, run_id)
-            except Exception as exc:  # noqa: BLE001 - qualquer falha de linha isola a linha
-                quarantine(db, connection_id, resource, key, f"{type(exc).__name__}: {exc}", row, run_id)
-                quarantined += 1
-                continue
-            if outcome == "persisted":
-                persisted += 1
-            else:
-                unchanged += 1
+        persisted, unchanged, quarantined = persist_rows(
+            db, connection_id, definition, rows, run_id
+        )
         unmapped = update_field_inventory(db, connection_id, definition, rows)
         db.flush()
         unresolved = int(

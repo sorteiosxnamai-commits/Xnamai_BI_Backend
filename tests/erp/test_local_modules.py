@@ -386,16 +386,16 @@ def test_page_crash_never_advances_cursor_or_leaves_partial_rows(erp_session_fac
     class Crash(BaseException):
         """Simula morte do processo no meio da página (não é Exception)."""
 
-    original = rows.process_row
+    original = rows.map_row  # usado tanto pelo caminho em lote quanto pelo linha a linha
     seen = []
 
-    def exploding(db, connection_id, definition, row, run_id):
+    def exploding(definition, row):
         seen.append(row["id"])
         if row["id"] == 2:
             raise Crash()
-        return original(db, connection_id, definition, row, run_id)
+        return original(definition, row)
 
-    monkeypatch.setattr(engine, "process_row", exploding)
+    monkeypatch.setattr(rows, "map_row", exploding)
 
     class Fake:
         async def list_page(self, alias, cursor):
@@ -408,7 +408,7 @@ def test_page_crash_never_advances_cursor_or_leaves_partial_rows(erp_session_fac
         assert db.scalar(select(func.count(ErpCustomer.id))) == 0  # página inteira reverteu
         cp = db.scalar(select(ErpSyncCheckpoint))
         assert cp.cursor is None and cp.transport_cursor is None  # cursor não avançou
-    monkeypatch.setattr(engine, "process_row", original)
+    monkeypatch.setattr(rows, "map_row", original)
     result = asyncio.run(engine.sync_resource(Fake(), "test", "customers"))
     assert result.status == "success" and result.persisted == 3
     with erp_session_factory() as db:
