@@ -140,7 +140,8 @@ def test_read_through_the_real_adaptor_uses_the_pagination_envelope(stack):
     assert [r["id"] for r in page.data] == [1]
     assert page.page_cursor == "2026-10-07T10:00:00" and page.next_cursor is None
     call = mercos.calls("GET", "/api/v1/clientes")[0]
-    assert call["query"] == "alterado_apos=2026-10-01T00%3A00%3A00"
+    # formato aceito pelo Mercos: "%Y-%m-%d %H:%M:%S" (espaço codificado como +)
+    assert call["query"] == "alterado_apos=2026-10-01+00%3A00%3A00"
     # tokens do Mercos vão ao Mercos; a chave interna do ERP nunca vai junto
     assert call["headers"]["applicationtoken"] == "app-token" and call["headers"]["companytoken"] == "company-token"
     assert ERP_KEY not in json.dumps(call["headers"])
