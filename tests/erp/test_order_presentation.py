@@ -1,6 +1,7 @@
 """Correções de apresentação: totais desconhecidos, ações por estado, referências, documentos e fases."""
 
 import json
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -12,6 +13,7 @@ from app.erp.models import (
     ErpCustomer,
     ErpPaymentCondition,
     ErpSalesOrder,
+    ErpSalesOrderItem,
     ErpSeller,
     ErpSyncCheckpoint,
     ErpSyncRun,
@@ -286,3 +288,12 @@ def test_status_separates_implemented_enabled_account_and_load_and_shows_increme
     assert customers["lastIncremental"]["persisted"] == 2 and customers["lastIncremental"]["cursorAfter"] == "2026-10-13T08:00:00"
     assert carriers["phase"] == "denied" and carriers["lastIncremental"] is None
     assert rows["segments"]["phase"] == "not_started" and set(customers["capability"]) >= {"enabled", "accountAccess"}
+
+
+def test_diagnostics_lists_complete_orders_whose_zero_total_contradicts_their_items(data):
+    with session_scope() as db:
+        db.add(ErpSalesOrderItem(order_id=db.query(ErpSalesOrder).filter_by(external_id="2").one().id, position=5,
+                                 external_id="2-x", name="Brinde", quantity=Decimal("1"), total=Decimal("40.00"), excluded=False))
+    body = get("/integration/diagnostics/orders").json()["ordersTotalZeroWithItems"]
+    assert body["total"] == 1 and body["byKind"] == {"order": 1}
+    assert body["sample"][0]["id"] == "2" and body["sample"][0]["itemsTotal"] == "40.00"

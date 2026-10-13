@@ -162,3 +162,21 @@ def test_permissions_and_unknown_resource(both, erp_session_factory):
     assert get("/orders", "estoque@x.com", "viewer").status_code == 200
     assert client().get("/api/v1/erp/integration/reconciliation/orders").status_code == 401
     assert get("/orders", dateFrom="2026-12-01", dateTo="2026-11-01").status_code == 422
+
+
+def test_a_scope_that_is_too_large_is_refused_instead_of_scanning_everything(both, monkeypatch):
+    from app.erp.services import reconciliation as rec
+
+    monkeypatch.setattr(rec, "MAX_SCOPE_ROWS", 3)
+    refused = get("/orders")
+    assert refused.status_code == 422 and refused.json()["detail"]["code"] == "scope_too_large"
+    ok = get("/orders", dateFrom="2026-10-03", dateTo="2026-10-03")
+    assert ok.status_code == 422  # ainda acima do limite artificial; o período curto de produção cabe no limite real
+    monkeypatch.setattr(rec, "MAX_SCOPE_ROWS", 60_000)
+    assert get("/orders", dateFrom="2026-10-03", dateTo="2026-10-03").status_code == 200
+
+
+def test_item_and_customer_lookups_are_scoped_to_the_compared_orders(both):
+    """Pedido fora do período não influencia a conferência (itens/clientes só do escopo)."""
+    out = get("/orders", dateFrom="2026-11-01", dateTo="2026-11-30").json()
+    assert out["erp"]["count"] == 0 and out["divergences"] == []

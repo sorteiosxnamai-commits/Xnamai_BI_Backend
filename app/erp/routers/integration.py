@@ -187,10 +187,20 @@ def reconciliation(
         raise http_error(404, "unknown_resource", "Recurso sem conciliação", allowed=list(rec.RESOURCES))
     if dateFrom and dateTo and dateTo < dateFrom:
         raise http_error(422, "invalid_period", "A data final não pode ser anterior à inicial")
-    return rec.reconcile(
-        db, cid(), resource, user=user, date_from=dateFrom, date_to=dateTo,
-        as_of=as_utc(asOf) if asOf else None, sample=sample,
-    )
+    from sqlalchemy.exc import OperationalError
+
+    try:
+        return rec.reconcile(
+            db, cid(), resource, user=user, date_from=dateFrom, date_to=dateTo,
+            as_of=as_utc(asOf) if asOf else None, sample=sample,
+        )
+    except rec.ScopeTooLarge as exc:
+        raise http_error(
+            422, "scope_too_large", f"{exc.rows} pedidos no escopo: informe um período menor", limit=rec.MAX_SCOPE_ROWS
+        ) from exc
+    except OperationalError as exc:  # statement_timeout do PostgreSQL
+        db.rollback()
+        raise http_error(503, "reconciliation_too_slow", "A conferência excedeu 20 s; reduza o período") from exc
 
 
 @router.post("/sync", status_code=202, summary="Agenda sincronização (nunca lê catálogo na requisição)")

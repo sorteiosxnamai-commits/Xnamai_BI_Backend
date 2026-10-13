@@ -152,6 +152,26 @@ def orders_load(db: Session, connection_id: str) -> dict:
     missing_distinct = int(db.scalar(select(func.count(func.distinct(M.customer_external_id))).where(*missing_customer)) or 0)
     missing_span = db.execute(select(func.min(M.issue_date), func.max(M.issue_date)).where(*missing_customer)).one()
     null_customer = int(db.scalar(select(func.count(M.id)).where(M.connection_id == connection_id, M.customer_external_id.is_(None))) or 0)
+    # total zerado com itens que somam valor: o zero veio do Mercos (mesmo mapeamento do BI), mas não bate com os itens
+    item_sums = (
+        select(m.ErpSalesOrderItem.order_id.label("order_id"), func.sum(m.ErpSalesOrderItem.total).label("items_total"))
+        .where(m.ErpSalesOrderItem.excluded.is_(False))
+        .group_by(m.ErpSalesOrderItem.order_id)
+        .subquery()
+    )
+    zero_rows = db.execute(
+        select(M.external_id, M.kind, M.issue_date, M.source_updated_at, item_sums.c.items_total)
+        .join(item_sums, item_sums.c.order_id == M.id)
+        .where(
+            M.connection_id == connection_id, M.items_complete.is_(True),
+            func.coalesce(M.net_total, 0) == 0, item_sums.c.items_total > 0,
+        )
+        .order_by(M.source_updated_at.desc())
+    ).all()
+    zero_by_kind: dict[str, int] = {}
+    for row in zero_rows:
+        zero_by_kind[row[1] or "unknown"] = zero_by_kind.get(row[1] or "unknown", 0) + 1
+    zero_dates = [r[2] for r in zero_rows if r[2]]
     code, reason = unresolved_reason(cps["customers"].status if "customers" in cps else None)
     last_hydrate = db.scalar(
         select(ErpJob).where(ErpJob.connection_id == connection_id, ErpJob.kind == "hydrate").order_by(ErpJob.id.desc()).limit(1)
@@ -210,6 +230,19 @@ def orders_load(db: Session, connection_id: str) -> dict:
                 "reason": reason,
             },
             "withoutCustomerIdInSource": null_customer,
+        },
+        "ordersTotalZeroWithItems": {
+            "total": len(zero_rows),
+            "byKind": zero_by_kind,
+            "orderDate": {
+                "min": min(zero_dates).isoformat() if zero_dates else None,
+                "max": max(zero_dates).isoformat() if zero_dates else None,
+            },
+            "sample": [
+                {"id": r[0], "kind": r[1], "itemsTotal": ser.money(r[4]), "sourceUpdatedAt": ser.iso(r[3])}
+                for r in zero_rows[:15]
+            ],
+            "note": "Total líquido 0 no Mercos, mas os itens somam valor. O ERP mostra o total recebido; não o recalcula.",
         },
         "unresolvedReferences": [p for p in pending_references(db, connection_id) if p["resource"] == "orders"],
     }

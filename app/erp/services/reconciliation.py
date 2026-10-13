@@ -10,7 +10,7 @@ O BI nunca sobrescreve o espelho do ERP: este módulo só relata."""
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Integer, Numeric, column, func, select, table
+from sqlalchemy import Boolean, DateTime, Integer, Numeric, column, func, select, table, text
 from sqlalchemy.orm import Session
 
 from app.domain.order_status import is_cancelled_order, normalize_order_status
@@ -41,6 +41,13 @@ BI_ORDERS = table(
 BI_ITEMS = table("order_items", column("order_mercos_id"), column("total", Numeric), column("excluded", Boolean))
 BI_SYNC = table("sync_states", column("resource"), column("cursor"), column("status"), column("last_success_at", _TS))
 TOLERANCE = Decimal("0.01")
+MAX_SCOPE_ROWS = 60_000
+
+
+class ScopeTooLarge(Exception):
+    def __init__(self, rows: int):
+        super().__init__(f"{rows} pedidos no escopo")
+        self.rows = rows
 
 CATALOG = {
     "only_in_erp": (
@@ -213,6 +220,9 @@ def reconcile(
 ) -> dict:
     if resource not in RESOURCES:
         raise ValueError(resource)
+    if db.get_bind().dialect.name == "postgresql":
+        # leitura de conferência nunca pode segurar o banco da carga: corta em 20 s
+        db.execute(text("SET LOCAL statement_timeout = 20000"))
     cp, erp_at = _erp_cursor(db, connection_id, resource)
     state, bi_at = _bi_cursor(db, resource)
     instant, basis = _as_of(as_of, erp_at, bi_at)
@@ -292,30 +302,47 @@ def _orders(db, connection_id, date_from, date_to, as_of, erp_at, bi_at, sample)
     if as_of:
         erp_q = erp_q.where(E.source_updated_at <= as_of)
         bi_q = bi_q.where(B.c.source_updated_at <= as_of)
+    erp_scope = [c for c in erp_q.whereclause.clauses] if hasattr(erp_q.whereclause, "clauses") else [erp_q.whereclause]
+    bi_scope = [c for c in bi_q.whereclause.clauses] if bi_q.whereclause is not None and hasattr(bi_q.whereclause, "clauses") else (
+        [bi_q.whereclause] if bi_q.whereclause is not None else []
+    )
+    # recusa varredura enorme sem período (a conciliação é uma conferência por escopo, não um export)
+    scoped = int(db.scalar(select(func.count()).select_from(erp_q.subquery())) or 0)
+    if scoped > MAX_SCOPE_ROWS:
+        raise ScopeTooLarge(scoped)
     erp = {r[0]: r for r in db.execute(erp_q)}
     biw = {r[0]: r for r in db.execute(bi_q)}
     matched_ids = erp.keys() & biw.keys()
 
-    # itens (soma e contagem por pedido, sem excluídos) só dos pedidos casados
+    # itens (soma e contagem por pedido, sem excluídos) só dos pedidos DENTRO do escopo, nunca da base inteira
     erp_items = {
         key: (int(count), _num(total) or Decimal("0"))
         for key, count, total in db.execute(
             select(E.external_id, func.count(m.ErpSalesOrderItem.id), func.coalesce(func.sum(m.ErpSalesOrderItem.total), 0))
             .join(E, E.id == m.ErpSalesOrderItem.order_id)
-            .where(E.connection_id == connection_id, m.ErpSalesOrderItem.excluded.is_(False))
+            .where(*erp_scope, m.ErpSalesOrderItem.excluded.is_(False))
             .group_by(E.external_id)
         )
     }
+    bi_ids = select(B.c.mercos_id).where(*bi_scope) if bi_scope else select(B.c.mercos_id)
     bi_items = {
         key: (int(count), _num(total) or Decimal("0"))
         for key, count, total in db.execute(
             select(BI_ITEMS.c.order_mercos_id, func.count(), func.coalesce(func.sum(BI_ITEMS.c.total), 0))
-            .where(BI_ITEMS.c.excluded.is_(False))
+            .where(BI_ITEMS.c.excluded.is_(False), BI_ITEMS.c.order_mercos_id.in_(bi_ids))
             .group_by(BI_ITEMS.c.order_mercos_id)
         )
     }
-    erp_customers = set(db.scalars(select(m.ErpCustomer.external_id).where(m.ErpCustomer.connection_id == connection_id)))
-    bi_customers = set(db.scalars(select(BI_CUSTOMERS.c.mercos_id)))
+    # cadastros só dos clientes citados pelos pedidos casados (não carrega a base de clientes inteira)
+    wanted = {erp[k][8] for k in matched_ids if erp[k][8]}
+    erp_customers: set = set()
+    bi_customers: set = set()
+    ordered = sorted(wanted)
+    for start in range(0, len(ordered), 1000):
+        chunk = ordered[start : start + 1000]
+        erp_customers |= set(db.scalars(select(m.ErpCustomer.external_id).where(
+            m.ErpCustomer.connection_id == connection_id, m.ErpCustomer.external_id.in_(chunk))))
+        bi_customers |= set(db.scalars(select(BI_CUSTOMERS.c.mercos_id).where(BI_CUSTOMERS.c.mercos_id.in_(chunk))))
 
     buckets = {code: _Bucket(code) for code in CATALOG}
     notes: list[str] = []
