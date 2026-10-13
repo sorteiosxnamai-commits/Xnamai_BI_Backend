@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.erp import serializers as ser
 from app.erp.audit import audit
 from app.erp.auth import ErpUser
+from app.erp.services import order_rules
 from app.erp.common import http_error, plain_decimal, utcnow
 from app.erp.models import commercial as m
 from app.erp.models import operations as op
@@ -296,12 +297,9 @@ def _organize(db: Session, draft: op.ErpInvoiceDraft, items: list[op.ErpInvoiceD
 
 def create_draft(db: Session, user: ErpUser, connection_id: str, order_id: str, body: InvoiceDraftCreate) -> dict:
     order = _order(db, connection_id, order_id, lock=True)
-    if order.kind == "cancelled":
-        raise http_error(409, "order_cancelled", "Pedido cancelado não recebe rascunho fiscal")
-    if not order.items_complete:
-        raise http_error(409, "items_incomplete", "Itens do pedido ainda não foram sincronizados; o rascunho depende da lista completa")
-    if order.net_total is None or order.net_total <= 0:
-        raise http_error(409, "order_total_unavailable", "O pedido não tem valor total conhecido")
+    blocked = order_rules.block(order, "invoice")
+    if blocked:
+        raise http_error(409, *blocked)
     current = current_items(db, order)
     if not current:
         raise http_error(409, "no_items", "O pedido não tem itens vivos para compor a nota")

@@ -267,6 +267,7 @@ def patch_product(
 def _order_filters(
     search, customerId, kind, commercialStatus, paymentStatus, billingStatus,
     itemsComplete, pending, dateFrom, dateTo, shipping=None, fiscal=None, financeStatus=None,
+    restricted=False,
 ) -> oo.OrderFilters:
     extra = [
         (name, value)
@@ -276,7 +277,7 @@ def _order_filters(
     return oo.OrderFilters(
         search=search, customer_id=customerId, kind=kind, commercial_status=commercialStatus,
         payment_status=paymentStatus, billing_status=billingStatus, items_complete=itemsComplete,
-        pending=pending, date_from=dateFrom, date_to=dateTo, extra=tuple(extra),
+        pending=pending, date_from=dateFrom, date_to=dateTo, extra=tuple(extra), restricted=restricted,
     )
 
 
@@ -307,6 +308,7 @@ def list_orders(
     filters = _order_filters(
         search, customerId, kind, commercialStatus, paymentStatus, billingStatus,
         itemsComplete, pending, dateFrom, dateTo, shipping, fiscal, financeStatus,
+        restricted=not user.can("pii:read"),
     )
     query = oo.apply_filters(select(M), cid(), filters)
     result, key, direction = paginate(
@@ -315,7 +317,7 @@ def list_orders(
         sort=sort, default_sort="issuedAt", order=order, page=page, page_size=page_size,
     )
     customers = {
-        c.external_id: c.name
+        c.external_id: ser.label(c.name, user)
         for c in db.scalars(
             select(m.ErpCustomer).where(
                 m.ErpCustomer.connection_id == cid(),
@@ -357,6 +359,7 @@ def operational_summary(
     filters = _order_filters(
         search, customerId, kind, commercialStatus, paymentStatus, billingStatus,
         itemsComplete, pending, dateFrom, dateTo, shipping, fiscal, financeStatus,
+        restricted=not user.can("pii:read"),
     )
     return oo.operational_summary(db, cid(), filters)
 
@@ -379,7 +382,8 @@ def get_order(
             m.ErpCustomer.external_id == row.customer_external_id,
         )
     )
-    data["customerName"] = customer.name if customer else None
+    data["customerName"] = ser.label(customer.name, user) if customer else None
+    data["references"] = oo.resolve_references(db, cid(), row, user)
     data["operational"] = oo.summarize_page(db, cid(), [row], user)[row.external_id]
     return data
 

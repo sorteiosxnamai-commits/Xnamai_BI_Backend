@@ -23,6 +23,7 @@ from sqlalchemy import and_, exists, func, not_, select
 from app.erp import serializers as ser
 from app.erp.audit import audit
 from app.erp.auth import ErpUser
+from app.erp.services import order_rules
 from app.erp.common import BR_TZ, http_error, money
 from app.erp.models import commercial as m
 from app.erp.models import local as lo
@@ -172,10 +173,9 @@ def order_finance(db, user: ErpUser, connection_id: str, order_id: str) -> dict:
 def create_order_receivable(db, user: ErpUser, connection_id: str, order_id: str, body: OrderReceivableInput) -> dict:
     order = _order(db, connection_id, order_id)
     db.get(m.ErpSalesOrder, order.id, with_for_update=True)  # serializa a criação de obrigações do pedido
-    if order.kind == "cancelled":
-        raise http_error(409, "order_cancelled", "Pedido cancelado não gera título")
-    if not order.customer_external_id:
-        raise http_error(409, "customer_required", "O pedido não tem cliente identificado")
+    blocked = order_rules.block(order, "receivable")
+    if blocked:
+        raise http_error(409, *blocked)
     amount = body.amount if body.amount is not None else order.net_total
     if amount is None or amount <= 0:
         raise http_error(409, "order_total_unavailable", "O pedido não tem valor conhecido; informe o valor do título")
@@ -420,7 +420,11 @@ def metrics(db, connection_id: str, start: date | None, end: date | None) -> dic
         previous["cash"] = _cash(db, connection_id, prev_start, prev_end)["net"]
     return {
         "period": {"from": start and start.isoformat(), "to": end and end.isoformat()},
-        "sales": {"orders": count, "net": money(sales), "variation": _variation(sales, previous["sales"], comparable)},
+        "sales": {
+            "orders": count, "net": money(sales), "variation": _variation(sales, previous["sales"], comparable),
+            "excludes": ["cancelled", "quote"],  # só pedidos: sem cancelados nem orçamentos
+        },
+        "coverage": oo._coverage(db, connection_id),  # totais são parciais enquanto a carga não terminou
         "cash": {
             "received": money(cash["received"]), "reversed": money(cash["reversed"]), "net": money(cash["net"]),
             "variation": _variation(cash["net"], previous["cash"], comparable),
@@ -445,7 +449,7 @@ def report_csv(db, user: ErpUser, connection_id: str, filters: oo.OrderFilters, 
     truncated = len(orders) > limit
     orders = orders[:limit]
     customers = {
-        c.external_id: c.name
+        c.external_id: ser.label(c.name, user)
         for c in db.scalars(
             select(m.ErpCustomer).where(
                 m.ErpCustomer.connection_id == connection_id,
@@ -462,7 +466,7 @@ def report_csv(db, user: ErpUser, connection_id: str, filters: oo.OrderFilters, 
         f = fin.get(o.external_id, {})
         writer.writerow([_csv_cell(v) for v in [
             o.number or o.external_id, customers.get(o.customer_external_id), o.commercial_status, o.kind,
-            money(o.net_total), f.get("price"), f.get("state"), "sim" if f.get("deadline") == "overdue" else "não",
+            None if ser.totals_unknown(o) else money(o.net_total), f.get("price"), f.get("state"), "sim" if f.get("deadline") == "overdue" else "não",
             o.payment_status,
         ]])
     return out.getvalue(), truncated

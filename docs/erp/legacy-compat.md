@@ -36,3 +36,11 @@ limpa o DOM entre testes (sem `globals`, o cleanup automático do Testing Librar
   respondiam 409 e agora aceitam corpo (cancelamento) ou seguem 409 `capability_disabled` (faturamento).
 - Migração `20261009_01` só cria/derruba as 7 tabelas novas; `20261007_01` permanece intacta.
 - Rotas do ERP anterior (`/erp/clientes`, `/erp/produtos` etc.) preservadas em `ErpApp.tsx`.
+
+## Verificação de 13/10/2026
+
+OpenAPI comparado ao `HEAD` desta rodada: nenhuma operação legada (BI, CRM, Análise Varejo) alterada ou removida.
+Mudanças só em `/api/v1/erp`: `GET /integration/diagnostics/orders` (novo) e campos **aditivos** nas respostas
+existentes (`phase`, `references`, `operational.actions`, `totalsUnknown`, `values.sold/byKind`, `dates`).
+**Mudança de contrato a observar:** `netTotal/grossTotal/discountTotal/freightTotal` passam a vir `null` (antes
+`"0.00"`) em pedidos incompletos com total zerado; o frontend do ERP já trata.

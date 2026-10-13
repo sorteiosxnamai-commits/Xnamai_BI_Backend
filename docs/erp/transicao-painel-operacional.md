@@ -101,3 +101,14 @@ schemas, testes). MercosAdaptor, XNamaiAgent, Club e NewStore **não foram modif
 2. Publicar backend e depois frontend (`VITE_ERP_ENABLED` e flags de escrita permanecem como estão).
 3. Retorno: voltar a versão do aplicativo; `alembic downgrade 20261007_01` só é necessário se as 7 tabelas
    novas precisarem sair (descarta apenas dados dessas tabelas).
+
+## 8. Arquivos alterados em 13/10/2026 (correções)
+
+Backend: `app/erp/{common,serializers,integrity,capabilities,workers}.py`, `sync/engine.py`,
+`integrations/mercos_client.py`, `routers/{access,commercial,integration,order_finance}.py`,
+`services/{order_operations,order_finance,shipping,invoice_drafts}.py`, novos `services/{order_rules,sync_phase,load_diagnostics}.py`,
+`tests/erp/{test_sync_resume,test_order_presentation}.py`, `openapi.json`, `docs/erp/diagnostico-carga-pedidos.md`.
+Frontend: `src/erp/{api/schemas.ts,erp-panel.css,components/ui.tsx,features/OverviewPage.tsx,
+features/orders/{OrdersPage,OrderDetailPage,orderUi}.tsx,features/shipping/ShippingPage.tsx,
+features/fiscal/InvoiceListPage.tsx,features/finance/FinancePage.tsx,features/integration/IntegrationPage.tsx}`,
+testes (`PresentationFixes.test.tsx` e ajustes). Sem migração nova.

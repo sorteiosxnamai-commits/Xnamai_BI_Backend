@@ -53,3 +53,17 @@ filtros de títulos. As rotas existem e estão testadas com transporte simulado,
 | Nota fiscal (NF-e) | indisponível | emissor fiscal homologado (certificado, CNPJ emitente, regras tributárias). Rascunho local não é NF-e; emitir responde 409 `issuer_unavailable` |
 | Pix / cobrança | indisponível | PSP/banco (credenciais, webhook de confirmação). Pagamento Pix fica sempre `unknown` |
 | Reembolso efetivo | manual | integração bancária/PSP. O ERP só registra solicitação, aprovação e confirmação externa manual |
+
+## Estado por recurso (13/10/2026): implementado × habilitado × conta × carga
+
+A tela Integrações › Recursos separa quatro coisas que não devem se confundir:
+**implementado no ERP**, **habilitado** (flags/configuração), **permitido pela conta** (evidência real de 200/403)
+e **carga concluída** (checkpoint). Hoje:
+
+- Leitura dos 12 recursos: implementada e habilitada. Conta: permitido para 8; **negado (403)** para `segments`,
+  `carriers`, `commercial-policies` e `product-prices` (bloqueio preservado e registrado com mensagem sanitizada;
+  não se repete por “sincronizar tudo” em 24 h; não se presume que trocar a chave resolva).
+- Títulos, pagamentos, comissões, promoções e formas de pagamento da Mercos: o Adaptor oferece a rota (desligada
+  por `MERCOS_ENABLED_EXTENSIONS` até validar no sandbox), mas **não há ligação no ERP** e o caminho/paginação reais
+  não estão confirmados. **Pendência externa** (validação no sandbox Mercos e habilitação no Adaptor): só entram
+  na sincronização depois disso. Nenhuma alteração no Adaptor foi feita.

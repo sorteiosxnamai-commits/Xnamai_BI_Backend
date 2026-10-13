@@ -4,7 +4,8 @@ from sqlalchemy.orm import Session
 
 from app.erp import capabilities, integrity
 from app.erp.auth import ErpUser, erp_user, erp_user_pending_ok
-from app.erp.common import as_utc, iso, utcnow
+from app.erp.services.sync_phase import count_phases, sync_phase
+from app.erp.common import sanitize_remote_message, as_utc, iso, utcnow
 from app.erp.config import erp_settings
 from app.erp.db import erp_db
 from app.erp.models import commercial as m
@@ -62,21 +63,22 @@ def overview(user: ErpUser = Depends(erp_user), db: Session = Depends(erp_db)):
         model = REGISTRY[alias].model
         row = checkpoints.get(alias)
         synced = row is not None and row.last_success_at is not None
-        count = (
-            int(db.scalar(select(func.count(model.id)).where(model.connection_id == cid)) or 0)
-            if synced
-            else None
-        )
+        local = int(db.scalar(select(func.count(model.id)).where(model.connection_id == cid)) or 0)
+        # registros locais aparecem mesmo sem carga concluída (marcados como parciais)
+        count = local if (synced or local) else None
         resources.append(
             {
                 "resource": alias,
                 "label": REGISTRY[alias].label,
                 "status": row.status if row else "never",
+                "phase": sync_phase(row.status if row else None, row.last_success_at if row else None),
                 "records": count,
+                "recordsPartial": bool(local) and not synced,
+                "lastAttemptAt": iso(row.last_attempt_at) if row else None,
                 "dataThrough": iso(row.data_through) if row else None,
                 "lastSuccessAt": iso(row.last_success_at) if row else None,
                 "unresolved": row.unresolved if row else None,
-                "error": row.error if row else None,
+                "error": sanitize_remote_message(row.error) if row else None,
             }
         )
     op_counts = dict(
@@ -95,6 +97,7 @@ def overview(user: ErpUser = Depends(erp_user), db: Session = Depends(erp_db)):
         # só há "dataThrough" global quando todos os 12 recursos já sincronizaram
         "dataThrough": last.isoformat() if last else None,
         "resources": resources,
+        "phases": count_phases(resources),
         "operations": {
             status: int(op_counts.get(status, 0))
             for status in (

@@ -10,6 +10,7 @@ Regras (documento, 7.1):
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -17,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.erp import capabilities, queue
-from app.erp.common import as_utc, parse_source_instant, utcnow
+from app.erp.common import as_utc, cursor_not_before, parse_source_instant, utcnow
 from app.erp.config import erp_settings
 from app.erp.db import session_scope
 from app.erp.integrations.mercos_client import AdaptorError, MercosAdaptorClient
@@ -35,6 +36,10 @@ from app.erp.sync.rows import (
 log = logging.getLogger("uvicorn.error")
 
 HYDRATE_BATCH_LIMIT = 50
+# Carga completa que parou assim continua do último cursor CONFIRMADO dela, nunca da página 1.
+RESUMABLE_FULL_STATUSES = ("interrupted", "failed", "partial", "waiting_rate_limit", "running", "continuing")
+# Recurso negado pela conta não é re-tentado por "sincronizar tudo" dentro desta janela.
+DENIED_RETRY_HOURS = 24
 
 
 class ResourceBusy(Exception):
@@ -54,6 +59,8 @@ class SyncResult:
     error: str | None = None
     retry_after: float | None = None
     unmapped: list[str] = field(default_factory=list)
+    resumed_from: str | None = None
+    sliced: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -68,6 +75,8 @@ class SyncResult:
             "error": self.error,
             "retryAfterSeconds": self.retry_after,
             "unmappedFields": self.unmapped,
+            "resumedFrom": self.resumed_from,
+            "sliced": self.sliced,
         }
 
 
@@ -96,6 +105,71 @@ def _checkpoint(
         db.add(row)
         db.flush()
     return row
+
+
+def _full_resume_cursor(db: Session, connection_id: str, resource: str) -> str | None:
+    """Ponto de retomada de uma carga completa interrompida (ou None: começa do início).
+
+    Usa o MAIOR cursor confirmado entre as execuções inacabadas desde a última carga completa
+    concluída: cada uma começou do início ou de um ponto confirmado e só grava cursor depois de
+    confirmar a página, então o maior valor é um ponto contíguo seguro (um recomeço indevido que
+    regrediu o checkpoint não apaga o progresso que uma execução anterior já confirmou).
+    Enquanto o recurso nunca concluiu nada, execuções incrementais da carga inicial também contam.
+    A última execução completa precisa ser retomável: cancelada pelo operador ou concluída significa
+    começar do início (pedido explícito)."""
+    runs = list(
+        db.scalars(
+            select(ErpSyncRun)
+            .where(ErpSyncRun.connection_id == connection_id, ErpSyncRun.resource == resource)
+            .order_by(ErpSyncRun.id.desc())
+            .limit(300)
+        )
+    )
+    full = [r for r in runs if r.mode == "full"]
+    never_completed = not any(r.status == "success" for r in runs)
+    pool = runs if never_completed else full
+    if not pool or pool[0].status not in RESUMABLE_FULL_STATUSES:
+        return None
+    last_full_success = next((r.id for r in full if r.status == "success"), 0)
+    best: tuple[datetime, str] | None = None
+    for run in pool:
+        if run.id <= last_full_success:
+            break
+        if run.status not in RESUMABLE_FULL_STATUSES:
+            continue
+        for candidate in (run.cursor_after, run.cursor_before):
+            instant = parse_source_instant(candidate) if candidate else None
+            if instant is not None and (best is None or instant > best[0]):
+                best = (instant, candidate)
+    return best[1] if best else None
+
+
+def completed_in_job(job_id: int | None) -> set[str]:
+    """Recursos que ESTE job já concluiu com sucesso (um job reassumido não os refaz)."""
+    if job_id is None:
+        return set()
+    with session_scope() as db:
+        return set(
+            db.scalars(
+                select(ErpSyncRun.resource).where(ErpSyncRun.job_id == job_id, ErpSyncRun.status == "success")
+            )
+        )
+
+
+def recently_denied(connection_id: str) -> set[str]:
+    """Recursos cuja última tentativa foi negada (403/404) dentro da janela de espera."""
+    limit = utcnow() - timedelta(hours=DENIED_RETRY_HOURS)
+    with session_scope() as db:
+        return {
+            row.resource
+            for row in db.scalars(
+                select(ErpSyncCheckpoint).where(
+                    ErpSyncCheckpoint.connection_id == connection_id,
+                    ErpSyncCheckpoint.status.in_(("forbidden", "unavailable")),
+                )
+            )
+            if row.last_attempt_at is not None and as_utc(row.last_attempt_at) >= limit
+        }
 
 
 def _begin_run(
@@ -133,6 +207,9 @@ def _begin_run(
             previous.finished_at = now
             previous.error = "Processo reiniciado durante a execução; retomada pelo checkpoint"
             db.add(previous)
+        start_cursor = cursor_before
+        if mode == "full":
+            start_cursor = _full_resume_cursor(db, connection_id, resource)
         checkpoint.status = "running"
         checkpoint.last_attempt_at = utcnow()
         checkpoint.error = None
@@ -143,11 +220,11 @@ def _begin_run(
             mode=mode,
             status="running",
             job_id=job_id,
-            cursor_before=cursor_before,
+            cursor_before=start_cursor,
         )
         db.add(run)
         db.flush()
-        return run.id, cursor_before
+        return run.id, start_cursor
 
 
 def _persist_page(
@@ -184,8 +261,11 @@ def _persist_page(
         checkpoint.last_attempt_at = utcnow()  # última atividade confirmada
         checkpoint.transport_cursor = transport_cursor or checkpoint.transport_cursor
         checkpoint.unresolved = unresolved
-        # Só avança o cursor de processamento quando nada ficou pendente.
-        if unresolved == 0 and page_cursor:
+        # Só avança o cursor de processamento quando nada ficou pendente, e nunca para trás:
+        # reler páginas antigas (sobreposição ou carga explícita desde o início) não regride
+        # o "dados até" do espelho.
+        advance = unresolved == 0 and bool(page_cursor)
+        if advance and cursor_not_before(page_cursor, checkpoint.cursor):
             checkpoint.cursor = page_cursor
             checkpoint.data_through = parse_source_instant(page_cursor) or checkpoint.data_through
         checkpoint.records = (checkpoint.records or 0) + persisted
@@ -196,7 +276,8 @@ def _persist_page(
         run.persisted = (run.persisted or 0) + persisted
         run.unchanged = (run.unchanged or 0) + unchanged
         run.quarantined = (run.quarantined or 0) + quarantined
-        run.cursor_after = checkpoint.cursor
+        if advance:
+            run.cursor_after = page_cursor  # progresso confirmado desta execução
         db.add(run)
         # O lock da linha do job só é tomado AQUI, no fim da página, imediatamente antes do
         # commit: quem perdeu o lease não confirma (rollback da página inteira), e o lock
@@ -254,6 +335,7 @@ async def sync_resource(
     job_id: int | None = None,
     lease_token: str | None = None,
     cancel_requested=lambda: False,
+    slice_seconds: float | None = None,
 ) -> SyncResult:
     definition = REGISTRY[resource]
     cfg = erp_settings()
@@ -272,7 +354,14 @@ async def sync_resource(
         result.error = "Lease do job perdido antes de iniciar"
         return result
     result.run_id = run_id
-    cursor = None if mode == "full" else overlap_cursor(cursor_before, cfg.erp_sync_overlap_seconds)
+    started_at = time.monotonic()
+    cursor = overlap_cursor(cursor_before, cfg.erp_sync_overlap_seconds)
+    if mode == "full" and cursor_before:
+        result.resumed_from = cursor_before
+        log.info(
+            "ERP sync %s run=%s: carga completa retomada do último cursor confirmado %s",
+            resource, run_id, cursor_before,
+        )
 
     async def finish(status: str, error: str | None = None, *, retry=None, access=None):
         result.status = status
@@ -337,6 +426,14 @@ async def sync_resource(
                     result.unmapped.append(name)
             if not page.next_cursor:
                 break
+            if slice_seconds and time.monotonic() - started_at >= slice_seconds:
+                # cede a vez: a página já está confirmada junto do checkpoint; o recurso volta à fila e
+                # continua do último cursor confirmado, sem bloquear os demais recursos
+                result.sliced = True
+                return await finish(
+                    "continuing",
+                    f"Fatia de {int(slice_seconds)} s concluída; continua do último cursor confirmado",
+                )
             if page.next_cursor == cursor:
                 return await finish(
                     "failed",

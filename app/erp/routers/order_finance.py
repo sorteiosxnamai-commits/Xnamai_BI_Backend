@@ -73,7 +73,8 @@ def orders_report(
 ):
     extra = (("financeStatus", financeStatus),) if financeStatus else ()
     filters = oo.OrderFilters(
-        search=search, kind=kind, customer_id=customerId, date_from=dateFrom, date_to=dateTo, extra=extra
+        search=search, kind=kind, customer_id=customerId, date_from=dateFrom, date_to=dateTo, extra=extra,
+        restricted=not user.can("pii:read"),
     )
     body, truncated = order_finance.report_csv(db, user, cid(), filters)
     return Response(

@@ -34,12 +34,40 @@ async def run_sync_job(client: MercosAdaptorClient, job) -> dict:
         result = await engine.hydrate_orders(
             client, job.connection_id, job_id=job.id, lease_token=job.lease_token
         )
-        return {"results": [result.as_dict()], "retryAfter": result.retry_after}
+        more = []
+        if result.status == "success" and result.persisted > 0:
+            # houve progresso e ainda há pedidos sem itens: nova fatia, atrás dos demais jobs
+            if await asyncio.to_thread(engine.pending_hydration, job.connection_id):
+                more = ["__hydrate__"]
+        return {"results": [result.as_dict()], "retryAfter": result.retry_after, "continue": more}
+    sync_all = resources is None
     if resources is None:
         resources = list(engine.SYNC_ORDER)
+    denied = engine.recently_denied(job.connection_id) if sync_all else set()
+    # job reassumido (processo morto ou lease vencido): não refaz o que ele mesmo já concluiu
+    done_by_job = engine.completed_in_job(job.id) if job.attempts and job.attempts > 1 else set()
+    slice_seconds = erp_settings().erp_sync_slice_seconds or None
     results = []
     retry_after = None
-    for resource in resources:
+    continue_with: list[str] = []
+    for index, resource in enumerate(resources):
+        if resource in done_by_job:
+            results.append({
+                "resource": resource, "status": "skipped_done", "runId": None, "pages": 0,
+                "received": 0, "persisted": 0, "unchanged": 0, "quarantined": 0,
+                "error": None, "retryAfterSeconds": None, "unmappedFields": [], "resumedFrom": None,
+                "sliced": False,
+            })
+            continue
+        if resource in denied:
+            # preserva o bloqueio: a conta já negou este recurso há pouco; só o botão do recurso insiste
+            results.append({
+                "resource": resource, "status": "skipped_denied", "runId": None, "pages": 0,
+                "received": 0, "persisted": 0, "unchanged": 0, "quarantined": 0,
+                "error": "Acesso negado recentemente pela conta; não repetido por 'sincronizar tudo'",
+                "retryAfterSeconds": None, "unmappedFields": [], "resumedFrom": None, "sliced": False,
+            })
+            continue
         outcome = await engine.sync_resource(
             client,
             job.connection_id,
@@ -48,8 +76,13 @@ async def run_sync_job(client: MercosAdaptorClient, job) -> dict:
             job_id=job.id,
             lease_token=job.lease_token,
             cancel_requested=cancelled,
+            slice_seconds=slice_seconds,
         )
         results.append(outcome.as_dict())
+        if outcome.status == "continuing":
+            # este recurso e os que viriam depois voltam à fila, um job por recurso, atrás do que já espera
+            continue_with = [r for r in resources[index:] if r not in done_by_job and r not in denied]
+            break
         if outcome.status == "lease_lost":
             break  # outro worker é o dono agora; não mexer em mais nada
         if outcome.status == "auth_failed":
@@ -63,7 +96,7 @@ async def run_sync_job(client: MercosAdaptorClient, job) -> dict:
             break
         if outcome.status in ("cancelled", "interrupted"):
             break
-    if retry_after is None and any(r["resource"] == "orders" for r in results):
+    if retry_after is None and any(r["resource"] == "orders" for r in results) and not continue_with:
         pending = await asyncio.to_thread(engine.pending_hydration, job.connection_id)
         if pending:
             with session_scope() as db:
@@ -71,7 +104,12 @@ async def run_sync_job(client: MercosAdaptorClient, job) -> dict:
                     db, kind="hydrate", connection_id=job.connection_id,
                     resource="orders", requested_by="worker",
                 )
-    return {"results": results, "retryAfter": retry_after}
+    if continue_with:
+        pending = await asyncio.to_thread(engine.pending_hydration, job.connection_id)
+        if pending and "orders" in {r["resource"] for r in results}:
+            # a hidratação de itens não espera o fim da carga de pedidos
+            continue_with.append("__hydrate__")
+    return {"results": results, "retryAfter": retry_after, "continue": continue_with}
 
 
 async def _keep_lease(job_id: int, token: str, every: float) -> None:
@@ -129,7 +167,26 @@ async def process_next_job(client: MercosAdaptorClient) -> bool:
             queue.finish(db, job.id, job.lease_token, status="cancelled", result=outcome)
         else:
             queue.finish(db, job.id, job.lease_token, status="succeeded", result=outcome)
+    _requeue_continuations(job, outcome.get("continue") or [])
     return True
+
+
+def _requeue_continuations(job, resources: list[str]) -> None:
+    """Continuações entram DEPOIS dos jobs que já esperavam (a fila ordena por `run_after` e `id`)."""
+    if not resources:
+        return
+    with session_scope() as db:
+        for resource in resources:
+            if resource == "__hydrate__":
+                queue.enqueue(
+                    db, kind="hydrate", connection_id=job.connection_id, resource="orders",
+                    requested_by="worker-continuation",
+                )
+            else:
+                queue.enqueue(
+                    db, kind="sync", connection_id=job.connection_id, resource=resource,
+                    mode=job.mode, requested_by="worker-continuation",
+                )
 
 
 async def process_outbox(client: MercosAdaptorClient, limit: int = 5) -> int:

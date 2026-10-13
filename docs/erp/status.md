@@ -106,3 +106,26 @@ menu Visão Geral, Pedidos, Nota Fiscal, Frete, Financeiro, Reembolsos e Configu
 solicitação/aprovação de reembolso e consumidor de cancelamento. Matriz detalhada em
 `transicao-painel-operacional.md`. **Isto não declara o ERP completo**: frete automático, NF-e, Pix e
 devolução efetiva de dinheiro dependem de integrações externas (ver `adaptor-requirements.md`).
+
+## Correções de 13/10/2026 (apresentação, documentos e carga de Pedidos)
+
+Somente no ERP, sem commit nesta rodada. Diagnóstico completo em `diagnostico-carga-pedidos.md`.
+
+- **Carga:** carga completa interrompida retoma do último cursor confirmado; checkpoint não regride; “sincronizar
+  tudo” não repete recurso negado em 24 h; mensagens de 403 sanitizadas.
+- **Visão Geral:** fases de carga separadas (concluída / em andamento / acesso negado / erro / não iniciada); some
+  o “12/12”. Registros locais de carga em andamento aparecem como “(parcial)”.
+- **Pedidos:** valor desconhecido de pedido incompleto sai `null` (“—, dados incompletos”), zero real preservado;
+  ações incompatíveis (pedido cancelado, itens incompletos) vêm da API em `operational.actions` e aparecem
+  desabilitadas com motivo (o backend continua recusando com 409); referências com nome ou “Cadastro não
+  disponível” (ID só como dado técnico); três datas distintas (pedido, alteração no Mercos, sincronização).
+- **Indicadores:** “valor vendido” = só pedidos (exclui cancelados e orçamentos); contagem do filtro informa a
+  composição; totais “parciais” enquanto a carga de Pedidos não termina.
+- **Documentos:** CPF/CNPJ digitados em nomes de cliente são removidos da resposta da API para perfis sem
+  `pii:read` (listas, detalhe, resumo, relatório CSV) e a busca desses perfis não casa dígitos longos com nomes.
+
+## Atualização automática e conciliação (13/10/2026, local, sem commit)
+
+Carga em fatias com continuação por recurso; job reassumido não refaz o que já concluiu; hidratação de itens
+em paralelo à carga; ciclo incremental sem operador comprovado em teste; conciliação ERP × BI somente leitura.
+Detalhes e limites em `diagnostico-carga-pedidos.md` (seção 8). O avanço real em produção **não** foi observado.

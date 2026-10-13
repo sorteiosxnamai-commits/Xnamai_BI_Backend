@@ -4,10 +4,12 @@ Nada é fabricado; a referência fica explícita como pendente e some quando o
 recurso dependente chega na próxima carga.
 """
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import distinct, exists, func, select
 from sqlalchemy.orm import Session
 
 from app.erp.models import commercial as m
+from app.erp.models.core import ErpSyncCheckpoint
+from app.erp.services.order_operations import unresolved_reason
 
 
 def _count(db: Session, connection_id: str, source_col, target_model, key_col, *extra) -> int:
@@ -30,7 +32,27 @@ def _count(db: Session, connection_id: str, source_col, target_model, key_col, *
     )
 
 
+def _distinct(db: Session, connection_id: str, source_col, target_model, key_col) -> int:
+    parent = source_col.class_
+    return int(
+        db.scalar(
+            select(func.count(distinct(source_col)))
+            .select_from(parent)
+            .where(
+                parent.connection_id == connection_id,
+                source_col.is_not(None),
+                ~exists().where(target_model.connection_id == connection_id, key_col == source_col),
+            )
+        )
+        or 0
+    )
+
+
 def pending_references(db: Session, connection_id: str) -> list[dict]:
+    statuses = {
+        cp.resource: cp.status
+        for cp in db.scalars(select(ErpSyncCheckpoint).where(ErpSyncCheckpoint.connection_id == connection_id))
+    }
     checks = [
         ("orders", "customerId", "customers", m.ErpSalesOrder.customer_external_id,
          m.ErpCustomer, m.ErpCustomer.external_id),
@@ -56,7 +78,14 @@ def pending_references(db: Session, connection_id: str) -> list[dict]:
     for resource, field, target, column, model, key in checks:
         count = _count(db, connection_id, column, model, key)
         if count:
+            # motivo só com evidência registrada: carga do alvo (403/andamento) ou ausência no que já veio.
+            # "not_in_synced_data" NÃO se resolve terminando a carga de pedidos.
+            code, reason = unresolved_reason(statuses.get(target))
             result.append(
-                {"resource": resource, "field": field, "target": target, "pending": count}
+                {
+                    "resource": resource, "field": field, "target": target, "pending": count,
+                    "distinctIds": _distinct(db, connection_id, column, model, key),
+                    "reasonCode": code, "reason": reason,
+                }
             )
     return result

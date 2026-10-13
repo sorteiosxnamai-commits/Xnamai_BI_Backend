@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.erp.common import as_utc, utcnow
+from app.erp.common import sanitize_remote_message, as_utc, utcnow
 from app.erp.config import erp_settings
 from app.erp.models.core import ErpCapability
 
@@ -310,7 +310,7 @@ def build_matrix(db: Session, connection_id: str) -> list[dict]:
                 "implementedInErp": item.implemented,
                 "enabled": enabled,
                 "lastValidatedAt": validated.isoformat() if validated else None,
-                "reason": row.reason or why or item.reason or None,
+                "reason": sanitize_remote_message(row.reason) or why or item.reason or None,
                 "source": item.source or None,
             }
         )

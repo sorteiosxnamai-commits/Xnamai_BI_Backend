@@ -1,5 +1,7 @@
 """Integração: status, jobs de sync, execuções, operações, conflitos e inventário."""
 
+from datetime import date, datetime
+
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
@@ -9,7 +11,8 @@ from app.erp import capabilities, outbox, queue
 from app.erp import serializers as ser
 from app.erp.audit import audit
 from app.erp.auth import ErpUser, require
-from app.erp.common import http_error, iso, paginate, utcnow
+from app.erp.services.sync_phase import sync_phase
+from app.erp.common import as_utc, http_error, iso, paginate, sanitize_remote_message, utcnow
 from app.erp.config import erp_settings
 from app.erp.db import erp_db
 from app.erp.integrations.mercos_client import AdaptorError, MercosAdaptorClient
@@ -32,6 +35,7 @@ def cid() -> str:
 def _checkpoint(row) -> dict:
     return {
         "status": row.status,
+        "phase": sync_phase(row.status, row.last_success_at),
         "cursor": row.cursor,
         "transportCursor": row.transport_cursor,
         "dataThrough": iso(row.data_through),
@@ -40,7 +44,7 @@ def _checkpoint(row) -> dict:
         "records": row.records,
         "unresolved": row.unresolved,
         "retryAfter": iso(row.retry_after),
-        "error": row.error,
+        "error": sanitize_remote_message(row.error),
     }
 
 
@@ -66,10 +70,23 @@ def integration_status(
             .group_by(core.ErpFieldInventory.resource)
         ).all()
     )
+    matrix = {item["key"]: item for item in capabilities.build_matrix(db, connection)}
     resources = []
     for alias in SYNC_ORDER:
         definition = REGISTRY[alias]
         row = checkpoints.get(alias)
+        cap = matrix.get(f"read.{alias}", {})
+        last_incremental = db.scalar(
+            select(core.ErpSyncRun)
+            .where(
+                core.ErpSyncRun.connection_id == connection,
+                core.ErpSyncRun.resource == alias,
+                core.ErpSyncRun.mode == "incremental",
+                core.ErpSyncRun.status == "success",
+            )
+            .order_by(core.ErpSyncRun.id.desc())
+            .limit(1)
+        )
         local = int(
             db.scalar(
                 select(func.count(definition.model.id)).where(
@@ -83,9 +100,29 @@ def integration_status(
                 "resource": alias,
                 "label": definition.label,
                 "upstream": f"{definition.upstream} ({definition.version})",
-                "localRecords": local if row and row.last_success_at else None,
+                "localRecords": local if (row and row.last_success_at) or local else None,
+                "localRecordsPartial": bool(local) and not (row and row.last_success_at),
                 "unmappedFields": int(unmapped.get(alias, 0)),
-                **(_checkpoint(row) if row else {"status": "never"}),
+                **(_checkpoint(row) if row else {"status": "never", "phase": "not_started"}),
+                # quatro coisas diferentes: implementado no ERP, habilitado, permitido na conta e carga concluída
+                "capability": {
+                    "implementedInErp": cap.get("implementedInErp"),
+                    "enabled": cap.get("enabled"),
+                    "accountAccess": cap.get("accountAccess"),
+                    "supportedByAdaptor": cap.get("supportedByAdaptor"),
+                    "reason": cap.get("reason"),
+                },
+                "lastIncremental": (
+                    {
+                        "finishedAt": iso(last_incremental.finished_at),
+                        "received": last_incremental.received,
+                        "persisted": last_incremental.persisted,
+                        "unchanged": last_incremental.unchanged,
+                        "cursorAfter": last_incremental.cursor_after,
+                    }
+                    if last_incremental
+                    else None
+                ),
             }
         )
     jobs = dict(
@@ -103,7 +140,7 @@ def integration_status(
         "resources": resources,
         "jobs": {k: int(v) for k, v in jobs.items()},
         "pendingReferences": pending_references(db, connection),
-        "capabilities": capabilities.build_matrix(db, connection),
+        "capabilities": list(matrix.values()),
     }
 
 
@@ -123,6 +160,37 @@ def _job(job: core.ErpJob) -> dict:
         "finishedAt": iso(job.finished_at),
         "statusUrl": f"/api/v1/erp/integration/jobs/{job.id}",
     }
+
+
+@router.get("/diagnostics/orders", summary="Diagnóstico somente leitura da carga de Pedidos")
+def orders_diagnostics(
+    user: ErpUser = Depends(require("integration:read")), db: Session = Depends(erp_db)
+):
+    from app.erp.services import load_diagnostics
+
+    return load_diagnostics.orders_load(db, cid())
+
+
+@router.get("/reconciliation/{resource}", summary="Conciliação somente leitura entre o espelho do ERP e o BI")
+def reconciliation(
+    resource: str,
+    dateFrom: date | None = None,
+    dateTo: date | None = None,
+    asOf: datetime | None = None,
+    sample: int = Query(10, ge=1, le=50),
+    user: ErpUser = Depends(require("integration:read")),
+    db: Session = Depends(erp_db),
+):
+    from app.erp.services import reconciliation as rec
+
+    if resource not in rec.RESOURCES:
+        raise http_error(404, "unknown_resource", "Recurso sem conciliação", allowed=list(rec.RESOURCES))
+    if dateFrom and dateTo and dateTo < dateFrom:
+        raise http_error(422, "invalid_period", "A data final não pode ser anterior à inicial")
+    return rec.reconcile(
+        db, cid(), resource, user=user, date_from=dateFrom, date_to=dateTo,
+        as_of=as_utc(asOf) if asOf else None, sample=sample,
+    )
 
 
 @router.post("/sync", status_code=202, summary="Agenda sincronização (nunca lê catálogo na requisição)")
@@ -202,7 +270,7 @@ def _run(run: core.ErpSyncRun) -> dict:
         "persisted": run.persisted,
         "unchanged": run.unchanged,
         "quarantined": run.quarantined,
-        "error": run.error,
+        "error": sanitize_remote_message(run.error),
     }
 
 

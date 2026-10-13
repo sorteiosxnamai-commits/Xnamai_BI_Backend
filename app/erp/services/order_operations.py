@@ -17,10 +17,11 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.erp import serializers as ser
+from app.erp.services import order_rules
 from app.erp.common import http_error
 from app.erp.models import commercial as m
 from app.erp.models.core import ErpAuditEvent, ErpOperation, ErpSyncCheckpoint
@@ -42,6 +43,8 @@ class OrderFilters:
     date_to: date | None = None
     # preenchidos pelos provedores de estado (frete/fiscal) quando existirem
     extra: tuple[tuple[str, str], ...] = ()
+    # perfil sem `pii:read`: a busca não casa dígitos longos contra nomes (CPF/CNPJ embutidos)
+    restricted: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -90,13 +93,16 @@ def apply_filters(query, connection_id: str, f: OrderFilters):
     query = query.where(M.connection_id == connection_id)
     if f.search and f.search.strip():
         text = f.search.strip()
+        # sem `pii:read`, qualquer dígito no termo desliga a busca por nome: fragmentos curtos
+        # de CPF/CNPJ embutido no nome permitiriam descobri-lo por tentativa (oráculo de busca)
+        name_search = not (f.restricted and any(ch.isdigit() for ch in text))
         query = query.where(
             or_(
                 _like(M.number, text),
                 exists().where(
                     C.connection_id == connection_id,
                     C.external_id == M.customer_external_id,
-                    _like(C.name, text),
+                    _like(C.name, text) if name_search else False,
                 ),
                 exists().where(
                     Item.order_id == M.id,
@@ -144,6 +150,51 @@ def operational_state(order) -> dict:
     if order.kind == "order":
         return {"code": "in_progress", "label": "Em andamento"}
     return {"code": "unclassified", "label": "Sem classificação"}
+
+
+REFERENCE_SPECS = (
+    ("customer", "customers", m.ErpCustomer, "customer_external_id"),
+    ("seller", "users", m.ErpSeller, "seller_external_id"),
+    ("paymentCondition", "payment-conditions", m.ErpPaymentCondition, "payment_condition_external_id"),
+    ("priceTable", "price-tables", m.ErpPriceTable, "price_table_external_id"),
+    ("carrier", "carriers", m.ErpCarrier, "carrier_external_id"),
+    ("orderType", "order-types", m.ErpOrderType, "order_type_external_id"),
+    ("commercialPolicy", "commercial-policies", m.ErpCommercialPolicy, "commercial_policy_external_id"),
+)
+
+
+def unresolved_reason(status: str | None) -> tuple[str, str]:
+    """Por que um cadastro referenciado não está disponível, só com evidência já registrada."""
+    if status in ("forbidden", "unavailable"):
+        return "access_denied", "A leitura deste cadastro foi negada pelo Mercos (HTTP 403) nesta conta"
+    if status in (None, "never", "running", "queued", "waiting_rate_limit", "interrupted"):
+        return "loading", "Este cadastro ainda não terminou de sincronizar"
+    return "not_in_synced_data", "Não consta no cadastro já sincronizado (pode ser um cadastro antigo ou removido na origem)"
+
+
+def resolve_references(db: Session, connection_id: str, order, user) -> dict[str, dict]:
+    """Nome de cada referência do pedido quando o cadastro existe; senão o motivo, sem inventar."""
+    checkpoints = {
+        cp.resource: cp.status
+        for cp in db.scalars(select(ErpSyncCheckpoint).where(ErpSyncCheckpoint.connection_id == connection_id))
+    }
+    out: dict[str, dict] = {}
+    for key, resource, model, attr in REFERENCE_SPECS:
+        ref_id = getattr(order, attr)
+        if ref_id in (None, ""):
+            out[key] = {"id": None, "name": None, "state": "absent", "reasonCode": None, "reason": None}
+            continue
+        row = db.scalar(select(model).where(model.connection_id == connection_id, model.external_id == ref_id))
+        if row is not None:
+            name = ser.label(row.name, user) if key == "customer" else row.name
+            out[key] = {"id": ref_id, "name": name, "state": "resolved", "reasonCode": None, "reason": None}
+            continue
+        code, reason = unresolved_reason(checkpoints.get(resource))
+        if str(ref_id) == "0":
+            # o contrato do Mercos não confirma que 0 signifique "sem cadastro": não é tratado como ausência
+            code, reason = "zero_id_unconfirmed", "O Mercos enviou o ID 0; não há confirmação de que isso signifique ausência"
+        out[key] = {"id": ref_id, "name": None, "state": "unavailable", "reasonCode": code, "reason": reason}
+    return out
 
 
 def _pendencies(order, customers: dict[str, str]) -> list[dict]:
@@ -246,7 +297,7 @@ def summarize_page(db: Session, connection_id: str, orders: list, user) -> dict[
     ids = [o.external_id for o in orders]
     customer_ids = [o.customer_external_id for o in orders if o.customer_external_id]
     customers = {
-        c.external_id: c.name
+        c.external_id: ser.label(c.name, user)
         for c in db.scalars(
             select(m.ErpCustomer).where(
                 m.ErpCustomer.connection_id == connection_id,
@@ -286,11 +337,14 @@ def summarize_page(db: Session, connection_id: str, orders: list, user) -> dict[
             "state": operational_state(order),
             "itemsPreview": previews.get(order.id, []),
             "totals": {
-                "gross": ser.money(order.gross_total),
-                "discount": ser.money(order.discount_total),
-                "freight": ser.money(order.freight_total),
-                "net": ser.money(order.net_total),
+                "gross": None if ser.totals_unknown(order) else ser.money(order.gross_total),
+                "discount": None if ser.totals_unknown(order) else ser.money(order.discount_total),
+                "freight": None if ser.totals_unknown(order) else ser.money(order.freight_total),
+                "net": None if ser.totals_unknown(order) else ser.money(order.net_total),
+                "unknown": ser.totals_unknown(order),
             },
+            # elegibilidade para ações locais: mesma regra que o backend aplica ao recusar
+            "actions": order_rules.availability(order),
             "pendencies": _pendencies(order, customers),
             "lastExternalUpdateAt": ser.iso(order.source_updated_at or order.captured_at),
             "lastHumanAction": human.get(order.external_id),
@@ -396,6 +450,30 @@ def operational_summary(db: Session, connection_id: str, f: OrderFilters) -> dic
         select(M.payment_status, func.count()).where(M.id.in_(select(filtered.c.id))).group_by(M.payment_status)
     ):
         by_payment[status or "unknown"] = int(total)
+    unknown_total = and_(filtered.c.items_complete.is_(False), func.coalesce(filtered.c.net_total, 0) == 0)
+    by_kind_values: dict[str, dict] = {}
+    unknown_sold = 0
+    for kind, total, net, unknown in db.execute(
+        select(
+            filtered.c.kind, func.count(), func.coalesce(func.sum(filtered.c.net_total), 0),
+            func.coalesce(func.sum(case((unknown_total, 1), else_=0)), 0),
+        ).group_by(filtered.c.kind)
+    ):
+        by_kind_values[kind or "unknown"] = {"count": int(total), "net": ser.money(Decimal(str(net or 0)))}
+        if kind == "order":
+            unknown_sold = int(unknown or 0)
+    sold = by_kind_values.get("order", {"count": 0, "net": ser.money(ZERO)})
+    span = db.execute(
+        select(
+            func.min(M.issue_date), func.max(M.issue_date),
+            func.max(M.source_updated_at), func.max(M.captured_at),
+        ).where(M.id.in_(select(filtered.c.id)))
+    ).one()
+    orders_cp = db.scalar(
+        select(ErpSyncCheckpoint).where(
+            ErpSyncCheckpoint.connection_id == connection_id, ErpSyncCheckpoint.resource == "orders"
+        )
+    )
     sections = {
         name: provider(db, connection_id, select(filtered.c.id)) for name, provider in SUMMARY_SECTIONS.items()
     }
@@ -410,7 +488,22 @@ def operational_summary(db: Session, connection_id: str, f: OrderFilters) -> dic
         "values": {
             "net": ser.money(current["net"]),
             "gross": ser.money(current["gross"]),
-            "note": "Valor vendido (pedidos e orçamentos filtrados); não é valor recebido.",
+            "note": "Soma de pedidos, orçamentos e cancelados do filtro; não é valor recebido.",
+            # "vendido" exclui cancelados e orçamentos; o total acima os inclui
+            "sold": {**sold, "excludes": ["cancelled", "quote"], "unknownTotals": unknown_sold},
+            "byKind": by_kind_values,
+        },
+        # três datas diferentes: do pedido, da última alteração no Mercos e da gravação local
+        "dates": {
+            "orderDate": {"min": span[0].isoformat() if span[0] else None, "max": span[1].isoformat() if span[1] else None},
+            "sourceUpdatedAtMax": ser.iso(span[2]),
+            "capturedAtMax": ser.iso(span[3]),
+            "checkpoint": {
+                "status": orders_cp.status if orders_cp else "never",
+                "cursor": orders_cp.cursor if orders_cp else None,
+                "dataThrough": ser.iso(orders_cp.data_through) if orders_cp else None,
+                "lastAttemptAt": ser.iso(orders_cp.last_attempt_at) if orders_cp else None,
+            },
         },
         "variation": _variation(db, connection_id, f, current, coverage),
         "payment": {"byStatus": by_payment, "pix": {"available": False, "reason": "Sem provedor de Pix"}},

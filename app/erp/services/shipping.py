@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from app.erp import serializers as ser
 from app.erp.audit import audit
 from app.erp.auth import ErpUser
+from app.erp.services import order_rules
 from app.erp.common import as_utc, http_error, plain_decimal, utcnow
 from app.erp.models import commercial as m
 from app.erp.models import operations as op
@@ -198,13 +199,9 @@ def create_quote(
     if body.mode == "automatic":
         raise http_error(409, "provider_unavailable", PROVIDER["reason"], provider=PROVIDER)
     order = _order(db, connection_id, order_id)
-    if order.kind == "cancelled":
-        raise http_error(409, "order_cancelled", "Pedido cancelado não recebe cotação de frete")
-    if not order.items_complete:
-        raise http_error(
-            409, "items_incomplete",
-            "Itens do pedido ainda não foram sincronizados; a cotação depende da lista completa",
-        )
+    blocked = order_rules.block(order, "shipping")
+    if blocked:
+        raise http_error(409, *blocked)
     quote = op.ErpShippingQuote(
         connection_id=connection_id,
         order_external_id=order_id,

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -38,6 +39,49 @@ def parse_source_instant(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=BR_TZ)
     return parsed.astimezone(timezone.utc)
+
+
+_SECRET_RE = re.compile(
+    r"(?i)(api[-_ ]?key|x-api-key|token|authorization|secret|senha|password)(\s*[:=]\s*)([^\s,;}\"']+)"
+)
+_LONG_BLOB_RE = re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}\b")
+
+
+def sanitize_remote_message(message: Any, limit: int = 240) -> str | None:
+    """Texto curto e seguro de um erro devolvido por sistema externo.
+
+    Extrai o campo legível (`error`/`message`/`detail`) quando a resposta é JSON, mascara
+    chaves/tokens e sequências longas e limita o tamanho. Nunca devolve o corpo bruto."""
+    if message in (None, ""):
+        return None
+    text = str(message).strip()
+    start = text.find("{")
+    if start != -1:
+        try:
+            body = json.loads(text[start:])
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            for key in ("error", "message", "detail", "mensagem"):
+                if isinstance(body.get(key), str) and body[key].strip():
+                    text = (text[:start].rstrip(": ") + ": " if text[:start].strip(": ") else "") + body[key].strip()
+                    break
+    text = _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[oculto]", text)
+    text = _LONG_BLOB_RE.sub("[oculto]", text)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def cursor_not_before(new: str | None, current: str | None) -> bool:
+    """True se `new` não é anterior a `current` (cursor de checkpoint nunca regride)."""
+    if not new:
+        return False
+    if not current:
+        return True
+    a, b = parse_source_instant(new), parse_source_instant(current)
+    if a is None or b is None:
+        return str(new) >= str(current)
+    return a >= b
 
 
 def parse_source_date(value: Any) -> date | None:

@@ -37,6 +37,9 @@ class ErpSettings(BaseSettings):
     erp_sync_max_pages: int = 5000
     erp_reconcile_window_hours: int = 24
     erp_job_lease_seconds: int = 300
+    # Um job de sincronização cede a vez depois deste tempo (0 desliga): grava o progresso, devolve o
+    # recurso à fila e deixa os demais recursos, a hidratação, a saída de escrita e os webhooks andarem.
+    erp_sync_slice_seconds: float = 240.0
     erp_worker_poll_seconds: float = 2.0
     # O scheduler do BI (já ativo no serviço web) esvazia a fila do ERP a cada 30 s.
     # Dispensa serviço de worker separado; desligue se um worker dedicado for usado.

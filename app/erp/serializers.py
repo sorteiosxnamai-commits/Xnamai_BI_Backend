@@ -6,6 +6,7 @@ pessoais, documentos e links financeiros dependem de permissão. O payload bruto
 de origem nunca sai por estes serializadores.
 """
 
+import re
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -20,6 +21,37 @@ def mask(value: str | None, keep: int = 2) -> str | None:
     if keep <= 0 or len(value) <= keep:
         return "•" * len(value)
     return "•" * (len(value) - keep) + value[-keep:]
+
+
+_ID_PATTERNS = (
+    re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b"),  # CNPJ
+    re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),  # CPF
+    re.compile(r"\b\d{2}\.\d{3}\.\d{3}\b"),  # base de CNPJ pontuada
+    re.compile(r"\b\d{8,}\b"),  # qualquer sequência longa de dígitos
+)
+
+
+def redact_ids(text: str | None) -> str | None:
+    """Remove CPF/CNPJ digitados dentro de nomes (o cadastro Mercos aceita isso)."""
+    if not text:
+        return text
+    for pattern in _ID_PATTERNS:
+        text = pattern.sub("•••", text)
+    return " ".join(text.split())
+
+
+def label(text: str | None, user: ErpUser | None) -> str | None:
+    """Nome de exibição: sem `pii:read`, documentos embutidos no texto saem da resposta."""
+    if user is not None and user.can("pii:read"):
+        return text
+    return redact_ids(text)
+
+
+def totals_unknown(row: Any) -> bool:
+    """Pedido sem itens e com total zero/ausente: o zero é "não sei", não um valor real.
+
+    Zero real de pedido completo é preservado (ele só vale quando os itens chegaram)."""
+    return not row.items_complete and not (row.net_total or 0)
 
 
 def _d(value: date | None) -> str | None:
@@ -40,8 +72,8 @@ def customer(row: Any, user: ErpUser, *, detail: bool = False, contacts=None, ad
     data = {
         "id": row.external_id,
         "localId": row.id,
-        "name": row.name,
-        "tradeName": row.trade_name,
+        "name": label(row.name, user),
+        "tradeName": label(row.trade_name, user),
         "personType": row.person_type,
         "document": row.document if pii else mask(row.document),
         "city": row.city,
@@ -154,6 +186,7 @@ def product_price(row: Any) -> dict:
 
 
 def order(row: Any, user: ErpUser, *, detail: bool = False, items=None) -> dict:
+    unknown = totals_unknown(row)
     data = {
         "id": row.external_id,
         "localId": row.id,
@@ -163,9 +196,10 @@ def order(row: Any, user: ErpUser, *, detail: bool = False, items=None) -> dict:
         "sellerId": row.seller_external_id,
         "issuedAt": iso(row.issued_at),
         "issueDate": _d(row.issue_date),
-        "netTotal": money(row.net_total),
-        "grossTotal": money(row.gross_total),
-        "discountTotal": money(row.discount_total),
+        "netTotal": None if unknown else money(row.net_total),
+        "grossTotal": None if unknown else money(row.gross_total),
+        "discountTotal": None if unknown else money(row.discount_total),
+        "totalsUnknown": unknown,
         "itemCount": row.item_count,
         "itemsComplete": row.items_complete,
         # Estados separados: nunca colapsar em um único "status".
@@ -186,7 +220,7 @@ def order(row: Any, user: ErpUser, *, detail: bool = False, items=None) -> dict:
             carrierId=row.carrier_external_id,
             commercialPolicyId=row.commercial_policy_external_id,
             expectedDeliveryDate=_d(row.expected_delivery_date),
-            freightTotal=money(row.freight_total),
+            freightTotal=None if unknown else money(row.freight_total),
             # texto livre, endereço de entrega e extras podem conter dados pessoais
             notes=row.notes if pii else None,
             shippingAddress=row.shipping_address if pii else None,

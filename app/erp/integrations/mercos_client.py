@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.erp.common import sanitize_remote_message
 from app.erp.config import erp_settings
 
 READ_ALIASES = (
@@ -209,7 +210,7 @@ class MercosAdaptorClient:
         if response.status_code == 403:
             raise AdaptorError(
                 "forbidden",
-                f"Acesso negado (403) em {alias}: {_detail(response)}",
+                f"Acesso negado (403) em {alias}: {sanitize_remote_message(_detail(response)) or 'sem detalhe'}",
                 status_code=403,
             )
         if response.status_code == 404:
