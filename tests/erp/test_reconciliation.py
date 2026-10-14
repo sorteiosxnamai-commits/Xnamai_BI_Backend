@@ -180,3 +180,27 @@ def test_item_and_customer_lookups_are_scoped_to_the_compared_orders(both):
     """Pedido fora do período não influencia a conferência (itens/clientes só do escopo)."""
     out = get("/orders", dateFrom="2026-11-01", dateTo="2026-11-30").json()
     assert out["erp"]["count"] == 0 and out["divergences"] == []
+
+
+def test_a_different_date_basis_is_not_reported_as_a_missing_record(both):
+    """Pedido dentro do período de um lado e fora no outro existe nos dois: não é 'falta', é critério de data."""
+    with session_scope() as db:
+        db.add(ErpSalesOrder(connection_id=C, external_id="d1", number="d1", kind="order", net_total=Decimal("5.00"),
+                             gross_total=Decimal("5.00"), discount_total=Decimal("0"), customer_external_id="c1",
+                             issue_date=date(2026, 10, 3), items_complete=False, source_updated_at=at(5), commercial_status="2"))
+        db.add(bi.Order(mercos_id="d1", number="d1", customer_mercos_id="c1", status="2",
+                        issued_at=datetime(2026, 10, 20, 15, tzinfo=timezone.utc), total=Decimal("5.00"), net_total=Decimal("5.00"),
+                        gross_total=Decimal("5.00"), discount_value=Decimal("0"), item_count=0, source_updated_at=at(5)))
+        db.add(bi.Order(mercos_id="d2", number="d2", customer_mercos_id="c1", status="2",
+                        issued_at=datetime(2026, 10, 3, 15, tzinfo=timezone.utc), total=Decimal("5.00"), net_total=Decimal("5.00"),
+                        gross_total=Decimal("5.00"), discount_value=Decimal("0"), item_count=0, source_updated_at=at(5)))
+        db.add(ErpSalesOrder(connection_id=C, external_id="d2", number="d2", kind="order", net_total=Decimal("5.00"),
+                             gross_total=Decimal("5.00"), discount_total=Decimal("0"), customer_external_id="c1",
+                             issue_date=date(2026, 10, 25), items_complete=False, source_updated_at=at(5), commercial_status="2"))
+    body = get("/orders", dateFrom="2026-10-03", dateTo="2026-10-03", sample=50).json()
+    codes = by_code(body)
+    basis = codes["date_basis_difference"]
+    assert basis["count"] == 2 and basis["explained"] == 2 and basis["unexplained"] == 0
+    assert {s["id"] for s in basis["samples"]} == {"d1", "d2"}
+    assert "d1" not in {s["id"] for s in codes.get("only_in_erp", {"samples": []})["samples"]}
+    assert "d2" not in {s["id"] for s in codes.get("only_in_bi", {"samples": []})["samples"]}

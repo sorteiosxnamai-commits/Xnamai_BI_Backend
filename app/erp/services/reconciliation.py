@@ -50,6 +50,11 @@ class ScopeTooLarge(Exception):
         self.rows = rows
 
 CATALOG = {
+    "date_basis_difference": (
+        "Existe nos dois lados, mas a data do pedido cai fora do período em um deles",
+        "A contagem do período difere por critério de data (data de emissão como dia no ERP; instante no BI), sem divergência de dados",
+        "Nenhuma: comparar pelo ID sem período. Não é falha de carga.",
+    ),
     "only_in_erp": (
         "Registro existe no ERP e não no BI",
         "O BI usa outra janela/carga ou ainda não importou",
@@ -285,7 +290,7 @@ def _orders(db, connection_id, date_from, date_to, as_of, erp_at, bi_at, sample)
     low, high = _bounds(date_from, date_to)
     erp_q = select(
         E.external_id, E.number, E.kind, E.net_total, E.gross_total, E.discount_total, E.item_count,
-        E.items_complete, E.customer_external_id, E.seller_external_id, E.source_updated_at, E.id,
+        E.items_complete, E.customer_external_id, E.seller_external_id, E.source_updated_at, E.id, E.issue_date,
     ).where(E.connection_id == connection_id, E.source_deleted.is_(False))
     bi_q = select(
         B.c.mercos_id, B.c.number, B.c.status, B.c.net_total, B.c.total, B.c.gross_total, B.c.discount_value, B.c.discount,
@@ -350,15 +355,41 @@ def _orders(db, connection_id, date_from, date_to, as_of, erp_at, bi_at, sample)
     def iso(value):
         return value.isoformat() if value else None
 
-    for key in erp.keys() - biw.keys():
+    # "ausente" só se o registro não existir no outro lado NEM fora do período/instante: antes de chamar de
+    # falta, procura o ID sem o filtro de datas (critério de data diferente não é dado faltando)
+    erp_only, bi_only = sorted(erp.keys() - biw.keys()), sorted(biw.keys() - erp.keys())
+    bi_elsewhere: dict = {}
+    for start in range(0, len(erp_only), 500):
+        chunk = erp_only[start : start + 500]
+        for r in db.execute(select(B.c.mercos_id, B.c.issued_at, B.c.source_updated_at).where(B.c.mercos_id.in_(chunk))):
+            bi_elsewhere[r[0]] = r
+    erp_elsewhere: dict = {}
+    for start in range(0, len(bi_only), 500):
+        chunk = bi_only[start : start + 500]
+        for r in db.execute(select(E.external_id, E.issue_date, E.source_updated_at).where(
+                E.connection_id == connection_id, E.external_id.in_(chunk))):
+            erp_elsewhere[r[0]] = r
+    for key in erp_only:
         row = erp[key]
+        if key in bi_elsewhere:
+            buckets["date_basis_difference"].add(
+                {"id": key, "side": "só no ERP dentro do período", "erpIssueDate": iso(row[12]) if len(row) > 12 else None,
+                 "biIssuedAt": iso(bi_elsewhere[key][1])}, True, sample,
+                "o BI tem o registro, com outra data de pedido")
+            continue
         lagging = bi_at is None or (row[10] is not None and as_utc(row[10]) > bi_at)
         buckets["only_in_erp"].add(
             {"id": key, "number": row[1], "erpUpdatedAt": iso(row[10])}, lagging, sample,
             "o BI ainda não alcançou este instante" if lagging else None,
         )
-    for key in biw.keys() - erp.keys():
+    for key in bi_only:
         row = biw[key]
+        if key in erp_elsewhere:
+            buckets["date_basis_difference"].add(
+                {"id": key, "side": "só no BI dentro do período", "erpIssueDate": iso(erp_elsewhere[key][1]),
+                 "biUpdatedAt": iso(row[11])}, True, sample,
+                "o ERP tem o registro, com outra data de pedido")
+            continue
         lagging = erp_at is None or (row[11] is not None and as_utc(row[11]) > erp_at)
         buckets["only_in_bi"].add(
             {"id": key, "number": row[1], "biUpdatedAt": iso(row[11])}, lagging, sample,
