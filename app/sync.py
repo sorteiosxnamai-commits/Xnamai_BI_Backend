@@ -11,7 +11,7 @@ from sqlalchemy import delete, func, select, text
 from app.adaptor import adaptor
 from app.database import SessionLocal
 from app.domain.order_status import VALID_SALE_STATUSES, status_sql_in
-from app.services.b2b_carts import observe_cart
+from app.services.b2b_carts import b2b_status, observe_cart
 from app.models import (
     Carrier,
     Category,
@@ -289,6 +289,7 @@ def _upsert_rows(db, resource: str, rows: list):
                 str(row.get("criador_id") or row.get("usuario_id") or row.get("vendedor_id") or "") or None
             )
             obj.status = str(row.get("status") if row.get("status") is not None else row.get("situacao") or "unknown")
+            obj.b2b_status = b2b_status(row.get("status_b2b"))
             obj.issued_at = dt(row.get("data_emissao") or row.get("data_criacao") or row.get("ultima_alteracao"))
             obj.total = f(row.get("total"))
             obj.discount = f(row.get("desconto"))

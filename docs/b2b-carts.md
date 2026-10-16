@@ -10,6 +10,14 @@ Pedidos V2 documenta `status_b2b`: null = não utiliza B2B, 1 = em aberto,
 2 = concluído. O Adaptor existente já usa V2 e preserva esses campos em `data`;
 o BI conserva o payload em `orders.raw`. Não é necessária uma rota Mercos inventada.
 
+O relatório consulta `orders.b2b_status`, extraído pela sincronização e indexado
+junto com a criação. A migração `20261016_02` preenche essa coluna a partir dos
+payloads já salvos, sem chamar o Mercos. Isso evita ler e descompactar repetidamente
+os JSONs completos a cada consulta do painel. A cobertura usa uma única agregação
+de colunas pequenas, e a data de carga vem do estado da sincronização de pedidos.
+Os indicadores macro aparecem antes dos filtros e permanecem com `—` em caso de
+erro, sem apresentar ausência de resposta como zero carrinhos.
+
 Fonte: https://docs.mercos.com/reference/v2pedidos
 
 Ainda falta validar na conta real se todos os carrinhos aparecem desde a primeira
