@@ -27,9 +27,23 @@ from app.services.analytics_v2 import (
     timeseries,
 )
 from app.services.price_savings import price_savings
+from app.services.b2b_carts import cart_report
 
 
 router = APIRouter(prefix="/api/v1/analytics", tags=["analytics"])
+
+
+@router.get("/b2b-carts")
+def get_b2b_carts(
+    abandonment_hours: int = Query(24, ge=1, le=8760, alias="abandonmentHours"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    stage: Literal["all", "open", "possible_abandonment", "converted", "completed_quote", "cancelled", "other"] = Query("all"),
+    filters: AnalyticsFilters = Depends(analytics_filters),
+    db: Session = Depends(db_session),
+):
+    return cart_report(db, filters, abandonment_hours=abandonment_hours,
+                       page=page, page_size=page_size, stage=stage)
 
 
 @router.get("/overview")

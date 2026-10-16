@@ -99,6 +99,20 @@ class Order(Base):
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class B2bCartObservation(Base):
+    """Observed source versions, never inferred historical cart events."""
+
+    __tablename__ = "b2b_cart_observations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_mercos_id: Mapped[str] = mapped_column(String(80), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    b2b_status: Mapped[int | None] = mapped_column(Integer)
+    order_status: Mapped[str] = mapped_column(String(50))
+    total: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class OrderItem(Base):
     __tablename__ = "order_items"
     __table_args__ = (

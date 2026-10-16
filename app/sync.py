@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select, text
 from app.adaptor import adaptor
 from app.database import SessionLocal
 from app.domain.order_status import VALID_SALE_STATUSES, status_sql_in
+from app.services.b2b_carts import observe_cart
 from app.models import (
     Carrier,
     Category,
@@ -381,6 +382,7 @@ def _upsert_rows(db, resource: str, rows: list):
             obj.raw = row
             db.add(obj)
             db.flush()
+            observe_cart(db, obj)
             db.execute(delete(OrderItem).where(OrderItem.order_mercos_id == mid))
             for pos, item in enumerate(source_items):
                 q = f(item.get("quantidade"))
