@@ -244,7 +244,7 @@ Pedidos e orçamentos. Chave externa: `id`.
 | `carrier_external_id` | `transportadora_id` | ident |  |
 | `commercial_policy_external_id` | `politica_comercial_id` | ident |  |
 | `issued_at` | `data_emissao`, `data_criacao`, `ultima_alteracao` | _order_issue_instant |  |
-| `issue_date` | `data_emissao` | day | Data sem hora permanece data. |
+| `issue_date` | `data_emissao`, `data_criacao` | _order_issue_date | Emissão ou, se ausente, dia civil de criação na Mercos. |
 | `expected_delivery_date` | `data_entrega`, `previsao_entrega` | day |  |
 | `gross_total` | `total_bruto`, `valor_bruto` | convert |  |
 | `discount_total` | `valor_desconto`, `desconto_valor`, `desconto` | convert |  |

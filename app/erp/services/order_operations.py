@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.erp import serializers as ser
 from app.erp.services import order_rules
+from app.erp.services.order_dates import effective_issue_date
 from app.erp.common import http_error
 from app.erp.models import commercial as m
 from app.erp.models.core import ErpAuditEvent, ErpOperation, ErpSyncCheckpoint
@@ -127,9 +128,9 @@ def apply_filters(query, connection_id: str, f: OrderFilters):
     elif f.pending is False:
         query = query.where(~_pending_condition(connection_id))
     if f.date_from:
-        query = query.where(M.issue_date >= f.date_from)
+        query = query.where(effective_issue_date(M) >= f.date_from)
     if f.date_to:
-        query = query.where(M.issue_date <= f.date_to)
+        query = query.where(effective_issue_date(M) <= f.date_to)
     for name, value in f.extra:
         provider = FILTER_PROVIDERS.get(name)
         if provider is None:
@@ -465,7 +466,7 @@ def operational_summary(db: Session, connection_id: str, f: OrderFilters) -> dic
     sold = by_kind_values.get("order", {"count": 0, "net": ser.money(ZERO)})
     span = db.execute(
         select(
-            func.min(M.issue_date), func.max(M.issue_date),
+            func.min(effective_issue_date(M)), func.max(effective_issue_date(M)),
             func.max(M.source_updated_at), func.max(M.captured_at),
         ).where(M.id.in_(select(filtered.c.id)))
     ).one()

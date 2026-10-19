@@ -16,6 +16,7 @@ from app.erp.models import (
     ErpSyncRun,
 )
 from app.erp.sync import engine
+from app.erp.registry import REGISTRY, map_row
 
 
 class FakeClient:
@@ -37,6 +38,14 @@ def page(rows, *, page_cursor=None, next_cursor=None, resource="customers"):
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def test_order_without_emission_date_uses_creation_day_for_period_filter():
+    mapped = map_row(REGISTRY["orders"], {
+        "id": 900, "status": 2, "data_criacao": "2026-10-03T01:30:00Z",
+        "ultima_alteracao": "2026-10-04T10:00:00Z",
+    })
+    assert mapped.values["issue_date"].isoformat() == "2026-10-02"
 
 
 @pytest.fixture(autouse=True)

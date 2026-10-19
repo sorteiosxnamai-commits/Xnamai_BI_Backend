@@ -19,7 +19,7 @@ from app.domain.order_status import (
     VALID_SALE_STATUSES,
     normalize_order_status,
 )
-from app.erp.common import parse_source_date, parse_source_instant, to_decimal
+from app.erp.common import BR_TZ, parse_source_date, parse_source_instant, to_decimal
 from app.erp.models import commercial as m
 
 # --- conversores ---------------------------------------------------------------
@@ -373,6 +373,13 @@ def _order_issue_instant(row: dict) -> datetime | None:
     return None
 
 
+def _order_issue_date(row: dict) -> date | None:
+    if row.get("data_emissao"):
+        return parse_source_date(row["data_emissao"])
+    created = parse_source_instant(row.get("data_criacao"))
+    return created.astimezone(BR_TZ).date() if created else None
+
+
 def _address_dict(value: Any) -> dict | None:
     return value if isinstance(value, dict) else None
 
@@ -402,8 +409,8 @@ ORDER_FIELDS = (
     Field("carrier_external_id", ("transportadora_id",), ident),
     Field("commercial_policy_external_id", ("politica_comercial_id",), ident),
     Field("issued_at", ("data_emissao", "data_criacao", "ultima_alteracao"), _order_issue_instant, True),
-    Field("issue_date", ("data_emissao",), day,
-          note="Data sem hora permanece data."),
+    Field("issue_date", ("data_emissao", "data_criacao"), _order_issue_date, True,
+          note="Emissão ou, se ausente, dia civil de criação na Mercos."),
     Field("expected_delivery_date", ("data_entrega", "previsao_entrega"), day),
     Field("gross_total", ("total_bruto", "valor_bruto"), _first_decimal("total_bruto", "valor_bruto"), True),
     Field("discount_total", ("valor_desconto", "desconto_valor", "desconto"),

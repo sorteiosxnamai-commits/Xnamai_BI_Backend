@@ -24,6 +24,7 @@ from app.erp import serializers as ser
 from app.erp.audit import audit
 from app.erp.auth import ErpUser
 from app.erp.services import order_rules
+from app.erp.services.order_dates import effective_issue_date
 from app.erp.common import BR_TZ, http_error, money
 from app.erp.models import commercial as m
 from app.erp.models import local as lo
@@ -331,9 +332,9 @@ def _sales(db, connection_id: str, start: date | None, end: date | None) -> tupl
         M.connection_id == connection_id, M.kind == "order"
     )
     if start:
-        query = query.where(M.issue_date >= start)
+        query = query.where(effective_issue_date(M) >= start)
     if end:
-        query = query.where(M.issue_date <= end)
+        query = query.where(effective_issue_date(M) <= end)
     count, total = db.execute(query).one()
     return int(count or 0), Decimal(str(total or 0))
 

@@ -150,6 +150,20 @@ def test_variation_uses_the_comparable_previous_period_and_handles_zero_base(see
     assert api("GET", "/finance/orders-summary", params={"dateFrom": "2026-10-31", "dateTo": "2026-10-01"}).status_code == 422
 
 
+def test_period_includes_imported_order_without_data_emissao(seeded):
+    from app.erp.models import ErpSalesOrder
+
+    with session_scope() as db:
+        row = db.scalar(select(ErpSalesOrder).where(ErpSalesOrder.external_id == "10"))
+        row.issue_date = None
+        row.source_created_at = datetime(2026, 10, 3, 1, 30, tzinfo=timezone.utc)
+
+    summary = api("GET", "/finance/orders-summary", params={"dateFrom": "2026-10-02", "dateTo": "2026-10-02"}).json()
+    assert summary["sales"]["net"] == "300.00"
+    orders = api("GET", "/sales-orders", params={"dateFrom": "2026-10-02", "dateTo": "2026-10-02"}).json()
+    assert any(row["id"] == "10" for row in orders["items"])
+
+
 def test_cash_period_uses_brasilia_day_not_utc(seeded):
     receivable(key="rec-key-brt000001")
     sid = settle(first_installment(), seeded, "10.00", "settle-brt-0001").json()["id"]

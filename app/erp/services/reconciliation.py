@@ -18,6 +18,7 @@ from app.erp import serializers as ser
 from app.erp.common import BR_TZ, as_utc, parse_source_instant
 from app.erp.models import commercial as m
 from app.erp.models.core import ErpSyncCheckpoint
+from app.erp.services.order_dates import effective_issue_date
 
 RESOURCES = ("orders", "customers", "products")
 
@@ -290,16 +291,16 @@ def _orders(db, connection_id, date_from, date_to, as_of, erp_at, bi_at, sample)
     low, high = _bounds(date_from, date_to)
     erp_q = select(
         E.external_id, E.number, E.kind, E.net_total, E.gross_total, E.discount_total, E.item_count,
-        E.items_complete, E.customer_external_id, E.seller_external_id, E.source_updated_at, E.id, E.issue_date,
+        E.items_complete, E.customer_external_id, E.seller_external_id, E.source_updated_at, E.id, effective_issue_date(E),
     ).where(E.connection_id == connection_id, E.source_deleted.is_(False))
     bi_q = select(
         B.c.mercos_id, B.c.number, B.c.status, B.c.net_total, B.c.total, B.c.gross_total, B.c.discount_value, B.c.discount,
         B.c.item_count, B.c.customer_mercos_id, B.c.seller_mercos_id, B.c.source_updated_at,
     )
     if date_from:
-        erp_q = erp_q.where(E.issue_date >= date_from)
+        erp_q = erp_q.where(effective_issue_date(E) >= date_from)
     if date_to:
-        erp_q = erp_q.where(E.issue_date <= date_to)
+        erp_q = erp_q.where(effective_issue_date(E) <= date_to)
     if low:
         bi_q = bi_q.where(B.c.issued_at >= low)
     if high:
@@ -366,7 +367,7 @@ def _orders(db, connection_id, date_from, date_to, as_of, erp_at, bi_at, sample)
     erp_elsewhere: dict = {}
     for start in range(0, len(bi_only), 500):
         chunk = bi_only[start : start + 500]
-        for r in db.execute(select(E.external_id, E.issue_date, E.source_updated_at).where(
+        for r in db.execute(select(E.external_id, effective_issue_date(E), E.source_updated_at).where(
                 E.connection_id == connection_id, E.external_id.in_(chunk))):
             erp_elsewhere[r[0]] = r
     for key in erp_only:
