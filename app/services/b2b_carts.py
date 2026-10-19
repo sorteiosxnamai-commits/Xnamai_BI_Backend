@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import case, func, select
+from sqlalchemy import String, case, cast, func, select
 
 from app.domain.order_status import (
     CANCELLED_ORDER_STATUSES,
@@ -18,6 +18,7 @@ from app.services.analytics_filters import (
     applied_filters,
     date_bounds,
     order_conditions,
+    data_through_timestamp,
 )
 
 
@@ -87,10 +88,8 @@ def cart_report(
 ):
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=abandonment_hours)
-    # This column is backfilled once by migration and maintained by sync.
-    # Repeated JSON extraction detoasts every large order payload in PostgreSQL.
-    source_status = Order.b2b_status
-    identified = source_status.in_((1, 2))
+    source_status = cast(Order.raw["status_b2b"].as_string(), String)
+    identified = source_status.in_(("1", "2"))
     # Never use issue date as cart creation date: it can change when converted.
     conditions = order_conditions(filters, bounds=(None, None))
     start, end = date_bounds(filters, now=now)
@@ -101,21 +100,21 @@ def cart_report(
     classification = case(
         (status_sql_in(Order.status, CANCELLED_ORDER_STATUSES), "cancelled"),
         (
-            (source_status == 2) & status_sql_in(Order.status, VALID_SALE_STATUSES),
+            (source_status == "2") & status_sql_in(Order.status, VALID_SALE_STATUSES),
             "converted",
         ),
         (
-            (source_status == 2) & status_sql_in(Order.status, QUOTE_ORDER_STATUSES),
+            (source_status == "2") & status_sql_in(Order.status, QUOTE_ORDER_STATUSES),
             "completed_quote",
         ),
         (
-            (source_status == 1)
+            (source_status == "1")
             & status_sql_in(Order.status, QUOTE_ORDER_STATUSES)
             & (Order.source_updated_at <= cutoff),
             "possible_abandonment",
         ),
         (
-            (source_status == 1) & status_sql_in(Order.status, QUOTE_ORDER_STATUSES),
+            (source_status == "1") & status_sql_in(Order.status, QUOTE_ORDER_STATUSES),
             "open",
         ),
         else_="other",
@@ -178,14 +177,16 @@ def cart_report(
         )
     ]
     matched = total if stage == "all" else groups[stage]["count"]
-    # A single scan of small columns for coverage, without loading raw JSON.
-    all_orders, all_b2b, undated = db.execute(
-        select(
-            func.count(Order.id),
-            func.count(case((identified, 1))),
-            func.count(case((identified & Order.source_created_at.is_(None), 1))),
+    all_orders = db.scalar(select(func.count(Order.id))) or 0
+    all_b2b = db.scalar(select(func.count(Order.id)).where(identified)) or 0
+    undated = (
+        db.scalar(
+            select(func.count(Order.id)).where(
+                identified, Order.source_created_at.is_(None)
+            )
         )
-    ).one()
+        or 0
+    )
     warnings = [
         "Cobertura de todos os carrinhos desde a primeira adição ainda não validada com o Mercos; os totais representam registros B2B recebidos pela API.",
         "Possível abandono = orçamento B2B em aberto sem alteração do registro há pelo menos "
@@ -226,7 +227,7 @@ def cart_report(
         "appliedFilters": applied_filters(filters),
         "metadata": {
             "generatedAt": now,
-            "dataThrough": sync.last_success_at if sync else None,
+            "dataThrough": data_through_timestamp(db),
             "isPartial": True,
             "warnings": warnings,
             "quality": {

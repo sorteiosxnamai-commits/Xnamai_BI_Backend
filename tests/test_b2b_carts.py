@@ -28,7 +28,6 @@ def add(db, mid, b2b, status="1", value=100, age=48, created=None):
         mercos_id=mid,
         number=mid,
         status=status,
-        b2b_status=b2b_status(b2b),
         total=Decimal(value),
         source_created_at=created or NOW - timedelta(days=3),
         issued_at=NOW - timedelta(days=400),
@@ -163,77 +162,6 @@ def test_backfill_is_idempotent_and_not_backdated(db):
     assert observation.observed_at.replace(tzinfo=timezone.utc) == NOW
     assert observation.b2b_status == 2
     assert db.scalar(select(func.count(B2bCartObservation.id))) == 1
-
-
-def test_report_never_reads_raw_order_payloads(db):
-    from sqlalchemy import event
-
-    add(db, "a", 1)
-    statements = []
-
-    def capture(conn, cursor, statement, parameters, context, executemany):
-        statements.append(statement)
-
-    event.listen(db.bind, "before_cursor_execute", capture)
-    try:
-        report = cart_report(db, AnalyticsFilters(period="all"), now=NOW)
-    finally:
-        event.remove(db.bind, "before_cursor_execute", capture)
-    assert report["summary"]["identified"]["count"] == 1
-    assert not any("raw" in sql.lower() for sql in statements)
-    assert len(statements) <= 4
-
-
-def test_status_migration_backfills_existing_raw_and_creates_index():
-    import json
-    from alembic.migration import MigrationContext
-    from alembic.operations import Operations
-    from sqlalchemy import inspect, text
-
-    # Load the repository migration without treating Alembic's installed package as our source tree.
-    import importlib.util
-    from pathlib import Path
-
-    spec = importlib.util.spec_from_file_location(
-        "b2b_status_migration",
-        Path(__file__).resolve().parents[1]
-        / "alembic/versions/20261016_02_index_b2b_status.py",
-    )
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
-    engine = create_engine("sqlite://")
-    with engine.begin() as connection:
-        connection.exec_driver_sql(
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, raw JSON, source_created_at DATETIME)"
-        )
-        payloads = [
-            {"status_b2b": 1},
-            {"status_b2b": "2"},
-            {"status_b2b": None},
-            {},
-            {"status_b2b": 3},
-        ]
-        for idx, payload in enumerate(payloads):
-            connection.execute(
-                text("INSERT INTO orders(id,raw) VALUES (:id,:raw)"),
-                {"id": idx, "raw": json.dumps(payload)},
-            )
-        with Operations.context(MigrationContext.configure(connection)):
-            migration.upgrade()
-        assert list(
-            connection.execute(
-                text("SELECT b2b_status FROM orders ORDER BY id")
-            ).scalars()
-        ) == [1, 2, None, None, None]
-        assert "ix_orders_b2b_created" in {
-            index["name"] for index in inspect(connection).get_indexes("orders")
-        }
-        with Operations.context(MigrationContext.configure(connection)):
-            migration.downgrade()
-        assert "b2b_status" not in {
-            column["name"] for column in inspect(connection).get_columns("orders")
-        }
-    engine.dispose()
 
 
 @pytest.mark.parametrize("value", [True, False, 3, "unknown", None, 1.5])

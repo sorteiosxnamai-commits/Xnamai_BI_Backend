@@ -64,16 +64,12 @@ class Seller(Base):
 
 class Order(Base):
     __tablename__ = "orders"
-    __table_args__ = (
-        Index("ix_orders_b2b_created", "b2b_status", "source_created_at"),
-    )
     id: Mapped[int] = mapped_column(primary_key=True)
     mercos_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     number: Mapped[str] = mapped_column(String(100), index=True)
     customer_mercos_id: Mapped[str | None] = mapped_column(String(80), index=True)
     seller_mercos_id: Mapped[str | None] = mapped_column(String(80), index=True)
     status: Mapped[str] = mapped_column(String(50), index=True)
-    b2b_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     issued_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), index=True
     )

@@ -14,7 +14,7 @@ from app.config import settings  # noqa: E402
 from app.database import SessionLocal  # noqa: E402
 from app.models import Order  # noqa: E402
 from app.schemas.analytics import AnalyticsFilters  # noqa: E402
-from app.services.b2b_carts import b2b_status, observe_cart, cart_report  # noqa: E402
+from app.services.b2b_carts import observe_cart, cart_report  # noqa: E402
 
 
 def main():
@@ -24,9 +24,7 @@ def main():
         action="store_true",
         help="Sync orders using configured Adaptor credentials and the saved cursor",
     )
-    parser.add_argument(
-        "--full", action="store_true", help="With --sync, restart from the first page"
-    )
+    parser.add_argument("--full", action="store_true", help="With --sync, restart from the first page")
     args = parser.parse_args()
     if args.full and not args.sync:
         parser.error("--full requires --sync")
@@ -50,7 +48,6 @@ def main():
             .where(cast(Order.raw["status_b2b"].as_string(), String).in_(("1", "2")))
             .execution_options(yield_per=500)
         ):
-            order.b2b_status = b2b_status(order.raw.get("status_b2b"))
             inserted += observe_cart(db, order)
         db.commit()
         report = cart_report(db, AnalyticsFilters(period="all"))
