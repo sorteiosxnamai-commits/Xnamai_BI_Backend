@@ -65,8 +65,9 @@ def render_coverage() -> str:
         "",
         "O `MercosAdaptor` agora oferece as rotas abaixo (ver `MercosAdaptor/docs/erp-extensions.md`),",
         "mas as que não têm caminho/paginação confirmados vêm **desligadas** até a validação no sandbox",
-        "(`MERCOS_ENABLED_EXTENSIONS`). No ERP continuam fora de `enabled` até existir a ligação (serviço,",
-        "tela e permissão) e o payload real da conta:",
+        "(`MERCOS_ENABLED_EXTENSIONS`). No ERP, `enabled` só liga com a flag de escrita, a chave ERP e a",
+        "extensão do Adaptor. A manutenção de produtos (lista, CRUD, estoque e Subir) já está no ERP;",
+        "o envio em si continua condicionado a essas condições:",
         "",
     ]
     for key, text in GAP_RESOURCES.items():

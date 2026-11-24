@@ -41,6 +41,47 @@ class CustomerFields(Strict):
         return value.strip() if value else value
 
 
+class ProductFields(Strict):
+    name: str | None = Field(default=None, min_length=1, max_length=400)
+    code: str | None = Field(default=None, max_length=100)
+    unit: str | None = Field(default=None, max_length=30)
+    categoryId: str | None = Field(default=None, max_length=200)
+    listPrice: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    minimumPrice: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    externalStock: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
+    ncm: str | None = Field(default=None, max_length=20)
+    notes: str | None = Field(default=None, max_length=4000)
+    imageUrl: str | None = Field(default=None, max_length=1000)
+    active: bool | None = None
+    onMercos: bool | None = None
+
+    @field_validator("name", "code", "unit", "categoryId", "ncm", "notes", "imageUrl")
+    @classmethod
+    def strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    @field_validator("imageUrl")
+    @classmethod
+    def image_link(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("A foto precisa ser um link http ou https")
+        return value
+
+
+class ProductCreate(ProductFields):
+    name: str = Field(min_length=1, max_length=400)
+    listPrice: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+
+
+class ProductPatch(ProductFields):
+    expectedVersion: int = Field(ge=1)
+
+
 class CustomerCreate(CustomerFields):
     name: str = Field(min_length=1, max_length=300)
 

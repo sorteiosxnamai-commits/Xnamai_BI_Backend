@@ -139,6 +139,10 @@ class ErpProduct(SourceMixin, ErpBase):
     length: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     active: Mapped[bool | None] = mapped_column(Boolean)
     image_hashes: Mapped[list | None] = mapped_column(JSON)
+    # Foto informada na manutenção (o Mercos só devolve hash, não URL).
+    image_url: Mapped[str | None] = mapped_column(String(1000))
+    # None = inferir pelo ID numérico do Mercos; True/False é a escolha do operador.
+    publish_to_mercos: Mapped[bool | None] = mapped_column(Boolean)
     notes: Mapped[str | None] = mapped_column(Text)
     source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

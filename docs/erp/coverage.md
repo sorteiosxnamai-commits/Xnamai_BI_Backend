@@ -51,8 +51,8 @@ snapshot de origem restrito e inventário de campos. Mapeamento campo a campo em
 | `write.titles` | Criar/editar títulos | A | sim | sim | não | `ERP_WRITE_TITLES` | F09 | Rota existe no Adaptor, mas só habilita após leitura/reconciliação de títulos. |
 | `read.titles` | Consultar títulos | D | sim | sim | não | — | F09 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Alias titles → titulos. |
 | `read.payments` | Pagamentos Mercos Pay | D | sim | sim | não | — | F10 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Ativação da conta a verificar. |
-| `write.products` | Criar/editar produtos | D | sim | sim | não | `ERP_WRITE_PRODUCTS` | F06 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. |
-| `write.inventory_publish` | Publicar ajuste de estoque | D | sim | sim | não | `ERP_WRITE_INVENTORY_PUBLISH` | F08 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Saldo é absoluto; exige autoridade definida. |
+| `write.products` | Criar/editar produtos | D | sim | sim | sim | `ERP_WRITE_PRODUCTS` | F06 | Manutenção local no ERP. Subir ao Mercos espera ERP_WRITE_PRODUCTS, chave de escrita e a extensão do Adaptor. |
+| `write.inventory_publish` | Publicar ajuste de estoque | D | sim | sim | sim | `ERP_WRITE_INVENTORY_PUBLISH` | F08 | Saldo absoluto no Mercos, enfileirado pelo Subir quando o produto já tem ID Mercos. Espera ERP_WRITE_INVENTORY_PUBLISH. |
 | `write.order_cancel` | Cancelar pedido | D | sim | sim | sim | `ERP_WRITE_ORDERS` | F27 | Operação dedicada documentada (POST pedidos/cancelar/{id}); só envia com a flag de pedidos, chave ERP com escopo de cancelamento e extensão ligada. Confirmação só pelo espelho (pedido volta cancelado). |
 | `write.billing` | Registrar/alterar faturamento | D | sim | sim | não | `ERP_WRITE_BILLING` | F28 | Não liberado: o Adaptor não tem leitura de faturamento, então não há como reconciliar o resultado. Faturamento do Mercos não é emissão fiscal. |
 | `read.commissions` | Comissões | D | sim | sim | não | — | F12 | O Adaptor já tem a rota (desligada até validar no sandbox, MERCOS_ENABLED_EXTENSIONS); falta a ligação no ERP e o payload real da conta. Chave própria `comissao_id`. |
@@ -80,8 +80,9 @@ snapshot de origem restrito e inventário de campos. Mapeamento campo a campo em
 
 O `MercosAdaptor` agora oferece as rotas abaixo (ver `MercosAdaptor/docs/erp-extensions.md`),
 mas as que não têm caminho/paginação confirmados vêm **desligadas** até a validação no sandbox
-(`MERCOS_ENABLED_EXTENSIONS`). No ERP continuam fora de `enabled` até existir a ligação (serviço,
-tela e permissão) e o payload real da conta:
+(`MERCOS_ENABLED_EXTENSIONS`). No ERP, `enabled` só liga com a flag de escrita, a chave ERP e a
+extensão do Adaptor. A manutenção de produtos (lista, CRUD, estoque e Subir) já está no ERP;
+o envio em si continua condicionado a essas condições:
 
 - `read.titles`: alias `titles` → `titulos` (GET)
 - `read.payments`: alias `payments` → `pagamentos` (GET)

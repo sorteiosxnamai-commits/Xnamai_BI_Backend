@@ -131,6 +131,14 @@ def customer(row: Any, user: ErpUser, *, detail: bool = False, contacts=None, ad
     return data
 
 
+def marked_for_mercos(row: Any) -> bool:
+    """Checkbox Mercos: escolha explícita, ou produto que já veio com ID numérico."""
+    flag = getattr(row, "publish_to_mercos", None)
+    if flag is not None:
+        return bool(flag)
+    return str(row.external_id).isdigit()
+
+
 def product(row: Any, *, detail: bool = False, variants=None) -> dict:
     data = {
         "id": row.external_id,
@@ -145,6 +153,9 @@ def product(row: Any, *, detail: bool = False, variants=None) -> dict:
         "minimumPrice": money(row.minimum_price),
         "externalStock": quantity(row.external_stock),
         "active": row.active,
+        "imageUrl": getattr(row, "image_url", None),
+        "onMercos": marked_for_mercos(row),
+        "localOnly": str(row.external_id).startswith("local-"),
         **_meta(row),
     }
     if detail:

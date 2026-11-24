@@ -202,7 +202,6 @@ def test_unimplemented_capabilities_return_409_not_fake_success():
     for path, method in (
         ("/api/v1/erp/sales-orders/1/cancel", "post"),
         ("/api/v1/erp/sales-orders/1/billings", "post"),
-        ("/api/v1/erp/products", "post"),
     ):
         headers = {**bearer(), "Idempotency-Key": "capability-key-0001"}
         response = getattr(c, method)(path, headers=headers, **({"json": bodies[path]} if path in bodies else {}))

@@ -32,6 +32,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             "read",
             "pii:read",
             "customers:write",
+            "products:write",
             "orders:write",
             "integration:read",
             "integration:sync",
@@ -50,6 +51,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             "inventory:read",
             "inventory:adjust",
             "inventory:transfer",
+            "products:write",
             "integration:read",
         }
     ),

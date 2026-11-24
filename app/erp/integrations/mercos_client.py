@@ -44,6 +44,9 @@ WRITE_ROUTES = {
     "bill_order": ("POST", "/v1/billings"),
     "create_title": ("POST", "/v1/titles"),
     "update_title": ("PUT", "/v1/titles/{id}"),
+    "create_product": ("POST", "/v1/products"),
+    "publish_product": ("PUT", "/v1/products/{id}"),
+    "publish_product_stock": ("PUT", "/v1/products/{id}/stock"),
 }
 
 DEFAULT_RATE_LIMIT_WAIT = 30.0

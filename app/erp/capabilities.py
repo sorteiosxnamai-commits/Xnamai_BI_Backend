@@ -78,10 +78,13 @@ CAPABILITIES: tuple[CapabilityDef, ...] = (
     CapabilityDef("read.payments", "Pagamentos Mercos Pay", "sync", "D", True, True,
                   False, source="F10", reason=PENDING_ADAPTOR + " Ativação da conta a verificar."),
     CapabilityDef("write.products", "Criar/editar produtos", "write", "D", True, True,
-                  False, "products", "F06", PENDING_ADAPTOR),
+                  True, "products", "F06",
+                  "Manutenção local no ERP. Subir ao Mercos espera ERP_WRITE_PRODUCTS, "
+                  "chave de escrita e a extensão do Adaptor."),
     CapabilityDef("write.inventory_publish", "Publicar ajuste de estoque", "write", "D",
-                  True, True, False, "inventory_publish", "F08",
-                  PENDING_ADAPTOR + " Saldo é absoluto; exige autoridade definida."),
+                  True, True, True, "inventory_publish", "F08",
+                  "Saldo absoluto no Mercos, enfileirado pelo Subir quando o produto já tem ID "
+                  "Mercos. Espera ERP_WRITE_INVENTORY_PUBLISH."),
     CapabilityDef("write.order_cancel", "Cancelar pedido", "write", "D", True, True,
                   True, "orders", "F27",
                   "Operação dedicada documentada (POST pedidos/cancelar/{id}); só envia com a flag de "

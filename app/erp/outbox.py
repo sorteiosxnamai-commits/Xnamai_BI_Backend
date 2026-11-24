@@ -23,7 +23,7 @@ from app.erp.common import as_utc, fingerprint, http_error, utcnow
 from app.erp.config import erp_settings
 from app.erp.db import session_scope
 from app.erp.integrations.mercos_client import MercosAdaptorClient, WriteOutcome
-from app.erp.models.commercial import ErpCustomer, ErpSalesOrder
+from app.erp.models.commercial import ErpCustomer, ErpProduct, ErpSalesOrder
 from app.erp.models.core import ErpConflict, ErpOperation
 from app.erp.schemas.commands import (
     CustomerCreate,
@@ -66,6 +66,9 @@ CAPABILITY_BY_KIND = {
     "bill_order": "write.billing",
     "create_title": "write.titles",
     "update_title": "write.titles",
+    "create_product": "write.products",
+    "publish_product": "write.products",
+    "publish_product_stock": "write.inventory_publish",
 }
 TARGET_BY_KIND = {
     "create_customer": "customers",
@@ -76,6 +79,9 @@ TARGET_BY_KIND = {
     "bill_order": "orders",
     "create_title": "titles",
     "update_title": "titles",
+    "create_product": "products",
+    "publish_product": "products",
+    "publish_product_stock": "products",
 }
 
 CUSTOMER_API_TO_ATTR = {
@@ -392,6 +398,92 @@ def submit(
     return op, True
 
 
+def enqueue_product(
+    db: Session,
+    *,
+    connection_id: str,
+    user: ErpUser,
+    kind: str,
+    mercos_payload: dict,
+    dto: dict,
+    target_external_id: str,
+    idempotency_key: str | None,
+) -> tuple[ErpOperation, bool]:
+    """Enfileira a carga de um produto (ou do saldo) já gravado no ERP."""
+    if not idempotency_key or not (8 <= len(idempotency_key) <= 120):
+        raise http_error(
+            422,
+            "idempotency_key_required",
+            "Header Idempotency-Key obrigatório (8 a 120 caracteres)",
+        )
+    cap_key = CAPABILITY_BY_KIND[kind]
+    enabled, reason = capabilities.capability_enabled(db, connection_id, cap_key)
+    if not enabled:
+        raise http_error(
+            409, "capability_disabled", "Capacidade desabilitada", capability=cap_key, reason=reason,
+        )
+    dto = _jsonable(dto)
+    mercos_payload = _jsonable(mercos_payload)
+    payload_hash = fingerprint(
+        {"kind": kind, "target": target_external_id, "dto": dto, "mercos": mercos_payload}
+    )
+    existing = db.scalar(
+        select(ErpOperation).where(
+            ErpOperation.connection_id == connection_id,
+            ErpOperation.operator == user.username,
+            ErpOperation.kind == kind,
+            ErpOperation.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        if existing.payload_hash != payload_hash:
+            raise http_error(
+                409, "idempotency_key_reuse", "Idempotency-Key já usada com corpo diferente",
+            )
+        return existing, False
+    op = ErpOperation(
+        id=str(uuid4()),
+        connection_id=connection_id,
+        operator=user.username,
+        kind=kind,
+        target_resource=TARGET_BY_KIND[kind],
+        target_external_id=target_external_id,
+        status="queued",
+        idempotency_key=idempotency_key,
+        payload_hash=payload_hash,
+        payload={"dto": dto, "mercos": mercos_payload},
+        correlation_id=str(uuid4()),
+    )
+    db.add(op)
+    audit(
+        db,
+        operator=user.username,
+        action=f"operation.{kind}",
+        connection_id=connection_id,
+        resource="products",
+        resource_id=target_external_id,
+        correlation_id=op.correlation_id,
+        result="queued",
+        detail={"operationId": op.id},
+    )
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(
+            select(ErpOperation).where(
+                ErpOperation.connection_id == connection_id,
+                ErpOperation.operator == user.username,
+                ErpOperation.kind == kind,
+                ErpOperation.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is None:
+            raise
+        return existing, False
+    return op, True
+
+
 def _load_target(db: Session, connection_id: str, kind: str, external_id: str | None):
     model = ErpCustomer if kind == "update_customer" else ErpSalesOrder
     if not external_id:
@@ -529,6 +621,29 @@ def _prepare_dispatch(op_id: str, token: str) -> dict | None:
         }
 
 
+def _rebind_created_product(db: Session, op: ErpOperation, new_id: str) -> None:
+    """Troca o id local pelo id que o Mercos devolveu, se ainda não existir."""
+    row = db.scalar(
+        select(ErpProduct).where(
+            ErpProduct.connection_id == op.connection_id,
+            ErpProduct.external_id == op.target_external_id,
+        )
+    )
+    if row is None or row.external_id == new_id:
+        return
+    clash = db.scalar(
+        select(ErpProduct.id).where(
+            ErpProduct.connection_id == op.connection_id,
+            ErpProduct.external_id == new_id,
+        )
+    )
+    if clash is not None:
+        return
+    row.external_id = new_id
+    row.publish_to_mercos = True
+    db.add(row)
+
+
 def _persist_outcome(op_id: str, token: str, outcome: WriteOutcome) -> None:
     with session_scope() as db:
         op = db.scalar(
@@ -550,6 +665,8 @@ def _persist_outcome(op_id: str, token: str, outcome: WriteOutcome) -> None:
             op.external_id = outcome.external_id
             op.completed_at = utcnow()
             op.error = None
+            if op.kind == "create_product" and outcome.external_id:
+                _rebind_created_product(db, op, outcome.external_id)
         elif outcome.kind == "rejected":
             transition(op, "failed")
             op.completed_at = utcnow()

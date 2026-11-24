@@ -23,8 +23,11 @@ from app.erp.schemas.commands import (
     OrderCancelInput,
     OrderCreate,
     OrderPatch,
+    ProductCreate,
+    ProductPatch,
     TitleInput,
 )
+from app.erp.services import product_maintenance as products
 
 router = APIRouter(tags=["erp-commercial"])
 
@@ -167,7 +170,7 @@ def list_products(
     db: Session = Depends(erp_db),
 ):
     M = m.ErpProduct
-    query = select(M).where(M.connection_id == cid())
+    query = select(M).where(M.connection_id == cid(), M.source_deleted.is_(False))
     if search:
         query = query.where(_like(M.name, search) | _like(M.code, search))
     if categoryId:
@@ -249,16 +252,62 @@ def _disabled(db: Session, key: str):
     )
 
 
-@router.post("/products", status_code=409, summary="Cria produto (capacidade pendente no Adaptor)")
-def create_product(user: ErpUser = Depends(require("products:write")), db: Session = Depends(erp_db)):
-    _disabled(db, "write.products")
+def _product_body(db: Session, row: m.ErpProduct) -> dict:
+    variants = db.scalars(
+        select(m.ErpProductVariant).where(m.ErpProductVariant.product_id == row.id)
+        .order_by(m.ErpProductVariant.position)
+    ).all()
+    return ser.product(row, detail=True, variants=variants)
 
 
-@router.patch("/products/{external_id}", status_code=409, summary="Edita produto (capacidade pendente)")
-def patch_product(
-    external_id: str, user: ErpUser = Depends(require("products:write")), db: Session = Depends(erp_db)
+@router.post("/products", status_code=201, summary="Cria produto na manutenção do ERP")
+def create_product(
+    body: ProductCreate,
+    user: ErpUser = Depends(require("products:write")),
+    db: Session = Depends(erp_db),
 ):
-    _disabled(db, "write.products")
+    row = products.create_product(db, user, cid(), body)
+    db.commit()
+    return _product_body(db, row)
+
+
+@router.patch("/products/{external_id}", summary="Altera produto, estoque ou marcação Mercos")
+def patch_product(
+    external_id: str,
+    body: ProductPatch,
+    user: ErpUser = Depends(require("products:write")),
+    db: Session = Depends(erp_db),
+):
+    row = products.update_product(db, user, cid(), external_id, body)
+    db.commit()
+    return _product_body(db, row)
+
+
+@router.delete("/products/{external_id}", summary="Exclui produto da manutenção (não apaga histórico)")
+def delete_product(
+    external_id: str,
+    user: ErpUser = Depends(require("products:write")),
+    db: Session = Depends(erp_db),
+):
+    row = products.delete_product(db, user, cid(), external_id)
+    db.commit()
+    return _product_body(db, row)
+
+
+@router.post("/products/{external_id}/publish", summary="Sobe o produto marcado para o Mercos")
+def publish_product(
+    external_id: str,
+    idempotency_key: str | None = Header(None),
+    user: ErpUser = Depends(require("products:write")),
+    db: Session = Depends(erp_db),
+):
+    op, created, stock = products.publish_product(db, user, cid(), external_id, idempotency_key)
+    db.commit()
+    status = 202 if created else 200
+    return JSONResponse(
+        status_code=status,
+        content={**ser.operation(op), "replayed": not created, "stockPublish": stock},
+    )
 
 
 # --- pedidos -------------------------------------------------------------------
