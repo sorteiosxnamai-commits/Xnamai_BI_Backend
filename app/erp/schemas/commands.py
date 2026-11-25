@@ -41,6 +41,29 @@ class CustomerFields(Strict):
         return value.strip() if value else value
 
 
+def _http_link(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value.startswith(("http://", "https://")):
+        raise ValueError("Use um link http ou https")
+    return value
+
+
+class ProductVariantInput(Strict):
+    code: str | None = Field(default=None, max_length=100)
+    name: str | None = Field(default=None, max_length=400)
+    externalStock: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
+    price: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+
+    @field_validator("code", "name")
+    @classmethod
+    def strip_variant(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
 class ProductFields(Strict):
     name: str | None = Field(default=None, min_length=1, max_length=400)
     code: str | None = Field(default=None, max_length=100)
@@ -51,11 +74,29 @@ class ProductFields(Strict):
     externalStock: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
     ncm: str | None = Field(default=None, max_length=20)
     notes: str | None = Field(default=None, max_length=4000)
+    description: str | None = Field(default=None, max_length=8000)
     imageUrl: str | None = Field(default=None, max_length=1000)
+    photos: list[str] | None = Field(default=None, max_length=12)
+    videos: list[str] | None = Field(default=None, max_length=8)
     active: bool | None = None
     onMercos: bool | None = None
+    grossWeight: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
+    width: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
+    height: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
+    length: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
+    supplierCode: str | None = Field(default=None, max_length=80)
+    barcode: str | None = Field(default=None, max_length=80)
+    lot: str | None = Field(default=None, max_length=80)
+    receivedAt: date | None = None
+    packKind: Literal["unit", "box"] | None = None
+    cost: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    stockLocation: str | None = Field(default=None, max_length=200)
+    variants: list[ProductVariantInput] | None = Field(default=None, max_length=40)
 
-    @field_validator("name", "code", "unit", "categoryId", "ncm", "notes", "imageUrl")
+    @field_validator(
+        "name", "code", "unit", "categoryId", "ncm", "notes", "description", "imageUrl",
+        "supplierCode", "barcode", "lot", "stockLocation",
+    )
     @classmethod
     def strip_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -66,11 +107,19 @@ class ProductFields(Strict):
     @field_validator("imageUrl")
     @classmethod
     def image_link(cls, value: str | None) -> str | None:
-        if value is None:
+        return _http_link(value)
+
+    @field_validator("photos", "videos")
+    @classmethod
+    def media_links(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
             return None
-        if not value.startswith(("http://", "https://")):
-            raise ValueError("A foto precisa ser um link http ou https")
-        return value
+        cleaned = []
+        for item in values:
+            text = item.strip()
+            if text:
+                cleaned.append(_http_link(text))
+        return cleaned
 
 
 class ProductCreate(ProductFields):
@@ -79,6 +128,28 @@ class ProductCreate(ProductFields):
 
 
 class ProductPatch(ProductFields):
+    expectedVersion: int = Field(ge=1)
+
+
+class CategoryWrite(Strict):
+    name: str | None = Field(default=None, min_length=1, max_length=300)
+    parentId: str | None = Field(default=None, max_length=200)
+    active: bool | None = None
+
+    @field_validator("name", "parentId")
+    @classmethod
+    def strip_category(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class CategoryCreate(CategoryWrite):
+    name: str = Field(min_length=1, max_length=300)
+
+
+class CategoryPatch(CategoryWrite):
     expectedVersion: int = Field(ge=1)
 
 

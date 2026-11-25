@@ -17,6 +17,8 @@ from app.erp.models import commercial as m
 from app.erp.registry import REGISTRY
 from app.erp.services import order_operations as oo
 from app.erp.schemas.commands import (
+    CategoryCreate,
+    CategoryPatch,
     CustomerCreate,
     CustomerPatch,
     OrderBillingInput,
@@ -27,6 +29,7 @@ from app.erp.schemas.commands import (
     ProductPatch,
     TitleInput,
 )
+from app.erp.services import category_maintenance as categories
 from app.erp.services import product_maintenance as products
 
 router = APIRouter(tags=["erp-commercial"])
@@ -513,6 +516,61 @@ def bill_order(
     )
     db.commit()
     return accepted(op, created)
+
+
+@router.get("/products/{external_id}/history", summary="Histórico de pedidos e estoque do produto")
+def product_history(
+    external_id: str,
+    user: ErpUser = Depends(require("read")),
+    db: Session = Depends(erp_db),
+):
+    return products.product_history(db, cid(), external_id)
+
+
+# --- categorias ----------------------------------------------------------------
+
+
+@router.get("/categories", summary="Categorias e subcategorias")
+def list_categories(
+    user: ErpUser = Depends(require("read")),
+    db: Session = Depends(erp_db),
+):
+    rows = categories.list_categories(db, cid())
+    return {"items": [ser.category(row) for row in rows]}
+
+
+@router.post("/categories", status_code=201, summary="Cria categoria ou subcategoria")
+def create_category(
+    body: CategoryCreate,
+    user: ErpUser = Depends(require("products:write")),
+    db: Session = Depends(erp_db),
+):
+    row = categories.create_category(db, user, cid(), body)
+    db.commit()
+    return ser.category(row)
+
+
+@router.patch("/categories/{external_id}", summary="Altera categoria")
+def patch_category(
+    external_id: str,
+    body: CategoryPatch,
+    user: ErpUser = Depends(require("products:write")),
+    db: Session = Depends(erp_db),
+):
+    row = categories.update_category(db, user, cid(), external_id, body)
+    db.commit()
+    return ser.category(row)
+
+
+@router.delete("/categories/{external_id}", summary="Exclui categoria sem subcategorias")
+def delete_category(
+    external_id: str,
+    user: ErpUser = Depends(require("products:write")),
+    db: Session = Depends(erp_db),
+):
+    row = categories.delete_category(db, user, cid(), external_id)
+    db.commit()
+    return ser.category(row)
 
 
 # --- catálogos auxiliares -------------------------------------------------------

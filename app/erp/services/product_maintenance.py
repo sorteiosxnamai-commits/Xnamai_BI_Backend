@@ -9,14 +9,15 @@ mesma carga quando o produto já tem ID numérico.
 from decimal import Decimal
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.erp import capabilities
 from app.erp.audit import audit
 from app.erp.auth import ErpUser
-from app.erp.common import http_error, utcnow
-from app.erp.models.commercial import ErpProduct
+from app.erp.common import http_error, iso, money, quantity, utcnow
+from app.erp.models.commercial import ErpProduct, ErpProductVariant, ErpSalesOrder, ErpSalesOrderItem
+from app.erp.models.local import ErpInventoryMovement
 from app.erp.outbox import enqueue_product
 from app.erp.schemas.commands import ProductCreate, ProductPatch
 from app.erp.serializers import marked_for_mercos
@@ -34,6 +35,20 @@ _ATTRS = {
     "imageUrl": "image_url",
     "active": "active",
     "onMercos": "publish_to_mercos",
+    "description": "description",
+    "photos": "photos",
+    "videos": "videos",
+    "grossWeight": "gross_weight",
+    "width": "width",
+    "height": "height",
+    "length": "length",
+    "supplierCode": "supplier_code",
+    "barcode": "barcode",
+    "lot": "lot",
+    "receivedAt": "received_at",
+    "packKind": "pack_kind",
+    "cost": "cost_price",
+    "stockLocation": "stock_location",
 }
 
 
@@ -58,6 +73,7 @@ def _touch(row: ErpProduct) -> None:
 
 def create_product(db: Session, user: ErpUser, connection_id: str, body: ProductCreate) -> ErpProduct:
     data = body.model_dump(exclude_unset=True)
+    variants = data.pop("variants", None)
     row = ErpProduct(
         connection_id=connection_id,
         external_id=f"local-{uuid4().hex[:20]}",
@@ -77,6 +93,8 @@ def create_product(db: Session, user: ErpUser, connection_id: str, body: Product
             setattr(row, attr, data[key])
     db.add(row)
     db.flush()
+    if variants is not None:
+        _save_variants(db, row, variants)
     audit(
         db, operator=user.username, action="product.create", connection_id=connection_id,
         resource="products", resource_id=row.external_id, result="ok",
@@ -93,15 +111,18 @@ def update_product(
         raise http_error(409, "product_deleted", "Produto excluído não pode ser alterado")
     data = body.model_dump(exclude_unset=True)
     expected = data.pop("expectedVersion")
+    variants = data.pop("variants", None)
     if row.version != expected:
         raise http_error(
             409, "version_mismatch", "A versão local mudou; recarregue antes de editar",
             currentVersion=row.version,
         )
-    if not data:
+    if not data and variants is None:
         raise http_error(422, "empty_patch", "Nenhum campo para alterar")
     for key, value in data.items():
         setattr(row, _ATTRS[key], value)
+    if variants is not None:
+        _save_variants(db, row, variants)
     _touch(row)
     db.add(row)
     audit(
@@ -138,6 +159,82 @@ def delete_product(db: Session, user: ErpUser, connection_id: str, external_id: 
                 idempotency_key=f"del-{row.external_id}-{row.version}"[:120],
             )
     return row
+
+
+def _save_variants(db: Session, row: ErpProduct, items: list[dict]) -> None:
+    db.execute(delete(ErpProductVariant).where(ErpProductVariant.product_id == row.id))
+    position = 0
+    for item in items:
+        if not any(item.get(key) not in (None, "") for key in ("code", "name", "externalStock", "price")):
+            continue
+        position += 1
+        db.add(ErpProductVariant(
+            product_id=row.id,
+            position=position,
+            code=item.get("code"),
+            name=item.get("name"),
+            external_stock=item.get("externalStock"),
+            price=item.get("price"),
+        ))
+
+
+def product_history(db: Session, connection_id: str, external_id: str) -> dict:
+    """Pedidos e movimentos de estoque do produto. O Mercos não manda geolocalização."""
+    get_product(db, connection_id, external_id)
+    orders = db.execute(
+        select(ErpSalesOrderItem, ErpSalesOrder)
+        .join(ErpSalesOrder, ErpSalesOrder.id == ErpSalesOrderItem.order_id)
+        .where(
+            ErpSalesOrder.connection_id == connection_id,
+            ErpSalesOrderItem.product_external_id == external_id,
+            ErpSalesOrderItem.excluded.is_(False),
+        )
+        .order_by(ErpSalesOrder.id.desc())
+        .limit(40)
+    ).all()
+    movements = db.scalars(
+        select(ErpInventoryMovement)
+        .where(
+            ErpInventoryMovement.connection_id == connection_id,
+            ErpInventoryMovement.product_external_id == external_id,
+        )
+        .order_by(ErpInventoryMovement.occurred_at.desc())
+        .limit(40)
+    ).all()
+    return {
+        "mercosGeolocation": None,
+        "mercosGeolocationNote": (
+            "O cadastro de produto do Mercos não traz geolocalização. "
+            "O local no estoque é informado neste ERP."
+        ),
+        "dimensionsSource": "mercos",
+        "dimensionsNote": (
+            "Peso e dimensões vêm do espelho do Mercos (peso_bruto, largura, altura e comprimento). "
+            "Este ERP não consulta a Tray."
+        ),
+        "orders": [
+            {
+                "orderId": order.external_id,
+                "number": order.number,
+                "issuedAt": iso(order.issued_at),
+                "status": order.commercial_status,
+                "quantity": quantity(item.quantity),
+                "total": money(item.total),
+            }
+            for item, order in orders
+        ],
+        "movements": [
+            {
+                "id": movement.id,
+                "kind": movement.kind,
+                "quantityDelta": quantity(movement.quantity_delta),
+                "occurredAt": iso(movement.occurred_at),
+                "reason": movement.reason,
+                "warehouseId": movement.warehouse_id,
+            }
+            for movement in movements
+        ],
+    }
 
 
 def _number(value: Decimal | None) -> float | None:

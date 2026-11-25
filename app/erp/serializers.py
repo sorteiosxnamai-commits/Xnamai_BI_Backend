@@ -170,7 +170,17 @@ def product(row: Any, *, detail: bool = False, variants=None) -> dict:
             length=quantity(row.length),
             imageHashes=row.image_hashes,
             notes=row.notes,
-            cost=None,  # custo desconhecido permanece desconhecido
+            description=getattr(row, "description", None),
+            photos=getattr(row, "photos", None) or [],
+            videos=getattr(row, "videos", None) or [],
+            supplierCode=getattr(row, "supplier_code", None),
+            barcode=getattr(row, "barcode", None),
+            lot=getattr(row, "lot", None),
+            receivedAt=row.received_at.isoformat() if getattr(row, "received_at", None) else None,
+            packKind=getattr(row, "pack_kind", None),
+            cost=money(getattr(row, "cost_price", None)),
+            stockLocation=getattr(row, "stock_location", None),
+            mercosGeolocation=None,
             variants=[
                 {
                     "id": v.external_id,
@@ -184,6 +194,18 @@ def product(row: Any, *, detail: bool = False, variants=None) -> dict:
             ],
         )
     return data
+
+
+def category(row: Any) -> dict:
+    return {
+        "id": row.external_id,
+        "localId": row.id,
+        "name": row.name,
+        "parentId": row.parent_external_id,
+        "active": row.active,
+        "localOnly": str(row.external_id).startswith("local-cat-"),
+        **_meta(row),
+    }
 
 
 def product_price(row: Any) -> dict:

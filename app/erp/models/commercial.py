@@ -144,6 +144,16 @@ class ErpProduct(SourceMixin, ErpBase):
     # None = inferir pelo ID numérico do Mercos; True/False é a escolha do operador.
     publish_to_mercos: Mapped[bool | None] = mapped_column(Boolean)
     notes: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    photos: Mapped[list | None] = mapped_column(JSON)
+    videos: Mapped[list | None] = mapped_column(JSON)
+    supplier_code: Mapped[str | None] = mapped_column(String(80))
+    barcode: Mapped[str | None] = mapped_column(String(80))
+    lot: Mapped[str | None] = mapped_column(String(80))
+    received_at: Mapped[date | None] = mapped_column(Date)
+    pack_kind: Mapped[str | None] = mapped_column(String(10))
+    cost_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    stock_location: Mapped[str | None] = mapped_column(String(200))
     source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
