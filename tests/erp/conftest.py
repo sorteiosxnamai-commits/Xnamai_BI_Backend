@@ -90,6 +90,7 @@ def erp_cfg(monkeypatch):
             # os testes de permissão usam tokens do BI vinculados; o fluxo de login
             # individual tem arquivo próprio e liga/desliga isto explicitamente
             "erp_allow_bi_operator_link": True,
+            "erp_storefront_images": False,
         }
         values.update(overrides)
         cfg = erp_config.ErpSettings(**values)

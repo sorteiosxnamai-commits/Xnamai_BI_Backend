@@ -30,6 +30,7 @@ from app.erp.schemas.commands import (
     TitleInput,
 )
 from app.erp.services import category_maintenance as categories
+from app.erp.services import product_images
 from app.erp.services import product_maintenance as products
 
 router = APIRouter(tags=["erp-commercial"])
@@ -188,6 +189,7 @@ def list_products(
                       "externalStock": M.external_stock},
         sort=sort, default_sort="name", order=order, page=page, page_size=page_size,
     )
+    product_images.attach_storefront_images(db, result.items)
     return result.envelope(
         ser.product, sort=key, order=direction,
         filters={"search": search, "categoryId": categoryId, "kind": kind, "active": active},
@@ -201,6 +203,7 @@ def get_product(
     db: Session = Depends(erp_db),
 ):
     row = _get(db, m.ErpProduct, external_id)
+    product_images.attach_storefront_images(db, [row])
     variants = db.scalars(
         select(m.ErpProductVariant).where(m.ErpProductVariant.product_id == row.id)
         .order_by(m.ErpProductVariant.position)

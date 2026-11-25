@@ -51,6 +51,9 @@ class ErpSettings(BaseSettings):
     erp_snapshot_retention_days: int = 90
     erp_inventory_authority: str = "mercos"
     erp_adaptor_timeout_seconds: float = 90.0
+    # Catálogo público do B2B. A API autenticada só manda hash da foto; a URL fica aqui.
+    erp_storefront_url: str = "https://xnamai.mercos.com"
+    erp_storefront_images: bool = True
     # Autenticação individual do ERP (independente do login do BI).
     erp_jwt_secret: str = ""
     erp_access_minutes: int = 15
